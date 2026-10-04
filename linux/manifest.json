@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"local.bose","name":"Bose Connections","version":"1.0.0","description":"Choose the devices connected to the Bose 700","kinds":["bar-widget"],"entryPoints":{"barWidget":"Panel.qml"},"barWidget":{"displayName":"Bose 700","category":"Audio","allowMultiple":false,"defaultSection":"right"}}

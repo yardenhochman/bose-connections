@@ -1,0 +1,1 @@
+{"private":true,"scripts":{"test:gui":"node tests/gui-fixtures.cjs"},"devDependencies":{"playwright-core":"^1.56.0"}}

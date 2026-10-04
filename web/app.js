@@ -1,0 +1,31 @@
+'use strict';
+const $=id=>document.getElementById(id);let state=null,busy=false,seq=0;const pending=new Map();
+window.finishRequest=(id,json)=>{const p=pending.get(id);if(p){pending.delete(id);p.resolve(JSON.parse(json));}};
+function api(path,data){
+ if(window.Android){return new Promise((resolve,reject)=>{const id=String(++seq);const timer=setTimeout(()=>{pending.delete(id);reject(new Error('Controller timed out. Refresh before trying again.'));},120000);pending.set(id,{resolve:r=>{clearTimeout(timer);if(r.error)reject(new Error(r.error));else resolve(r);}});Android.request(id,path,data?JSON.stringify(data):'');});}
+ return fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined}).then(async r=>{const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Request failed');return d;});
+}
+function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'';}
+function setBusy(value){busy=value;document.querySelectorAll('button').forEach(b=>b.disabled=value);$('refresh').textContent=value?'Checking…':'↻ Refresh';}
+const labels={pc:'PC',phone:'Phone',mac:'Mac'};const icons={pc:'▣',phone:'▯',mac:'▰'};
+function render(){
+ $('live-dot').className='status-dot'+(state.reachable&&!state.cached?' live':'');$('headset-status').textContent=state.cached?'Last known connections':state.reachable?'Headphones available':'Headphones unavailable';
+ const connected=state.devices.filter(d=>d.connected);$('slots').textContent=state.reachable?`${connected.length} / 2`:'— / 2';$('battery').textContent=state.battery==null?'—':`${state.battery}%`;$('battery').parentElement.hidden=state.battery==null;
+ $('headset-detail').textContent=state.cached?'Updated '+(state.observed?new Date(state.observed*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}):'previously')+' · Refreshing checks current connections':state.reachable?connected.map(d=>labels[Object.keys(state.roles).find(k=>state.roles[k]===d.address)]||d.name).join(' · ')||'No devices connected':'No controller can reach the headset.';
+ $('controllers').replaceChildren();
+ for(const id of ['pc','phone','mac']){
+  const s=state.controllers.find(c=>c.controller===id);const row=node('div','controller');row.append(node('span','controller-icon',icons[id]));const info=node('div');info.append(node('b','',labels[id]),node('small',id===state.here?'here':'',s?.reachable?'Available':(s?.checking?'Checking…':s?.error?'Offline':'Not set up')));row.append(info);
+  if(state.roles[id]&&state.reachable){const button=node('button','',id===state.here?'Connect here':'Connect');button.onclick=()=>connect(state.roles[id]);row.append(button);} $('controllers').append(row);
+ }
+ $('devices').replaceChildren();
+ if(!state.devices.length){const empty=node('div','empty');empty.append(node('strong','',state.reachable?'No saved devices found':'Headset unavailable'),node('span','',state.reachable?'Pair your devices in their Bluetooth settings.':'Turn on the headset and connect a phone, PC or Mac.'));$('devices').append(empty);return;}
+ for(const d of state.devices){const role=Object.keys(state.roles).find(k=>state.roles[k]===d.address);const row=node('div','device');row.append(node('span','device-icon',icons[role]||'♫'));const info=node('div','device-info');info.append(node('strong','',d.name),node('small',d.connected?'connected':'',d.connected?`Connected${role?' · '+labels[role]:''}`:'Saved device'));row.append(info);const button=node('button',d.connected?'':'connect',d.connected?'Disconnect':'Connect');button.onclick=()=>d.connected?perform({action:'disconnect',address:d.address}):connect(d.address);row.append(button);$('devices').append(row);}
+}
+async function refresh(){if(busy)return;setBusy(true);message('');try{state=await api('/api/overview');render();}catch(e){message(e.message,true);}finally{setBusy(false);}}
+async function perform(data){if(busy)return;setBusy(true);$('switch-dialog').close();message('Updating connections…');try{const result=await api('/api/override',data);if(!result.ok||!result.verified)throw new Error(result.error||'The change wasn’t verified. Refresh before trying again.');message(result.message||'Connection updated');state=await api('/api/overview');render();}catch(e){message(e.message,true);}finally{setBusy(false);}}
+function connect(address){const target=state.devices.find(d=>d.address===address);if(!target)return message('This controller isn’t identified in the headset’s device list yet.',true);if(target.connected)return message(`${target.name} is already connected.`);const connected=state.devices.filter(d=>d.connected);if(connected.length<2)return perform({action:'connect',address});$('switch-title').textContent=`Connect ${target.name}`;$('replace-options').replaceChildren();for(const d of connected){const b=node('button','replace',`Disconnect ${d.name}`);b.onclick=()=>perform({action:'connect',address,replace:d.address});$('replace-options').append(b);}$('switch-dialog').showModal();}
+$('refresh').onclick=refresh;$('settings').onclick=()=>{if(!state&&window.Android){Android.settings();return;}if(!state)return;$('role-fields').replaceChildren();for(const id of ['pc','phone','mac']){const label=node('label','',labels[id]);label.htmlFor='role-'+id;const select=node('select');select.id='role-'+id;const empty=node('option','','Not identified');empty.value='';select.append(empty);for(const d of state.devices){const option=node('option','',d.name);option.value=d.address;select.append(option);}select.value=state.roles[id]||'';$('role-fields').append(label,select);}$('native-settings').hidden=!window.Android;$('settings-dialog').showModal();};
+$('save-roles').onclick=async()=>{const roles={};for(const id of ['pc','phone','mac'])if($('role-'+id).value)roles[id]=$('role-'+id).value;try{await api('/api/roles',{roles});$('settings-dialog').close();await refresh();}catch(e){message(e.message,true);}};
+$('native-settings').onclick=()=>Android.settings();
+(async()=>{try{state=await api('/api/cached');if(state.devices.length)render();}catch(e){}await refresh();})();

@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#f3f1eb"><title>Bose · Connections</title><link rel="stylesheet" href="style.css"></head><body>
+<main><header><a class="brand" href="./" aria-label="Bose connections home">Bose 700<span>Connections</span></a><button id="settings" class="subtle">Settings</button></header>
+<section class="summary"><div><span class="status-dot" id="live-dot"></span><strong id="headset-status">Checking connections</strong><small id="headset-detail">Finding a controller that can reach your headphones.</small></div><div class="metrics"><span><strong id="slots">— / 2</strong><small>CONNECTED</small></span><span><strong id="battery">—</strong><small>BATTERY</small></span></div></section>
+<section class="controllers" id="controllers" aria-label="Your controllers"></section>
+<section class="device-section"><div class="section-title"><div><h2>Saved devices</h2></div><button id="refresh" class="subtle">↻ Refresh</button></div><div id="devices" class="devices"><div class="empty">Loading your devices…</div></div></section>
+<div id="message" role="status" aria-live="polite"></div>
+</main>
+<dialog id="switch-dialog"><form method="dialog"><button class="close" aria-label="Close">×</button></form><div class="eyebrow">CONNECTION LIMIT</div><h2 id="switch-title">Connect device</h2><p>Both connections are occupied. Choose a device to disconnect.</p><div id="replace-options"></div></dialog>
+<dialog id="settings-dialog"><form method="dialog"><button class="close" aria-label="Close">×</button></form><div class="eyebrow">CONTROLLERS</div><h2>Controller settings</h2><p>Assign the devices used for headset control.</p><div id="role-fields"></div><button id="save-roles" class="primary">Save devices</button><button id="native-settings" class="subtle" hidden>Set up controller links</button></dialog>
+<script src="app.js"></script></body></html>
