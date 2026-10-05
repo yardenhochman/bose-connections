@@ -56,7 +56,7 @@
  for(NSDictionary *d in devices){
   BOOL on=[d[@"connected"] boolValue];NSString *name=[self label:d];NSDictionary *action=@{@"action":on?@"disconnect":@"connect",@"address":d[@"address"]};
   NSMenuItem *row=[self item:name selector:@selector(deviceClicked:) data:action];row.state=on?NSControlStateValueOn:NSControlStateValueOff;
-  row.enabled=[self.snapshot[@"reachable"] boolValue]&&!self.changing;
+  row.enabled=[self.snapshot[@"reachable"] boolValue]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;
   if(!on && connected.count>=2){NSMenu *replace=[NSMenu new];replace.autoenablesItems=NO;
    [replace addItem:[self item:@"Disconnect to connect:" selector:NULL data:nil]];
    for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];[replace addItem:[self item:[self label:old] selector:@selector(deviceClicked:) data:a]];}row.submenu=replace;
@@ -64,6 +64,12 @@
   [self.deviceMenu addItem:row];
  }
  [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+ NSDictionary *noise=self.snapshot[@"noise"];
+ if([noise isKindOfClass:[NSDictionary class]]){
+  NSMenuItem *section=[self item:@"Noise cancellation" selector:NULL data:nil];section.enabled=YES;NSMenu *levels=[NSMenu new];levels.autoenablesItems=NO;
+  NSMenuItem *off=[self item:@"Off" selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":noise[@"level"],@"enabled":@NO}];off.state=[noise[@"enabled"] boolValue]?NSControlStateValueOff:NSControlStateValueOn;off.enabled=[self.snapshot[@"reachable"] boolValue]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;[levels addItem:off];
+  for(int n=0;n<=10;n++){NSString *label=n==0?@"0 — Aware":n==10?@"10 — Maximum":[NSString stringWithFormat:@"%d",n];NSMenuItem *item=[self item:label selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":@(n),@"enabled":@YES}];item.state=[noise[@"enabled"] boolValue]&&[noise[@"level"] intValue]==n?NSControlStateValueOn:NSControlStateValueOff;item.enabled=off.enabled;[levels addItem:item];}section.submenu=levels;[self.deviceMenu addItem:section];
+ }
  [self.deviceMenu addItem:[self item:@"Refresh" selector:@selector(refreshClicked:) data:nil]];
  [self.deviceMenu addItem:[self item:@"Open dashboard…" selector:@selector(openDashboard:) data:nil]];
 }

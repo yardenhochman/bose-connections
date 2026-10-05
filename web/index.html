@@ -2,6 +2,7 @@
 <main><header><a class="brand" href="./" aria-label="Bose connections home">Bose 700<span>Connections</span></a><button id="settings" class="subtle">Settings</button></header>
 <section class="summary"><div><span class="status-dot" id="live-dot"></span><strong id="headset-status">Checking connections</strong><small id="headset-detail">Finding a controller that can reach your headphones.</small></div><div class="metrics"><span><strong id="slots">— / 2</strong><small>CONNECTED</small></span><span><strong id="battery">—</strong><small>BATTERY</small></span></div></section>
 <section class="controllers" id="controllers" aria-label="Your controllers"></section>
+<section id="noise-controls" class="summary" hidden><div><strong>Noise cancellation</strong><small id="noise-current"></small></div><div class="noise-input"><input id="noise-level" type="range" min="0" max="10" step="1" aria-label="Noise cancellation level"><output id="noise-value">—</output><button id="noise-apply">Apply</button><button id="noise-off">Off</button></div></section>
 <section class="device-section"><div class="section-title"><div><h2>Saved devices</h2></div><button id="refresh" class="subtle">↻ Refresh</button></div><div id="devices" class="devices"><div class="empty">Loading your devices…</div></div></section>
 <div id="message" role="status" aria-live="polite"></div>
 </main>

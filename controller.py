@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Local GUI and authenticated symmetric relay for the personal Bose controller."""
-import argparse, concurrent.futures, hmac, http.client, ipaddress, json, os, queue, socket, sys, threading, time
+import argparse, concurrent.futures, hmac, http.client, ipaddress, json, os, queue, socket, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.parse import urlsplit
-from protocol import connection, mac_bytes, ProtocolError, ActionUnconfirmed
+from protocol import connection, mac_bytes, ProtocolError, ActionUnconfirmed, validate_noise
 ROOT=Path(__file__).resolve().parent
 MAIN_TASKS=queue.Queue()
 def on_main(func):
@@ -15,6 +15,7 @@ class Controller:
     def __init__(self,config):
         self.config=config;self.lock=threading.Lock();self.channel=config.get('channel',2)
         self.cache={};self.last_error=None
+        self.discovery_lock=threading.Lock();self.discovery_timer=None;self.discovery_restore=None
         self.status_pool=concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.probes={};self.probe_lock=threading.Lock();self.snapshot_lock=threading.Lock()
     def cached_overview(self):
@@ -31,6 +32,17 @@ class Controller:
         if sys.platform=='darwin' and threading.current_thread()!=threading.main_thread():return on_main(self.local_status)
         with self.lock:
             try:
+                if sys.platform.startswith('linux'):
+                    mac_bytes(self.config['headset'])
+                    adapter=self.config.get('adapter','hci0')
+                    if not adapter.startswith('hci') or not adapter[3:].isdigit():raise ValueError('Invalid BlueZ adapter')
+                    path='/org/bluez/'+adapter+'/dev_'+self.config['headset'].replace(':','_')
+                    status=subprocess.run(['busctl','get-property','org.bluez',path,'org.bluez.Device1','Connected'],capture_output=True,text=True,timeout=2,check=True)
+                    if status.stdout.strip()!='b true':raise ProtocolError('Headset is not connected to this PC')
+                if sys.platform=='darwin':
+                    from IOBluetooth import IOBluetoothDevice
+                    device=IOBluetoothDevice.deviceWithAddressString_(self.config['headset'])
+                    if not device or not device.isConnected():raise ProtocolError('Headset is not connected to this Mac')
                 with connection(self.config['headset'],self.channel) as client:state=client.status()
                 state.update(reachable=True,node=self.config['name'],controller=self.config['id'],observed=time.time())
                 self.cache=state;self.last_error=None
@@ -52,7 +64,30 @@ class Controller:
             return json.loads(raw)
         except Exception as e:return dict(reachable=False,node=peer['name'],controller=peer['id'],error=f'Controller unavailable: {type(e).__name__}')
         finally:con.close()
-    def overview(self,wait_all=False):
+    def prepare_connect(self,data):
+        # BlueZ can be powered but non-connectable when hidden. A short visibility
+        # window permits the paired headset's incoming connection without root.
+        target=data.get('address','').upper();mac_bytes(target)
+        if target!=self.config.get('roles',{}).get(self.config['id']):
+            raise ValueError('Only this controller can prepare its own Bluetooth connection')
+        if not sys.platform.startswith('linux'):return dict(ok=True)
+        adapter=self.config.get('adapter','hci0')
+        if not adapter.startswith('hci') or not adapter[3:].isdigit():raise ValueError('Invalid BlueZ adapter')
+        base=['busctl']
+        path='/org/bluez/'+adapter
+        with self.discovery_lock:
+            if self.discovery_restore is None:
+                value=subprocess.run(base+['get-property','org.bluez',path,'org.bluez.Adapter1','Discoverable'],capture_output=True,text=True,timeout=2,check=True).stdout.strip()
+                self.discovery_restore=value=='b true'
+            subprocess.run(base+['set-property','org.bluez',path,'org.bluez.Adapter1','Discoverable','b','true'],capture_output=True,timeout=2,check=True)
+            if self.discovery_timer:self.discovery_timer.cancel()
+            def restore():
+                with self.discovery_lock:
+                    try:subprocess.run(base+['set-property','org.bluez',path,'org.bluez.Adapter1','Discoverable','b',str(self.discovery_restore).lower()],capture_output=True,timeout=2,check=True)
+                    finally:self.discovery_restore=None;self.discovery_timer=None
+            self.discovery_timer=threading.Timer(30,restore);self.discovery_timer.daemon=True;self.discovery_timer.start()
+        return dict(ok=True)
+    def overview(self,wait_all=False,exclude_current=None):
         # Reuse unfinished probes; show a fresh successful controller immediately.
         sources=[(self.config['id'],self.config['name'],self.local_status)]+[
             (p['id'],p['name'],lambda p=p:self.peer_call(p,'/api/status')) for p in self.config.get('peers',[])]
@@ -65,7 +100,7 @@ class Controller:
         remaining={job for _,_,job in jobs};deadline=time.monotonic()+35
         while remaining:
             done,remaining=concurrent.futures.wait(remaining,timeout=max(0,deadline-time.monotonic()),return_when=concurrent.futures.FIRST_COMPLETED)
-            if (not wait_all and any(j.result().get('reachable') for j in done)) or not done:break
+            if (not wait_all and any(j.result().get('reachable') and not any(d.get('current') and d['address']==exclude_current for d in j.result().get('devices',[])) for j in done)) or not done:break
         states=[job.result() if job.done() else dict(controller=ident,node=name,reachable=False,checking=True,devices=[])
                 for ident,name,job in jobs]
         valid=[s for s in states if s.get('reachable')]
@@ -75,14 +110,22 @@ class Controller:
         for state in valid:
             for d in state.get('devices',[]):
                 if d.get('current'):roles[state['controller']]=d['address']
-        result=dict(controllers=states,devices=devices,roles=roles,reachable=bool(valid),battery=(freshest or {}).get('battery'),capacity=2,here=self.config['id'],known_roles=self.config.get('roles',{}),observed=(freshest or {}).get('observed'),cached=False)
+        result=dict(controllers=states,devices=devices,roles=roles,reachable=bool(valid),battery=(freshest or {}).get('battery'),capacity=2,here=self.config['id'],known_roles=self.config.get('roles',{}),observed=(freshest or {}).get('observed'),cached=False,noise=(freshest or {}).get('noise'))
         if valid:self.store_snapshot(result)
         elif not wait_all:
             previous=self.cached_overview()
-            result.update(devices=previous['devices'],observed=previous.get('observed'),cached=bool(previous['devices']))
+            result.update(devices=previous['devices'],observed=previous.get('observed'),cached=bool(previous['devices']),noise=previous.get('noise'))
         return result
     def local_action(self,data):
         if sys.platform=='darwin' and threading.current_thread()!=threading.main_thread():return on_main(lambda:self.local_action(data))
+        if data.get('action')=='noise':
+            level=data.get('level');enabled=data.get('enabled');validate_noise(level,enabled)
+            with self.lock:
+                with connection(self.config['headset'],self.channel) as client:
+                    ident=client.request(0,3)
+                    if len(ident)!=3 or ident[:2]!=b'\x40\x24':raise ProtocolError('This controller supports only the Bose NC700')
+                    result=client.set_noise(level,enabled)
+            return dict(ok=True,verified=True,noise=result,message='Noise cancellation updated')
         action=data.get('action');target=data.get('address','').upper();replace=data.get('replace','').upper()
         mac_bytes(target)
         if action not in ('connect','disconnect'):raise ValueError('Unknown action')
@@ -96,6 +139,7 @@ class Controller:
                 connected={d['address'] for d in devices.values() if d['connected']}
                 disconnect=target if action=='disconnect' else replace
                 if action=='connect' and target in connected:return dict(ok=True,verified=True,state=before,message='Already connected')
+                if action=='disconnect' and target not in connected:return dict(ok=True,verified=True,state=before,message='Already disconnected')
                 if action=='connect' and len(connected)>=2 and not replace:
                     raise ValueError('Both slots are occupied. Choose which device to replace.')
                 if disconnect:
@@ -123,7 +167,8 @@ class Controller:
                     time.sleep(.5)
                 raise ProtocolError('Command acknowledged but connection change was not verified. Refresh before trying again.')
     def override(self,data):
-        overview=self.overview(wait_all=True)
+        disconnect=data.get('replace') if data.get('action')=='connect' else data.get('address')
+        overview=self.overview(exclude_current=disconnect)
         anchors=list(set(overview['roles'].values()))
         data={**data,'anchors':anchors}
         eligible=[s for s in overview['controllers'] if s.get('reachable')]
@@ -131,6 +176,14 @@ class Controller:
         disconnect=data.get('replace') if data.get('action')=='connect' else data.get('address')
         eligible=[s for s in eligible if not any(d.get('current') and d['address']==disconnect for d in s.get('devices',[]))]
         if not eligible:raise ValueError('No controller can perform this change while retaining access. Refresh or connect a controller manually.')
+        if data.get('action')=='connect':
+            target=data.get('address','').upper()
+            if target==overview['roles'].get(self.config['id']):self.prepare_connect(data)
+            else:
+                destination=next((p for p in self.config.get('peers',[]) if target==overview['roles'].get(p['id'])),None)
+                if destination and destination['id']=='pc':
+                    prepared=self.peer_call(destination,'/api/prepare-connect',{'address':target})
+                    if not prepared.get('ok'):raise ValueError(prepared.get('error','Target controller unavailable'))
         state=eligible[0]
         if state['controller']==self.config['id']:return self.local_action(data)
         peer=next(p for p in self.config['peers'] if p['id']==state['controller'])
@@ -192,6 +245,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data,dict):raise ValueError('Invalid request')
             path=urlsplit(self.path).path
             if path=='/api/override' and not self.server.mesh:result=self.server.controller.override(data)
+            elif path=='/api/prepare-connect':result=self.server.controller.prepare_connect(data)
             elif path=='/api/action' and self.server.mesh:result=self.server.controller.local_action(data)
             elif path=='/api/roles' and not self.server.mesh:
                 roles=data.get('roles',{})

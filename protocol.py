@@ -1,5 +1,5 @@
-"""Small NC700 BMAP client. No firmware, pairing-list deletion or settings writes."""
-import socket, time, sys
+"""NC700 connection and ANC client. No firmware or pairing-list deletion."""
+import errno, socket, time, sys
 from contextlib import contextmanager
 
 class ProtocolError(Exception): pass
@@ -23,11 +23,20 @@ def parse_info(payload, address):
         raise ProtocolError('Unexpected device information layout; refusing changes')
     return dict(address=mac_text(address),name=payload[9:].split(b'\0')[0].decode('utf-8','replace') or mac_text(address),connected=payload[6] in (1,3),current=payload[6]==3)
 
+def parse_noise(payload):
+    if len(payload)!=3 or payload[0]!=11 or payload[1]>10 or payload[2] not in (0,1):
+        raise ProtocolError('Unknown NC700 noise-control layout; refusing changes')
+    return dict(level=10-payload[1],enabled=bool(payload[2]))
+
+def validate_noise(level,enabled):
+    if type(level) is not int or not 0<=level<=10 or type(enabled) is not bool:
+        raise ValueError('Noise level must be 0–10 and enabled must be boolean')
+
 class Client:
     def __init__(self,sock): self.sock=sock; self.buf=bytearray()
-    def request(self,block,func,op=1,payload=b'',expected=(3,)):
+    def request(self,block,func,op=1,payload=b'',expected=(3,),timeout=4):
         self.sock.sendall(bytes([block,func,op,len(payload)])+payload)
-        deadline=time.monotonic()+4
+        deadline=time.monotonic()+timeout
         while time.monotonic()<deadline:
             while len(self.buf)>=4 and len(self.buf)>=4+self.buf[3]:
                 n=4+self.buf[3]; packet=bytes(self.buf[:n]);del self.buf[:n]
@@ -35,11 +44,31 @@ class Client:
                 kind=packet[2]&15
                 if kind==15: raise ProtocolError(f'Headset rejected {block}.{func}: {packet[4:].hex()}')
                 if kind in expected:return packet[4:]
+            if hasattr(self.sock,'settimeout'):self.sock.settimeout(max(.01,deadline-time.monotonic()))
             data=self.sock.recv(4096)
             if not data: raise ProtocolError('Headset closed the control connection')
             self.buf.extend(data)
             if len(self.buf)>16384:raise ProtocolError('Invalid oversized Bluetooth response')
         raise ProtocolError('Headset did not acknowledge the command')
+    def noise(self):return parse_noise(self.request(1,5))
+    def write_noise(self,level,enabled):
+        try:self.request(1,5,2,bytes([10-level,int(enabled)]),timeout=.25)
+        except Exception as e:
+            if not (isinstance(e,socket.timeout) or type(e).__name__=='BmapTimeoutError' or (isinstance(e,ProtocolError) and 'acknowledge' in str(e))):raise
+            # Some firmware applies SETGET without sending its STATUS reply.
+            # Continue with a read, never repeat an ambiguous write.
+    def set_noise(self,level,enabled):
+        validate_noise(level,enabled)
+        before=self.noise()
+        self.write_noise(level,enabled)
+        after=self.noise()
+        # NC700 enabling from Off can reset to maximum. Correct only after a
+        # confirmed read; never resend an unconfirmed write.
+        if not before['enabled'] and enabled and after['enabled'] and after['level']!=level:
+            self.write_noise(level,True);after=self.noise()
+        if after['enabled']!=enabled or (enabled and after['level']!=level):
+            raise ProtocolError('Noise-control change was not verified; refresh before retrying')
+        return after
     def status(self):
         ident=self.request(0,3)
         if len(ident)!=3 or ident[:2]!=b'\x40\x24':
@@ -51,12 +80,15 @@ class Client:
             raw=self.request(2,2)
             if len(raw)==1 and raw[0]<=100:battery=raw[0]
         except ProtocolError:pass
-        return {'devices':devices,'battery':battery,'product':'Bose 700','capacity':2}
+        noise=None
+        try:noise=self.noise()
+        except Exception:pass
+        return {'devices':devices,'battery':battery,'product':'Bose 700','capacity':2,'noise':noise}
     def action(self,action,address):
         a=mac_bytes(address)
         try:
             if action=='connect': self.request(4,1,5,b'\0'+a,expected=(7,))
-            elif action=='disconnect':self.request(4,2,5,a,expected=(7,))
+            elif action=='disconnect':self.request(4,2,5,a,expected=(7,),timeout=.25)
             else:raise ValueError('Unknown action')
         except Exception as e:
             if isinstance(e,socket.timeout) or type(e).__name__=='BmapTimeoutError' or (isinstance(e,ProtocolError) and 'acknowledge' in str(e)):
@@ -69,13 +101,14 @@ class MacSocket:
         sys.path.insert(0,str(__import__('pathlib').Path(__file__).parent/'vendor/bosectl/python'))
         from pybmap.transport import MacOsRfcommTransport
         self.transport=MacOsRfcommTransport(address,channel,timeout=4)
-        self.transport.connect(); self.data=b''
+        self.transport.connect(); self.data=b'';self.timeout=4
     def sendall(self,data):
         status=self.transport.channel.writeSync_length_(data,len(data))
         if status!=0:raise ProtocolError(f'Bluetooth write failed: {status}')
+    def settimeout(self,value):self.timeout=value
     def recv(self,n):
         from Foundation import NSRunLoop,NSDate,NSDefaultRunLoopMode
-        deadline=time.monotonic()+4
+        deadline=time.monotonic()+self.timeout
         while time.monotonic()<deadline:
             if not self.transport.delegate.received_queue.empty():
                 return bytes(self.transport.delegate.received_queue.get())
@@ -91,7 +124,15 @@ def connection(address,channel):
         if sys.platform=='darwin':sock=MacSocket(address,channel)
         else:
             sock=socket.socket(socket.AF_BLUETOOTH,socket.SOCK_STREAM,socket.BTPROTO_RFCOMM)
-            sock.settimeout(4);sock.connect((address,channel))
+            for attempt in range(12):
+                sock.settimeout(4)
+                try:sock.connect((address,channel));break
+                except OSError as e:
+                    if e.errno!=errno.EBUSY or attempt==11:raise
+                    # RFCOMM close completes asynchronously. Retry only opening
+                    # the socket, before sending any protocol command.
+                    sock.close();time.sleep(.1)
+                    sock=socket.socket(socket.AF_BLUETOOTH,socket.SOCK_STREAM,socket.BTPROTO_RFCOMM)
         yield Client(sock)
     finally:
         if sock:sock.close()

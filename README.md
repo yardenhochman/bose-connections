@@ -5,6 +5,8 @@ See the headset's saved devices, connect or disconnect them, and choose which
 connection to replace when both Bluetooth slots are occupied.
 
 - Shared dashboard for Linux, macOS and Android.
+- Noise cancellation levels 0–10 and Off, with verified headset state.
+- Android Quick Settings tile with a compact connections and ANC panel.
 - Native Mac menu-bar headphones icon and an Omarchy Linux top-bar popup.
 - Optional authenticated controller-to-controller relay over Tailscale: an
   unconnected computer can send a request through a controller that reaches the headset.
@@ -14,10 +16,17 @@ connection to replace when both Bluetooth slots are occupied.
 
 Independent community project; not affiliated with Bose. **Experimental:**
 macOS reads and disconnect/reconnect have been verified on one NC700 running
-firmware 1.8.2. Linux-to-Mac relay is verified. Android installs/builds, but direct
-Bluetooth control has not yet been verified successfully. Linux direct Bluetooth,
-menu click acceptance, sleep/reboot recovery and automatic controller retention
-still need testing. This does not support other Bose models.
+firmware 1.8.2. Linux direct reads and phone disconnect/reconnect are also verified,
+as are ANC levels 9 and 10. Relay switching has succeeded but repeated recovery
+checks have been inconsistent. Android installs/builds and its Quick Settings tile
+is registered; direct Bluetooth and tile dialog behavior still need validation.
+Sleep/reboot recovery and automatic controller retention remain experimental.
+This does not support other Bose models.
+
+Noise cancellation offers levels **0–10** and **Off**. Unknown packet layouts
+refuse writes. Changes are read back from the headset; missing acknowledgements
+trigger verification, never a blind repeat. Enabling ANC may reset the NC700 to
+maximum, so a second write occurs only after a confirmed read of that transition.
 
 ## What is authoritative?
 
@@ -103,6 +112,13 @@ select which device to disconnect. The same backend protections apply to menu an
 dashboard actions. Other Linux desktops can use the web dashboard; a generic
 system-tray implementation is not included.
 
+On Linux, preparing a connection briefly enables BlueZ discovery for up to 30
+seconds and restores the previous setting, allowing incoming connections to a
+powered but non-connectable adapter. Status checks do not dial disconnected PC/Mac
+hosts. Actions select the first eligible controller and always check actual headset
+state before changing connections. Linux requires the `busctl` utility (systemd);
+`adapter` in private config defaults to `hci0` for the paired headset.
+
 ## Android
 
 Requires Android 8+; build target is Android 15 (API 35). Install JDK 17+ and the
@@ -128,16 +144,24 @@ The app's foreground service listens on its detected Tailscale interface while
 running and retains a notification. No boot receiver is installed. VPN rebinding,
 screen-off behavior and direct Bluetooth control remain experimental.
 
+### Android Quick Settings
+
+Add **Bose** using the Quick Settings panel's edit button after installation. Tap
+the tile for a compact device list, connect/disconnect and explicit slot replacement,
+plus ANC level and Off controls. It uses the same private config and cached state
+as the app; cached entries display immediately, and mutations require live state.
+A locked phone must be unlocked before controls open. Long-press opens app settings.
+
 ## Development
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-The 15 protocol/controller tests use simulated transports and have no hardware
+The 28 protocol/controller tests use simulated transports and have no hardware
 side effects. They cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
-persistence. CI runs them on Python 3.12 and 3.13.
+persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
 
 For GUI checks, start the local helper, install Node dependencies (`npm install`)
 and Chromium, then run `npm run test:gui`. Set `CHROMIUM_PATH` or `BOSE_URL` if
@@ -153,7 +177,7 @@ screenshots under `artifacts/`; it sends no connection mutations.
 - Android: stop the relay in controller-link settings or uninstall the app.
 
 Retain private configuration/signing files if reinstalling. The controller does
-not delete pairings, update firmware or change noise-cancellation settings.
+not delete pairings or update firmware. ANC settings change only on explicit actions.
 
 ## License and credits
 

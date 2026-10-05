@@ -9,6 +9,8 @@ import java.util.concurrent.*;
 
 public class Core {
  static final Object LOCK=new Object();
+ static final ExecutorService STATUS_POOL=Executors.newFixedThreadPool(3);
+ static final Map<String,Future<JSONObject>> PROBES=new HashMap<>();
  static final String HEADSET="";
  static final UUID BMAP=UUID.fromString("00000000-deca-fade-deca-deafdecacaff");
  static JSONObject config(Context c)throws Exception{
@@ -44,8 +46,9 @@ public class Core {
     int available=in.available();if(available==0){Thread.sleep(10);continue;}int got=in.read(b,pos,Math.min(available,n-pos));if(got<0)throw new IOException("Headset closed the connection");pos+=got;
    }return b;
   }
-  byte[] request(int block,int func,int op,byte[] p,int wanted)throws Exception{
-   out.write(new byte[]{(byte)block,(byte)func,(byte)op,(byte)p.length});out.write(p);out.flush();long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+  byte[] request(int block,int func,int op,byte[] p,int wanted)throws Exception{return request(block,func,op,p,wanted,5000);}
+  byte[] request(int block,int func,int op,byte[] p,int wanted,int timeout)throws Exception{
+   out.write(new byte[]{(byte)block,(byte)func,(byte)op,(byte)p.length});out.write(p);out.flush();long deadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(timeout);
    for(int count=0;count<100;count++){
     byte[] h=exact(4,deadline);byte[] data=exact(h[3]&255,deadline);
     if((h[0]&255)!=block||(h[1]&255)!=func)continue;
@@ -55,6 +58,17 @@ public class Core {
    }throw new IOException("No matching headset response");
   }
   byte[] get(int b,int f,byte[] p)throws Exception{return request(b,f,1,p,3);}
+  JSONObject noise()throws Exception{
+   byte[] p=get(1,5,new byte[0]);if(p.length!=3||p[0]!=11||(p[1]&255)>10||(p[2]!=0&&p[2]!=1))throw new IOException("Unknown NC700 noise-control layout; refusing changes");
+   return new JSONObject().put("level",10-(p[1]&255)).put("enabled",p[2]!=0);
+  }
+  void writeNoise(int level,boolean enabled)throws Exception{try{request(1,5,2,new byte[]{(byte)(10-level),(byte)(enabled?1:0)},3,250);}catch(ReadTimeout ignored){}}
+  JSONObject setNoise(int level,boolean enabled)throws Exception{
+   if(level<0||level>10)throw new IOException("Noise level must be 0–10");JSONObject before=noise();
+   writeNoise(level,enabled);JSONObject after=noise();
+   if(!before.getBoolean("enabled")&&enabled&&after.getBoolean("enabled")&&after.getInt("level")!=level){writeNoise(level,true);after=noise();}
+   if(after.getBoolean("enabled")!=enabled||(enabled&&after.getInt("level")!=level))throw new IOException("Noise-control change was not verified; refresh before retrying");return after;
+  }
   JSONObject status()throws Exception{
    byte[] id=get(0,3,new byte[0]);if(id.length!=3||id[0]!=0x40||id[1]!=0x24)throw new IOException("This controller supports only the Bose NC700");
    byte[] list=get(4,4,new byte[0]);if(list.length<1||(list.length-1)%6!=0||list.length>49)throw new IOException("Unexpected device-list layout; refusing changes");
@@ -65,9 +79,10 @@ public class Core {
     devices.put(new JSONObject().put("address",address(a)).put("name",name.isEmpty()?address(a):name).put("connected",info[6]!=0).put("current",info[6]==3));
    }
    Object battery=JSONObject.NULL;try{byte[] b=get(2,2,new byte[0]);if(b.length==1&&(b[0]&255)<=100)battery=b[0]&255;}catch(Exception ignored){}
-   return new JSONObject().put("devices",devices).put("battery",battery).put("capacity",2).put("product","Bose 700");
+   Object noise=JSONObject.NULL;try{noise=noise();}catch(Exception ignored){}
+   return new JSONObject().put("noise",noise).put("devices",devices).put("battery",battery).put("capacity",2).put("product","Bose 700");
   }
-  void action(String action,String target)throws Exception{byte[] a=address(target);try{if(action.equals("connect")){byte[] p=new byte[7];System.arraycopy(a,0,p,1,6);request(4,1,5,p,7);}else if(action.equals("disconnect"))request(4,2,5,a,7);else throw new IOException("Unknown action");}catch(ReadTimeout unconfirmed){/* State verification is mandatory in Core.action. Do not resend. */}}
+  void action(String action,String target)throws Exception{byte[] a=address(target);try{if(action.equals("connect")){byte[] p=new byte[7];System.arraycopy(a,0,p,1,6);request(4,1,5,p,7);}else if(action.equals("disconnect"))request(4,2,5,a,7,250);else throw new IOException("Unknown action");}catch(ReadTimeout unconfirmed){/* State verification is mandatory in Core.action. Do not resend. */}}
   public void close(){if(expiry!=null)expiry.cancel(false);timer.shutdownNow();try{if(socket!=null)socket.close();}catch(Exception ignored){}}
  }
  static JSONObject status(Context c){synchronized(LOCK){try(Client client=new Client(c)){return client.status().put("reachable",true).put("node","Phone").put("controller","phone").put("observed",System.currentTimeMillis()/1000.0);}catch(Exception e){JSONObject o=error(e);try{o.put("node","Phone").put("controller","phone").put("devices",new JSONArray());}catch(Exception ignored){}return o;}}}
@@ -79,18 +94,34 @@ public class Core {
   int code=con.getResponseCode();JSONObject result=new JSONObject(read(code>=400?con.getErrorStream():con.getInputStream(),65536));return result;
  }catch(Exception e){JSONObject o=error(e);try{o.put("controller",p.optString("id")).put("node",p.optString("name"));}catch(Exception ignored){}return o;}finally{if(con!=null)con.disconnect();}}
  static boolean tailnet(String ip){try{String[] p=ip.split("\\.");return p.length==4&&Integer.parseInt(p[0])==100&&Integer.parseInt(p[1])>=64&&Integer.parseInt(p[1])<=127;}catch(Exception e){return false;}}
- static JSONObject overview(Context c)throws Exception{
-  JSONArray peers=config(c).optJSONArray("peers");ExecutorService pool=Executors.newFixedThreadPool(3);List<Future<JSONObject>> jobs=new ArrayList<>();
-  try{jobs.add(pool.submit(()->status(c)));if(peers!=null)for(int i=0;i<peers.length();i++){final JSONObject p=peers.getJSONObject(i);jobs.add(pool.submit(()->peer(c,p,"/api/status",null)));}
-   JSONArray states=new JSONArray(),devices=new JSONArray();JSONObject roles=new JSONObject(config(c).optJSONObject("roles")==null?"{}":config(c).getJSONObject("roles").toString());Object battery=JSONObject.NULL;boolean reachable=false;double freshest=0;
-   for(Future<JSONObject> j:jobs){JSONObject s=j.get();states.put(s);if(s.optBoolean("reachable")){reachable=true;if(s.optDouble("observed")>=freshest){freshest=s.optDouble("observed");devices=s.getJSONArray("devices");battery=s.opt("battery");}JSONArray ds=s.getJSONArray("devices");for(int k=0;k<ds.length();k++){JSONObject d=ds.getJSONObject(k);if(d.optBoolean("current"))roles.put(s.getString("controller"),d.getString("address"));}}}
-   JSONObject result=new JSONObject().put("controllers",states).put("devices",devices).put("roles",roles).put("reachable",reachable).put("battery",battery).put("capacity",2).put("here","phone").put("observed",freshest).put("cached",false);
-   if(reachable)try(FileOutputStream out=new FileOutputStream(new File(c.getFilesDir(),"snapshot.json"))){out.write(result.toString().getBytes("UTF-8"));}
-   return result;
-  }finally{pool.shutdownNow();}
+ static JSONObject overview(Context c)throws Exception{return overview(c,"");}
+ static boolean eligible(JSONObject state,String exclude)throws Exception{
+  if(!state.optBoolean("reachable"))return false;JSONArray ds=state.optJSONArray("devices");
+  if(ds!=null)for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.optBoolean("current")&&d.optString("address").equals(exclude))return false;}return true;
+ }
+ static JSONObject overview(Context c,String exclude)throws Exception{
+  JSONObject conf=config(c);JSONArray peers=conf.optJSONArray("peers");Map<String,Future<JSONObject>> jobs=new LinkedHashMap<>();Map<String,String> names=new HashMap<>();
+  synchronized(PROBES){
+   Future<JSONObject> local=PROBES.get("phone");if(local==null||local.isDone())PROBES.put("phone",local=STATUS_POOL.submit(()->status(c)));jobs.put("phone",local);names.put("phone","Phone");
+   if(peers!=null)for(int i=0;i<peers.length();i++){final JSONObject p=peers.getJSONObject(i);String id=p.getString("id");Future<JSONObject> job=PROBES.get(id);if(job==null||job.isDone())PROBES.put(id,job=STATUS_POOL.submit(()->peer(c,p,"/api/status",null)));jobs.put(id,job);names.put(id,p.optString("name",id));}
+  }
+  long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(35);
+  while(System.nanoTime()<deadline){boolean all=true,ready=false;for(Future<JSONObject> job:jobs.values()){if(!job.isDone())all=false;else if(eligible(job.get(),exclude))ready=true;}if(all||ready)break;Thread.sleep(10);}
+  JSONArray states=new JSONArray(),devices=new JSONArray();JSONObject roles=new JSONObject(conf.optJSONObject("roles")==null?"{}":conf.getJSONObject("roles").toString());Object battery=JSONObject.NULL,noise=JSONObject.NULL;boolean reachable=false;double freshest=0;
+  for(Map.Entry<String,Future<JSONObject>> entry:jobs.entrySet()){
+   Future<JSONObject> job=entry.getValue();JSONObject state=job.isDone()?job.get():new JSONObject().put("controller",entry.getKey()).put("node",names.get(entry.getKey())).put("reachable",false).put("checking",true).put("devices",new JSONArray());states.put(state);
+   if(state.optBoolean("reachable")){reachable=true;if(state.optDouble("observed")>=freshest){freshest=state.optDouble("observed");devices=state.getJSONArray("devices");battery=state.opt("battery");noise=state.opt("noise");}JSONArray ds=state.getJSONArray("devices");for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.optBoolean("current"))roles.put(state.getString("controller"),d.getString("address"));}}
+  }
+  JSONObject result=new JSONObject().put("controllers",states).put("devices",devices).put("roles",roles).put("reachable",reachable).put("battery",battery).put("capacity",2).put("here","phone").put("observed",freshest).put("cached",false).put("noise",noise==null?JSONObject.NULL:noise);
+  if(reachable)try(FileOutputStream out=new FileOutputStream(new File(c.getFilesDir(),"snapshot.json"))){out.write(result.toString().getBytes("UTF-8"));}
+  return result;
  }
  static Set<String> connected(JSONObject state)throws Exception{Set<String> set=new HashSet<>();JSONArray ds=state.getJSONArray("devices");for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.getBoolean("connected"))set.add(d.getString("address"));}return set;}
  static JSONObject action(Context c,JSONObject data)throws Exception{synchronized(LOCK){try(Client client=new Client(c)){
+  if(data.getString("action").equals("noise")){
+   Object level=data.get("level"),enabled=data.get("enabled");if(!(level instanceof Integer)||!(enabled instanceof Boolean))throw new IOException("Invalid noise-control values");byte[] id=client.get(0,3,new byte[0]);if(id.length!=3||id[0]!=0x40||id[1]!=0x24)throw new IOException("This controller supports only the Bose NC700");
+   JSONObject result=client.setNoise((Integer)level,(Boolean)enabled);return new JSONObject().put("ok",true).put("verified",true).put("noise",result).put("message","Noise cancellation updated");
+  }
   String a=data.getString("action"),target=data.getString("address").toUpperCase(Locale.ROOT),replace=data.optString("replace").toUpperCase(Locale.ROOT);address(target);if(!a.equals("connect")&&!a.equals("disconnect"))throw new IOException("Unknown action");
   JSONObject before=client.status();JSONArray ds=before.getJSONArray("devices");Set<String> anchors=new HashSet<>(),current=new HashSet<>(),all=new HashSet<>();
   JSONObject roles=config(c).optJSONObject("roles");if(roles!=null){Iterator<String> it=roles.keys();while(it.hasNext())anchors.add(roles.getString(it.next()));}
@@ -105,8 +136,10 @@ public class Core {
   for(int i=0;i<8;i++){JSONObject after=client.status();if(connected(after).contains(target)==a.equals("connect"))return new JSONObject().put("ok",true).put("verified",true).put("message","Connection updated").put("state",after);Thread.sleep(500);}throw new IOException("Change not verified. Refresh before trying again.");
  }}}
  static JSONObject override(Context c,JSONObject data)throws Exception{
-  JSONObject view=overview(c);JSONArray anchors=new JSONArray();JSONObject roles=view.getJSONObject("roles");Iterator<String> it=roles.keys();while(it.hasNext())anchors.put(roles.getString(it.next()));data.put("anchors",anchors);
-  String drop=data.getString("action").equals("connect")?data.optString("replace"):data.getString("address");JSONArray states=view.getJSONArray("controllers");
+  String drop=data.getString("action").equals("connect")?data.optString("replace"):data.optString("address");
+  JSONObject view=overview(c,drop);JSONArray anchors=new JSONArray();JSONObject roles=view.getJSONObject("roles");Iterator<String> it=roles.keys();while(it.hasNext())anchors.put(roles.getString(it.next()));data.put("anchors",anchors);
+  if(data.optString("action").equals("connect")&&data.optString("address").equals(roles.optString("pc"))){JSONArray ps=config(c).getJSONArray("peers");for(int i=0;i<ps.length();i++){JSONObject p=ps.getJSONObject(i);if(p.optString("id").equals("pc")){JSONObject prepared=peer(c,p,"/api/prepare-connect",new JSONObject().put("address",data.getString("address")));if(!prepared.optBoolean("ok"))throw new IOException(prepared.optString("error","PC Bluetooth unavailable"));}}}
+  JSONArray states=view.getJSONArray("controllers");
   for(int i=0;i<states.length();i++){JSONObject s=states.getJSONObject(i);if(!s.optBoolean("reachable"))continue;boolean dropping=false;JSONArray ds=s.getJSONArray("devices");for(int k=0;k<ds.length();k++){JSONObject d=ds.getJSONObject(k);if(d.optBoolean("current")&&d.getString("address").equals(drop))dropping=true;}if(dropping)continue;if(s.getString("controller").equals("phone"))return action(c,data);JSONArray ps=config(c).getJSONArray("peers");for(int k=0;k<ps.length();k++){JSONObject p=ps.getJSONObject(k);if(p.getString("id").equals(s.getString("controller")))return peer(c,p,"/api/action",data);}}
   throw new IOException("No controller can make this change while retaining access");
  }

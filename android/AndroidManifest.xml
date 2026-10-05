@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.bose.connections" android:versionCode="1" android:versionName="0.1">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.bose.connections" android:versionCode="2" android:versionName="0.2">
 <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35"/>
 <uses-permission android:name="android.permission.INTERNET"/>
 <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
@@ -8,6 +8,9 @@
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 <application android:label="Bose Connections" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:allowBackup="false" android:debuggable="true" android:usesCleartextTraffic="true">
-<activity android:name=".ConnectionsActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity>
+<activity android:name=".ConnectionsActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter><intent-filter><action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES"/><category android:name="android.intent.category.DEFAULT"/></intent-filter></activity>
+<service android:name=".BoseTileService" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:label="Bose" android:icon="@drawable/ic_headphones">
+<intent-filter><action android:name="android.service.quicksettings.action.QS_TILE"/></intent-filter>
+</service>
 <service android:name=".RelayService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
 </application></manifest>

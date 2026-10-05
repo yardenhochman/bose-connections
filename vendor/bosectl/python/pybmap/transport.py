@@ -96,11 +96,13 @@ if sys.platform == "darwin":
                 self.delegate = MacOsRfcommDelegate.alloc().init()
                 run_loop = NSRunLoop.currentRunLoop()
 
-                # 1. Query SDP first so macOS registers active Bluetooth services
-                self.device.performSDPQuery_(None)
-                start_sdp = time.time()
-                while time.time() - start_sdp < 1.5:
-                    run_loop.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.05))
+                # A connected, paired NC700 already has cached services. Avoid
+                # paying a fixed SDP delay for every status/action connection.
+                if not self.device.isConnected():
+                    self.device.performSDPQuery_(None)
+                    start_sdp = time.time()
+                    while time.time() - start_sdp < 1.5:
+                        run_loop.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.05))
 
                 # Already-connected devices may not emit another connection callback.
                 if self.device.isConnected():
@@ -133,7 +135,6 @@ if sys.platform == "darwin":
                 self.channel = channel
 
                 # 4. Flush any startup handshake/broadcast packets
-                time.sleep(0.5)
                 while not self.delegate.received_queue.empty():
                     try:
                         self.delegate.received_queue.get_nowait()
@@ -150,6 +151,11 @@ if sys.platform == "darwin":
             if self.channel:
                 try:
                     self.channel.closeChannel()
+                    # Keep the delegate alive until the asynchronous close is
+                    # delivered, allowing an immediate subsequent connection.
+                    deadline = time.monotonic() + 0.25
+                    while self.delegate and not self.delegate.closed_event.is_set() and time.monotonic() < deadline:
+                        NSRunLoop.currentRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.01))
                 except Exception:
                     pass
                 self.channel = None

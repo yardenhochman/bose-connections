@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as Controls
 import qs.Ui as Ui
 import qs.Commons
 
@@ -13,6 +14,8 @@ Ui.Panel {
   property string notice: ""
   property var replacementTarget: null
   property var request: null
+  property bool showSettings: false
+  property var editedRoles: ({})
   readonly property var connected: (snapshot.devices || []).filter(d => d.connected)
   readonly property var devices: (snapshot.devices || []).slice().sort((a,b) => Number(b.connected)-Number(a.connected))
 
@@ -45,16 +48,27 @@ Ui.Panel {
     replacementTarget = null
     query("/api/overview", null, json => { root.snapshot = json })
   }
+  function changeNoise(level,enabled) {
+    notice=""
+    query("/api/override",{action:"noise",level:level,enabled:enabled},json => {
+      root.notice=json.ok && json.verified ? "Noise cancellation updated" : "Change not verified. Refresh before retrying."
+      root.refresh()
+    })
+  }
   function change(action, address, replace) {
     notice = ""
     replacementTarget = null
     const data = {action:action,address:address}
     if(replace) data.replace = replace
     query("/api/override", data, json => {
-      root.notice = json.verified ? "Connection updated" : "Change not verified. Refresh before retrying."
+      root.notice = json.ok && json.verified ? "Connection updated" : "Change not verified. Refresh before retrying."
       root.refresh()
     })
   }
+  function saveRoles() {
+    query("/api/roles", {roles:editedRoles}, json => { root.notice = "Controller settings saved"; root.showSettings = false; root.refresh() })
+  }
+  function setRole(id,address) { const roles=Object.assign({},editedRoles); if(address) roles[id]=address; else delete roles[id]; editedRoles=roles }
   function choose(d) {
     if (d.connected) change("disconnect", d.address, "")
     else if (connected.length >= 2) replacementTarget = d
@@ -86,6 +100,11 @@ Ui.Panel {
     open: root.opened
     contentWidth: fittedContentWidth(Style.space(320))
     contentHeight: fittedContentHeight(column.implicitHeight)
+    Flickable {
+      anchors.fill: parent
+      contentHeight: column.implicitHeight
+      clip: true
+      Controls.ScrollBar.vertical: Controls.ScrollBar {}
     Column {
       id: column
       width: parent.width
@@ -93,7 +112,7 @@ Ui.Panel {
       Text { text: "Bose 700"; color: Color.foreground; font.family: Style.font.family; font.pixelSize: Style.font.body; font.bold: true }
       Text {
         width: parent.width
-        text: root.busy ? "Checking…" : root.replacementTarget ? "Connect " + root.label(root.replacementTarget) + " — disconnect:" : root.snapshot.reachable ? root.connected.length + " / 2 connected" : "Headset unavailable"
+        text: root.busy ? "Checking…" : root.replacementTarget ? "Connect " + root.label(root.replacementTarget) + " — disconnect:" : root.snapshot.cached ? "Last known device list" : root.snapshot.reachable ? root.connected.length + " / 2 connected" : "Headset unavailable"
         color: Color.muted; font.pixelSize: Style.font.body; wrapMode: Text.Wrap; textFormat: Text.PlainText
       }
       Text {
@@ -101,24 +120,83 @@ Ui.Panel {
         text: "Updated " + new Date((root.snapshot.observed || 0)*1000).toLocaleTimeString(Qt.locale(), "hh:mm")
         color: Color.muted; font.pixelSize: Style.font.body
       }
+      Text {
+        width: parent.width
+        visible: !root.busy && !root.snapshot.reachable
+        text: "No controller can reach the headset. Turn it on and connect it through Bluetooth settings. The saved list is not current."
+        color: Color.muted; wrapMode: Text.Wrap; font.pixelSize: Style.font.body
+      }
+      Text {
+        visible: root.snapshot.battery !== undefined && root.snapshot.battery !== null
+        text: "Battery: " + root.snapshot.battery + "%" + (root.snapshot.cached ? " (last known)" : "")
+        color: Color.muted; font.pixelSize: Style.font.body
+      }
+      Repeater {
+        model: root.snapshot.controllers || []
+        delegate: Text {
+          required property var modelData
+          width: column.width
+          text: modelData.node + ": " + (modelData.reachable ? "Available" : modelData.checking ? "Checking…" : "Unavailable")
+          color: Color.muted; font.pixelSize: Style.font.body
+        }
+      }
+      Column {
+        width: parent.width; spacing: Style.space(4)
+        visible: !!root.snapshot.noise
+        Text { text: "Noise cancellation"; color: Color.foreground; font.bold: true; font.pixelSize: Style.font.body }
+        Text { text: root.snapshot.noise && root.snapshot.noise.enabled ? "Level " + root.snapshot.noise.level + " / 10" : "Off"; color: Color.muted; font.pixelSize: Style.font.body }
+        Controls.Slider {
+          id: noiseSlider; width: parent.width; from:0; to:10; stepSize:1
+          value: root.snapshot.noise ? root.snapshot.noise.level : 10
+          enabled: !root.busy && root.snapshot.reachable && !root.snapshot.cached
+          onMoved: noiseChoice.text = "Apply level " + Math.round(value)
+        }
+        Text { text: "0 = aware · 10 = maximum"; color: Color.muted; font.pixelSize: Style.font.body }
+        Ui.Button { id: noiseChoice; width: parent.width; text: "Apply level " + Math.round(noiseSlider.value); enabled: noiseSlider.enabled; focusable:true; onClicked: root.changeNoise(Math.round(noiseSlider.value),true) }
+        Ui.Button { width: parent.width; text: "Turn noise cancellation off"; enabled: noiseSlider.enabled; focusable:true; onClicked: root.changeNoise(Math.round(noiseSlider.value),false) }
+      }
       Repeater {
         model: root.replacementTarget ? root.connected : root.devices
         delegate: Ui.Button {
           required property var modelData
           width: column.width
-          text: (root.replacementTarget ? "Disconnect " : modelData.connected ? "✓  " : "    ") + root.label(modelData)
+          text: (root.replacementTarget ? "Disconnect " : modelData.connected ? "✓  " : "    ") + root.label(modelData) + (!root.replacementTarget && !root.snapshot.cached ? modelData.connected ? " — Disconnect" : " — Connect" : "")
           leftAlign: true
           focusable: true
-          enabled: !root.busy && root.snapshot.reachable
+          enabled: !root.busy && root.snapshot.reachable && !root.snapshot.cached
           tooltipText: root.replacementTarget || modelData.connected ? "Disconnect" : "Connect"
           onClicked: root.replacementTarget ? root.change("connect",root.replacementTarget.address,modelData.address) : root.choose(modelData)
         }
       }
       Ui.Button { width: parent.width; visible: !!root.replacementTarget; text: "Cancel"; focusable: true; onClicked: root.replacementTarget = null }
       Text { width: parent.width; visible: root.notice !== ""; text: root.notice; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: Color.foreground; font.pixelSize: Style.font.body }
+      Ui.Button {
+        width: parent.width; text: root.showSettings ? "Close settings" : "Controller settings"; leftAlign:true; focusable:true; enabled: !root.busy
+        onClicked: { root.editedRoles=Object.assign({},root.snapshot.roles || {}); root.showSettings = !root.showSettings }
+      }
+      Column {
+        visible: root.showSettings; width: parent.width; spacing: Style.space(4)
+        Repeater {
+          model: ["pc","mac","phone"]
+          delegate: Column {
+            required property string modelData
+            width: column.width
+            Text { text: parent.modelData.toUpperCase(); color: Color.foreground; font.pixelSize: Style.font.body }
+            Controls.ComboBox {
+              width: parent.width
+              model: [{name:"Not identified",address:""}].concat(root.devices)
+              textRole: "name"; valueRole: "address"
+              currentIndex: { for(let i=0;i<model.length;i++) if(model[i].address === (root.editedRoles[parent.modelData] || "")) return i; return 0 }
+              onActivated: root.setRole(parent.modelData,currentValue)
+            }
+          }
+        }
+        Ui.Button { width: parent.width; text: "Save controller settings"; enabled: !root.busy; focusable:true; onClicked: root.saveRoles() }
+      }
       Rectangle { width: parent.width; height: 1; color: Color.muted; opacity: 0.4 }
       Ui.Button { width: parent.width; text: "Refresh"; leftAlign: true; focusable: true; enabled: !root.busy; onClicked: { root.notice = ""; root.refresh() } }
       Ui.Button { width: parent.width; text: "Open dashboard…"; leftAlign: true; focusable: true; onClicked: { root.close(); root.bar.run("xdg-open http://127.0.0.1:8847") } }
+    }
     }
   }
 }
