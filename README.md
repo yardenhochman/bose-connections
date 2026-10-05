@@ -14,12 +14,29 @@ connection to replace when both Bluetooth slots are occupied.
 - Connection changes reread headset state, preserve a known control device, and
   verify the result. An ambiguous command is never retried through another peer.
 
+## Screenshots
+
+Device and network names are anonymized; unrelated phone content is removed.
+
+<table>
+  <tr><th>Android dashboard</th><th>Quick Settings controls</th></tr>
+  <tr>
+    <td><img src="docs/screenshots/android-dashboard.png" width="360" alt="Android dashboard with generic devices and noise cancellation controls"></td>
+    <td><img src="docs/screenshots/android-quick-panel.png" width="360" alt="Compact Bose Quick Settings dialog with connection and ANC controls"></td>
+  </tr>
+</table>
+
+**Bose tile in Android Quick Settings** — the headphones icon at the upper left.
+
+<img src="docs/screenshots/android-quick-settings.png" width="600" alt="Samsung Quick Settings with the Bose headphones tile and anonymized network and headset names">
+
 Independent community project; not affiliated with Bose. **Experimental:**
 macOS reads and disconnect/reconnect have been verified on one NC700 running
 firmware 1.8.2. Linux direct reads and phone disconnect/reconnect are also verified,
 as are ANC levels 9 and 10. Relay switching has succeeded but repeated recovery
 checks have been inconsistent. Android installs/builds and its Quick Settings tile
-is registered; direct Bluetooth and tile dialog behavior still need validation.
+is registered, and its dialog appearance has been checked on Samsung Android.
+Android direct Bluetooth and recovery behavior still need validation.
 Sleep/reboot recovery and automatic controller retention remain experimental.
 This does not support other Bose models.
 
@@ -75,7 +92,8 @@ privacy attribution. Running the backend directly through SSH is not equivalent.
 
 ### Optional Tailscale relay
 
-Use each controller's actual Tailscale IPv4 address. For example:
+Use each controller's actual Tailscale IPv4 address. The addresses below are **illustrative placeholders**, not real device addresses.
+Replace every headset, adapter and Tailscale address with your own:
 
 ```sh
 python3 configure.py --id pc --headset AA:BB:CC:DD:EE:FF \
