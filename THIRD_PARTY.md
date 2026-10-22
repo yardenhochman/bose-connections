@@ -23,3 +23,6 @@ No Bose firmware, account login, or cloud authentication is used or modified.
 
 NC700 noise-control packet layout (Settings/CNC 1.5, inverted 0–10 level
 and enabled flag) is documented by [danielgjackson/noisecancel](https://github.com/danielgjackson/noisecancel), MIT. Packet handling is independently implemented here.
+
+The dashboard font is [Jost](https://github.com/indestructible-type/Jost) (variable, latin and latin-ext
+subsets as served by Google Fonts), SIL Open Font License 1.1; see web/fonts/OFL.txt.

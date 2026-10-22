@@ -1,11 +1,80 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#f3f1eb"><title>Bose · Connections</title><link rel="stylesheet" href="style.css"></head><body>
-<main><header><a class="brand" href="./" aria-label="Bose connections home">Bose 700<span>Connections</span></a><button id="settings" class="subtle">Settings</button></header>
-<section class="summary"><div><span class="status-dot" id="live-dot"></span><strong id="headset-status">Checking connections</strong><small id="headset-detail">Finding a controller that can reach your headphones.</small></div><div class="metrics"><span><strong id="slots">— / 2</strong><small>CONNECTED</small></span><span><strong id="battery">—</strong><small>BATTERY</small></span></div></section>
-<section class="controllers" id="controllers" aria-label="Your controllers"></section>
-<section id="noise-controls" class="summary" hidden><div><strong>Noise cancellation</strong><small id="noise-current"></small></div><div class="noise-input"><input id="noise-level" type="range" min="0" max="10" step="1" aria-label="Noise cancellation level"><output id="noise-value">—</output><button id="noise-apply">Apply</button><button id="noise-off">Off</button></div></section>
-<section class="device-section"><div class="section-title"><div><h2>Saved devices</h2></div><button id="refresh" class="subtle">↻ Refresh</button></div><div id="devices" class="devices"><div class="empty">Loading your devices…</div></div></section>
-<div id="message" role="status" aria-live="polite"></div>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#11181d" media="(prefers-color-scheme: dark)">
+<title>Bose · Connections</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<script>if(new URLSearchParams(location.search).get('view')==='popover')document.documentElement.classList.add('popover');</script>
+<link rel="preload" href="fonts/jost-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg width="0" height="0" class="defs" aria-hidden="true">
+ <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+ <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></symbol>
+ <symbol id="i-battery" viewBox="0 0 24 24"><rect x="2.5" y="7" width="17" height="10" rx="2.5"/><path d="M22 10.5v3"/></symbol>
+ <symbol id="i-desktop" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/></symbol>
+ <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/></symbol>
+ <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/></symbol>
+ <symbol id="i-tv" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="1.5"/><path d="M8 20.5h8"/></symbol>
+ <symbol id="i-device" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="3"/><circle cx="12" cy="14" r="3"/><path d="M11 7.5h2"/></symbol>
+ <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+ <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/></symbol>
+ <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+</svg>
+<main class="shell">
+ <header class="top">
+  <div class="title"><h1>Bose 700</h1><div class="sub"><span class="led checking" id="live-dot"></span><span id="slot-count" class="count" hidden></span><span id="headset-status">Checking…</span></div></div>
+  <div class="batt" id="battery-wrap" hidden><svg class="i" aria-hidden="true"><use href="#i-battery"/><rect id="battery-fill" x="4.5" y="9" width="11" height="6" rx="1" fill="currentColor" stroke="none"/></svg><span id="battery">—</span></div>
+  <button id="settings" class="iconbtn" type="button" aria-label="Settings"><svg class="i" aria-hidden="true"><use href="#i-gear"/></svg></button>
+ </header>
+
+ <div class="plot" id="plot" role="img" aria-label="Outside sound: unknown">
+  <div class="cap"><span>Outside sound</span><span id="noise-readout" class="num">—</span></div>
+  <canvas id="ridges" aria-hidden="true"></canvas>
+ </div>
+
+ <div class="col col-main">
+  <div class="choose" id="choose" hidden aria-live="polite"><p id="choose-text"></p><button id="cancel-replace" class="btn ghost" type="button">Cancel</button></div>
+  <div class="cups" id="cups" aria-label="Headset connection slots"></div>
+  <section class="nc" id="noise-controls" hidden aria-label="Noise cancellation">
+   <div class="swrow">
+    <label for="noise-enabled"><span class="nc-t">Noise cancellation</span><span class="nc-s" id="noise-current"></span></label>
+    <input id="noise-enabled" class="sw" type="checkbox" role="switch" data-live="true">
+   </div>
+   <div class="slider" id="noise-slider">
+    <input id="noise-level" type="range" min="0" max="10" step="1" value="5" aria-label="Noise cancellation level" data-live="true">
+    <div class="ticks" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="ends" aria-hidden="true"><span>Aware</span><span>Max</span></div>
+   </div>
+  </section>
+ </div>
+
+ <div class="col col-side">
+  <section class="saved" aria-labelledby="saved-title">
+   <div class="lh"><h2 id="saved-title" class="lbl">Saved devices</h2><button id="refresh" class="iconbtn" type="button" aria-label="Refresh"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg></button></div>
+   <div id="devices" class="devices"><div class="empty">Loading your devices…</div></div>
+  </section>
+  <footer class="foot">
+   <div class="ctl" id="controllers" aria-label="Your controllers"></div>
+   <div id="message" class="status" role="status" aria-live="polite"></div>
+  </footer>
+ </div>
 </main>
-<dialog id="switch-dialog"><form method="dialog"><button class="close" aria-label="Close">×</button></form><div class="eyebrow">CONNECTION LIMIT</div><h2 id="switch-title">Connect device</h2><p>Both connections are occupied. Choose a device to disconnect.</p><div id="replace-options"></div></dialog>
-<dialog id="settings-dialog"><form method="dialog"><button class="close" aria-label="Close">×</button></form><div class="eyebrow">CONTROLLERS</div><h2>Controller settings</h2><p>Assign the devices used for headset control.</p><div id="role-fields"></div><button id="save-roles" class="primary">Save devices</button><button id="native-settings" class="subtle" hidden>Set up controller links</button></dialog>
-<script src="app.js"></script></body></html>
+
+<dialog id="settings-dialog" aria-labelledby="settings-title">
+ <form method="dialog"><button class="iconbtn close" aria-label="Close"><svg class="i" aria-hidden="true"><use href="#i-close"/></svg></button></form>
+ <h2 id="settings-title">Controller settings</h2>
+ <p>Assign the saved device that each of your controllers is.</p>
+ <div id="role-fields"></div>
+ <button id="save-roles" class="btn solid" type="button">Save devices</button>
+ <button id="native-settings" class="btn ghost" type="button" hidden>Set up controller links</button>
+ <button id="open-window" class="btn quiet" type="button" hidden>Open full window</button>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>

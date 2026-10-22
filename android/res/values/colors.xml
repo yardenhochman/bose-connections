@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "Mist sleeve" tokens (light). Source: .impeccable/mocks/decision/h2-pulse-quick-light.html -->
+<resources>
+ <color name="qs_ground">#FFFFFFFF</color>
+ <color name="qs_surface">#FFF2F4F5</color>
+ <color name="qs_cup_edge">#FFDFE4E7</color>
+ <!-- Ridges carry more contrast than the mock in light mode (owner's decision). -->
+ <color name="qs_ridge">#FF22303A</color>
+ <color name="qs_ink">#FF1B2328</color>
+ <color name="qs_ink2">#FF43515A</color>
+ <color name="qs_ink3">#FF53606A</color>
+ <color name="qs_hair">#261B2328</color>
+ <color name="qs_line_strong">#611B2328</color>
+ <color name="qs_accent">#FFAD8037</color>
+ <color name="qs_accent_ink">#FF7A531A</color>
+ <color name="qs_on_accent">#FF1B1408</color>
+ <color name="qs_ok">#FF2F7A6E</color>
+ <color name="qs_ok_halo">#2E2F7A6E</color>
+ <color name="qs_warn">#FFA4472F</color>
+ <color name="qs_track">#2E1B2328</color>
+ <color name="qs_fill">#FF33424C</color>
+ <color name="qs_thumb">#FFF6F8F8</color>
+ <color name="qs_press">#1F1B2328</color>
+</resources>

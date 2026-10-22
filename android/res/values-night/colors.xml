@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "Mist sleeve" tokens (dark). Source: .impeccable/mocks/decision/h2-pulse-quick-dark.html -->
+<resources>
+ <color name="qs_ground">#FF11181D</color>
+ <color name="qs_surface">#FF1A242B</color>
+ <color name="qs_cup_edge">#1AD6E2E8</color>
+ <color name="qs_ridge">#FFC3D0D7</color>
+ <color name="qs_ink">#FFE3E8EA</color>
+ <color name="qs_ink2">#FFAAB5BC</color>
+ <color name="qs_ink3">#FF929EA6</color>
+ <color name="qs_hair">#1FD6E2E8</color>
+ <color name="qs_line_strong">#52D6E2E8</color>
+ <color name="qs_accent">#FFD6A858</color>
+ <color name="qs_accent_ink">#FFE0B46A</color>
+ <color name="qs_on_accent">#FF1D1606</color>
+ <color name="qs_ok">#FF7CC4B4</color>
+ <color name="qs_ok_halo">#297CC4B4</color>
+ <color name="qs_warn">#FFE8957A</color>
+ <color name="qs_track">#29D6E2E8</color>
+ <color name="qs_fill">#FFB9C6CD</color>
+ <color name="qs_thumb">#FF1A242B</color>
+ <color name="qs_press">#24D6E2E8</color>
+</resources>

@@ -12,3 +12,5 @@ snapshot.json
 *.jks
 *.keystore
 signing-password
+.impeccable/*
+!.impeccable/surfaces/

@@ -69,12 +69,15 @@ class Client:
         if after['enabled']!=enabled or (enabled and after['level']!=level):
             raise ProtocolError('Noise-control change was not verified; refresh before retrying')
         return after
-    def status(self):
-        ident=self.request(0,3)
-        if len(ident)!=3 or ident[:2]!=b'\x40\x24':
-            raise ProtocolError('This controller supports only the Bose NC700')
+    def status(self,full=True,check_ident=True):
+        # Verification polls pass full=False, check_ident=False: only the device list is needed.
+        if check_ident:
+            ident=self.request(0,3)
+            if len(ident)!=3 or ident[:2]!=b'\x40\x24':
+                raise ProtocolError('This controller supports only the Bose NC700')
         addresses=parse_list(self.request(4,4))
         devices=[parse_info(self.request(4,5,payload=a),a) for a in addresses]
+        if not full:return {'devices':devices,'capacity':2}
         battery=None
         try:
             raw=self.request(2,2)
@@ -87,7 +90,7 @@ class Client:
     def action(self,action,address):
         a=mac_bytes(address)
         try:
-            if action=='connect': self.request(4,1,5,b'\0'+a,expected=(7,))
+            if action=='connect': self.request(4,1,5,b'\0'+a,expected=(7,),timeout=1)
             elif action=='disconnect':self.request(4,2,5,a,expected=(7,),timeout=.25)
             else:raise ValueError('Unknown action')
         except Exception as e:

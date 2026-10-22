@@ -1,4 +1,4 @@
-import unittest
+import unittest,re
 import threading
 import tempfile,json
 from unittest.mock import patch
@@ -14,7 +14,7 @@ def device(a,connected,current=False):return dict(address=a,connected=connected,
 def state(devices):return {'devices':devices,'battery':80}
 class Fake:
  def __init__(self,devices,apply=True):self.devices=devices;self.calls=[];self.apply=apply
- def status(self):return state(self.devices)
+ def status(self,**kwargs):self.status_calls=getattr(self,'status_calls',[])+[kwargs];return state([dict(d) for d in self.devices])
  def action(self,action,a):
   self.calls.append((action,a))
   if self.apply:
@@ -176,4 +176,153 @@ class Tests(unittest.TestCase):
   c=self.ctl()
   with patch.object(c,'local_status',return_value=dict(controller='pc',reachable=False,devices=[device(PC,True)],stale=True)):
    self.assertFalse(c.overview()['reachable']);self.assertEqual(c.overview()['devices'],[])
+
+class Clock:
+ def __init__(self):self.now=1000.;self.slept=0.
+ def monotonic(self):return self.now
+ def sleep(self,s):self.now+=s;self.slept+=s
+MAC_RE=re.compile(r'(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}')
+class SpeedTests(unittest.TestCase):
+ def ctl(self,peers=False):
+  c=Controller(dict(id='pc',name='PC',headset=PC,roles={'pc':PC,'phone':PHONE},peers=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')] if peers else []))
+  return c
+ def act(self,c,fake,data,clock=None):
+  clock=clock or Clock()
+  with patch('controller.connection',return_value=fake_connect(fake)),patch('controller.time.sleep',clock.sleep),patch('controller.time.monotonic',clock.monotonic):return c.local_action(data)
+ def test_connect_returns_full_overview_state_and_updates_snapshot(self):
+  c=self.ctl()
+  with tempfile.TemporaryDirectory() as folder:
+   c.config_path=str(Path(folder)/'config.json')
+   f=Fake([device(PC,True,True),device(TV,False)])
+   r=self.act(c,f,dict(action='connect',address=TV));s=r['state']
+   for key in ('here','reachable','cached','observed','battery','noise','roles','devices','controllers'):self.assertIn(key,s)
+   self.assertFalse(s['cached']);self.assertTrue(next(d for d in s['devices'] if d['address']==TV)['connected'])
+   self.assertEqual(s['here'],'pc');self.assertEqual(c.cached_overview()['devices'],s['devices'])
+ def test_already_connected_and_noise_return_full_state(self):
+  c=self.ctl();f=Fake([device(PC,True,True),device(TV,True)])
+  self.assertIn('controllers',self.act(c,f,dict(action='connect',address=TV))['state'])
+  class NoiseClient(Fake):
+   def request(self,*a,**k):return b'\x40\x24\x01'
+   def set_noise(self,level,enabled):return dict(level=level,enabled=enabled)
+  n=NoiseClient([device(PC,True,True)]);c.cache=state(n.devices)
+  r=self.act(c,n,dict(action='noise',level=4,enabled=True))
+  self.assertEqual(r['state']['noise'],dict(level=4,enabled=True));self.assertEqual(r['state']['devices'][0]['address'],PC)
+  self.assertTrue(c.ident_ok)
+ def test_noise_skips_prelude_when_local_and_caches_identity(self):
+  c=self.ctl();c.cache=state([device(PC,True,True)])
+  class NoiseClient(Fake):
+   idents=0
+   def request(self,*a,**k):NoiseClient.idents+=1;return b'\x40\x24\x01'
+   def set_noise(self,level,enabled):return dict(level=level,enabled=enabled)
+  n=NoiseClient([device(PC,True,True)])
+  with patch('controller.connection',return_value=fake_connect(n)),patch.object(c,'overview') as ov:
+   c.override(dict(action='noise',level=3,enabled=True))
+   with patch('controller.connection',return_value=fake_connect(n)):c.override(dict(action='noise',level=5,enabled=True))
+   ov.assert_not_called()
+  self.assertEqual(NoiseClient.idents,1)
+ def test_noise_falls_back_when_headset_unreachable_before_any_command(self):
+  c=self.ctl(True);c.cache=state([device(PC,True,True)])
+  @contextmanager
+  def broken(*a):raise OSError('no route');yield
+  view=dict(roles={},controllers=[dict(controller='phone',reachable=True,devices=[device(PHONE,True,True)])],devices=[],battery=1)
+  with patch('controller.connection',broken),patch.object(c,'overview',return_value=view) as ov,patch.object(c,'peer_call',return_value=dict(ok=True,verified=True,noise=dict(level=2,enabled=True))) as call:
+   r=c.override(dict(action='noise',level=2,enabled=True))
+  ov.assert_called_once();call.assert_called_once();self.assertFalse(c.ident_ok)
+  self.assertEqual(r['state']['noise'],dict(level=2,enabled=True))
+ def test_noise_reply_uses_fresh_device_read_and_snapshot(self):
+  c=self.ctl();c.cache=state([device(PC,True,True),device(TV,True)])
+  class NoiseClient(Fake):
+   def request(self,*a,**k):return b'\x40\x24\x01'
+   def set_noise(self,level,enabled):return dict(level=level,enabled=enabled)
+  n=NoiseClient([device(PC,True,True),device(TV,False)])
+  with tempfile.TemporaryDirectory() as folder:
+   c.config_path=str(Path(folder)/'config.json')
+   r=self.act(c,n,dict(action='noise',level=4,enabled=True))
+   self.assertEqual(n.status_calls[-1],dict(full=False,check_ident=False))
+   self.assertFalse(next(d for d in r['state']['devices'] if d['address']==TV)['connected'])
+   self.assertEqual(c.cached_overview()['devices'],r['state']['devices'])
+ def test_noise_without_fresh_read_returns_no_stale_state_or_snapshot(self):
+  c=self.ctl();c.cache=state([device(PC,True,True),device(TV,True)])
+  class NoiseClient(Fake):
+   def request(self,*a,**k):return b'\x40\x24\x01'
+   def set_noise(self,level,enabled):return dict(level=level,enabled=enabled)
+   def status(self,**kwargs):raise ProtocolError('read failed')
+  n=NoiseClient([device(PC,True,True)])
+  with tempfile.TemporaryDirectory() as folder:
+   c.config_path=str(Path(folder)/'config.json')
+   r=self.act(c,n,dict(action='noise',level=4,enabled=True))
+   self.assertNotIn('state',r);self.assertEqual(r['noise'],dict(level=4,enabled=True))
+   self.assertFalse((Path(folder)/'snapshot.json').exists())
+ def test_fresh_overview_forced_after_headset_unreachable(self):
+  c=self.ctl(True);c.cache=state([device(PC,True,True)]);clock=Clock()
+  stale=dict(roles={},controllers=[dict(controller='pc',reachable=True,devices=[device(PC,True,True)])],devices=[],battery=1)
+  fresh=dict(roles={},controllers=[dict(controller='phone',reachable=True,devices=[device(PHONE,True,True)])],devices=[],battery=1)
+  c.last_overview=(clock.now,stale)
+  @contextmanager
+  def broken(*a):raise OSError('no route');yield
+  with patch('controller.time.monotonic',clock.monotonic),patch('controller.connection',broken),patch.object(c,'overview',return_value=fresh) as ov,patch.object(c,'peer_call',return_value=dict(ok=True,verified=True,noise=dict(level=2,enabled=True))) as call:
+   c.override(dict(action='noise',level=2,enabled=True))
+  ov.assert_called_once();call.assert_called_once()
+ def test_prelude_reused_within_ttl_and_refreshed_after(self):
+  c=self.ctl();clock=Clock()
+  view=dict(roles={'pc':PC},controllers=[dict(controller='pc',reachable=True,devices=[device(PC,True,True),device(TV,True)])],devices=[],battery=1)
+  c.last_overview=(clock.now-2,view)
+  with patch('controller.time.monotonic',clock.monotonic),patch.object(c,'overview',return_value=view) as ov,patch.object(c,'local_action',return_value={'ok':True}):
+   c.override(dict(action='disconnect',address=TV));ov.assert_not_called()
+   c.last_overview=(clock.now-6,view);c.override(dict(action='disconnect',address=TV));ov.assert_called_once()
+ def test_stale_prelude_not_used_when_it_has_no_eligible_controller(self):
+  c=self.ctl();clock=Clock()
+  view=dict(roles={},controllers=[dict(controller='pc',reachable=True,devices=[device(PC,True,True)])])
+  c.last_overview=(clock.now,view)
+  with patch('controller.time.monotonic',clock.monotonic),patch.object(c,'overview',return_value=view) as ov:
+   with self.assertRaises(ValueError):c.override(dict(action='disconnect',address=PC))
+  ov.assert_called_once()
+ def test_overview_stops_waiting_for_hung_peer_after_excluded_holder_answers(self):
+  c=self.ctl(True);release=threading.Event()
+  def slow(*a):release.wait(3);return dict(controller='phone',reachable=False)
+  try:
+   with patch('controller.EXCLUDE_GRACE',.2),patch.object(c,'local_status',return_value=dict(controller='pc',reachable=True,observed=1,devices=[device(PC,True,True)])),patch.object(c,'peer_call',side_effect=slow):
+    import time as t;start=t.monotonic();view=c.overview(exclude_current=PC);self.assertLess(t.monotonic()-start,1.5)
+    self.assertTrue(view['controllers'][1].get('checking'))
+  finally:release.set();c.status_pool.shutdown(wait=True)
+ def test_poll_deadline_not_shorter_than_before(self):
+  clock=Clock();c=self.ctl()
+  f=Fake([device(PC,True,True),device(TV,True),device(PHONE,False)],apply=False)
+  with self.assertRaisesRegex(ProtocolError,'Disconnect was not verified'):self.act(c,f,dict(action='connect',address=PHONE,replace=TV),clock)
+  self.assertGreaterEqual(clock.slept,6*.4)
+  clock=Clock();f=Fake([device(PC,True,True),device(PHONE,False)],apply=False)
+  with self.assertRaisesRegex(ProtocolError,'not verified'):self.act(c,f,dict(action='connect',address=PHONE),clock)
+  self.assertGreaterEqual(clock.slept,4+8*.5)
+  self.assertLessEqual(clock.slept,12)
+ def test_polls_are_light_and_fast(self):
+  clock=Clock();c=self.ctl();f=Fake([device(PC,True,True),device(TV,True)],apply=False)
+  with self.assertRaises(ProtocolError):self.act(c,f,dict(action='disconnect',address=TV),clock)
+  self.assertEqual(f.status_calls[0],dict(check_ident=True));self.assertTrue(all(k==dict(full=False,check_ident=False) for k in f.status_calls[1:]))
+  self.assertLessEqual(clock.slept/ (len(f.status_calls)-2),.16)
+ def test_connect_ack_window_is_short_and_never_resent(self):
+  client=Client(None)
+  with patch.object(client,'request',side_effect=ProtocolError('Headset did not acknowledge the command')) as req:
+   with self.assertRaises(ActionUnconfirmed):client.action('connect',PHONE)
+   self.assertEqual(req.call_count,1);self.assertEqual(req.call_args.kwargs['timeout'],1)
+  class NoAck(Fake):
+   def action(self,action,a):
+    self.calls.append((action,a));raise ActionUnconfirmed('no ack')
+  f=NoAck([device(PC,True,True),device(PHONE,False)],apply=False);clock=Clock()
+  with self.assertRaises(ProtocolError):self.act(self.ctl(),f,dict(action='connect',address=PHONE),clock)
+  self.assertEqual(f.calls,[('connect',PHONE)])
+ def test_timing_log_has_no_addresses(self):
+  c=self.ctl();f=Fake([device(PC,True,True),device(TV,False)])
+  with self.assertLogs('bose.timing',level='INFO') as logs:
+   self.act(c,f,dict(action='connect',address=TV))
+   with self.assertRaises(ValueError):self.act(c,f,dict(action='connect',address=MAC))
+  text=' '.join(logs.output)
+  self.assertIn('action=connect',text);self.assertIn('outcome=ok',text);self.assertIn('before=',text);self.assertIn('verify=',text)
+  self.assertIn('target=device#2',text);self.assertIsNone(MAC_RE.search(text));self.assertNotIn(TV,text)
+ def test_peer_state_is_remerged_with_local_controllers(self):
+  c=self.ctl(True)
+  view=dict(roles={'pc':PC,'phone':PHONE},devices=[],controllers=[dict(controller='pc',reachable=True,devices=[device(PC,True,True)]),dict(controller='phone',reachable=True,devices=[device(PHONE,True,True),device(PC,True)])])
+  peer_state=dict(here='phone',devices=[device(PHONE,True,True),device(TV,False)],battery=50,noise=None,observed=9,controllers=[],roles={})
+  with patch.object(c,'overview',return_value=view),patch.object(c,'peer_call',return_value=dict(ok=True,verified=True,state=peer_state)):
+   s=c.override(dict(action='disconnect',address=PC))['state']
+  self.assertEqual(s['here'],'pc');self.assertEqual(len(s['controllers']),2);self.assertEqual(s['battery'],50)
 if __name__=='__main__':unittest.main()

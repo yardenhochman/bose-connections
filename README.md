@@ -4,10 +4,15 @@ A minimal connection dashboard for the **Bose Noise Cancelling Headphones 700**.
 See the headset's saved devices, connect or disconnect them, and choose which
 connection to replace when both Bluetooth slots are occupied.
 
-- Shared dashboard for Linux, macOS and Android.
-- Noise cancellation levels 0–10 and Off, with verified headset state.
-- Android Quick Settings tile with a compact connections and ANC panel.
-- Native Mac menu-bar headphones icon and an Omarchy Linux top-bar popup.
+- Shared dashboard for Linux, macOS and Android, with a new app icon. It follows
+  the system light/dark setting.
+- Pending states appear instantly and settle only after the headset confirms;
+  a failed or unconfirmed change reverts to the verified state.
+- Noise cancellation levels 0–10 and Off, with verified headset state. The slider
+  applies on release, and a switch turns noise cancellation on or off.
+- Android Quick Settings tile and a native dialog with connections and ANC controls.
+- Omarchy top-bar popup that uses the active Omarchy theme's colours.
+- macOS menu-bar icon that opens a compact popover; right-click for the native menu.
 - Optional authenticated controller-to-controller relay over Tailscale: an
   unconnected computer can send a request through a controller that reaches the headset.
 - Immediate last-known device list, followed by a live refresh.
@@ -19,16 +24,31 @@ connection to replace when both Bluetooth slots are occupied.
 Device and network names are anonymized; unrelated phone content is removed.
 
 <table>
-  <tr><th>Android dashboard</th><th>Quick Settings controls</th></tr>
   <tr>
-    <td><img src="docs/screenshots/android-dashboard.png" width="360" alt="Android dashboard with generic devices and noise cancellation controls"></td>
-    <td><img src="docs/screenshots/android-quick-panel.png" width="360" alt="Compact Bose Quick Settings dialog with connection and ANC controls"></td>
+    <th>Phone, light</th><th>Phone, dark</th><th>Desktop</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/phone-light.png" width="260" alt="Web dashboard in the phone layout, light theme: two connected slot cards, noise cancellation switch and slider, saved devices"></td>
+    <td><img src="docs/screenshots/phone-dark.png" width="260" alt="Web dashboard in the phone layout, dark theme"></td>
+    <td><img src="docs/screenshots/desktop.png" width="420" alt="Web dashboard in the desktop layout with slot cards beside the saved devices list"></td>
+  </tr>
+  <tr>
+    <th>Android dialog, light</th><th>Android dialog, dark</th><th>Android Quick Settings tile</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/quick-settings-light.png" width="260" alt="Native Android Quick Settings dialog, light theme, with slot cards, ANC controls and saved devices"></td>
+    <td><img src="docs/screenshots/quick-settings-dark.png" width="260" alt="Native Android Quick Settings dialog, dark theme"></td>
+    <td><img src="docs/screenshots/tile.png" width="260" alt="Quick Settings panel with the Bose tile showing 2 of 2 connected and ANC 7"></td>
+  </tr>
+  <tr>
+    <th>Omarchy popup</th><th>macOS menu-bar popover</th><th></th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/omarchy-popup.png" width="260" alt="Omarchy top-bar popup in the Tokyo Night theme"></td>
+    <td><img src="docs/screenshots/mac-popover.png" width="260" alt="Compact macOS menu-bar popover with slot cards, ANC controls and saved devices"></td>
+    <td></td>
   </tr>
 </table>
-
-**Bose tile in Android Quick Settings** — the headphones icon at the upper left.
-
-<img src="docs/screenshots/android-quick-settings.png" width="600" alt="Samsung Quick Settings with the Bose headphones tile and anonymized network and headset names">
 
 Independent community project; not affiliated with Bose. **Experimental:**
 macOS reads and disconnect/reconnect have been verified on one NC700 running
@@ -86,7 +106,7 @@ python3 install_mac.py --config ~/.local/state/bose-control/config.json
 
 This installs `~/Applications/Bose Connections.app` and a per-user LaunchAgent
 `local.bose.connections`. The background helper adds a headphones icon to the menu
-bar; open the app for the full dashboard. Allow Bluetooth when macOS asks.
+bar; click it for the compact popover (right-click for the native menu), which opens the full dashboard. Allow Bluetooth when macOS asks.
 IOBluetooth calls run on the Python main thread under the native app for proper
 privacy attribution. Running the backend directly through SSH is not equivalent.
 
@@ -124,9 +144,13 @@ omarchy plugin validate ~/.config/omarchy/plugins/local.bose
 omarchy plugin enable local.bose right
 ```
 
-Back up your shell config before layout changes. Click the headphones icon to
-select a device. Connected devices have checkmarks; when both slots are occupied,
-select which device to disconnect. The same backend protections apply to menu and
+Back up your shell config before layout changes. Copy the whole `linux/` folder:
+it holds several QML files and a `fonts/` directory. Click the headphones icon to
+open the popup. Two slot cups show the connected devices, each with Disconnect;
+saved devices have Connect. When both slots are full, choose which device to
+replace in place. The ANC switch and slider apply on release, and **Open dashboard**
+opens a compact app window through `omarchy-launch-webapp`. Colours follow the
+active Omarchy theme. The same backend protections apply to popup and
 dashboard actions. Other Linux desktops can use the web dashboard; a generic
 system-tray implementation is not included.
 
@@ -176,7 +200,7 @@ A locked phone must be unlocked before controls open. Long-press opens app setti
 python3 -m unittest discover -s tests -v
 ```
 
-The 28 protocol/controller tests use simulated transports and have no hardware
+The 43 protocol/controller tests use simulated transports and have no hardware
 side effects. They cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
@@ -185,7 +209,9 @@ For GUI checks, start the local helper, install Node dependencies (`npm install`
 and Chromium, then run `npm run test:gui`. Set `CHROMIUM_PATH` or `BOSE_URL` if
 needed. The runner intercepts API responses with synthetic data and verifies
 mobile/desktop layouts, settings and the replacement dialog. It creates ignored
-screenshots under `artifacts/`; it sends no connection mutations.
+screenshots under `artifacts/`; it sends no connection mutations. Set
+`SCREENSHOT_SCALE=2` for 2x captures, as used for the images above. The design
+system is described in [DESIGN.md](DESIGN.md).
 
 ## Remove
 

@@ -1,7 +1,14 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #import <CoreBluetooth/CoreBluetooth.h>
-@interface App : NSObject <NSApplicationDelegate,CBCentralManagerDelegate,NSMenuDelegate>
+static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@"http://127.0.0.1:8847/?view=popover";
+@interface WeakScript : NSObject <WKScriptMessageHandler>
+@property (weak) id<WKScriptMessageHandler> target;
+@end
+@implementation WeakScript
+- (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {[self.target userContentController:controller didReceiveScriptMessage:message];}
+@end
+@interface App : NSObject <NSApplicationDelegate,CBCentralManagerDelegate,NSMenuDelegate,NSPopoverDelegate,WKNavigationDelegate,WKScriptMessageHandler>
 @property NSTask *server;
 @property NSWindow *window;
 @property WKWebView *web;
@@ -13,6 +20,13 @@
 @property NSString *menuMessage;
 @property BOOL refreshing;
 @property BOOL changing;
+@property NSDictionary *pending;
+@property NSPopover *popover;
+@property WKWebView *popWeb;
+@property NSDate *popoverClosed;
+@property id escMonitor;
+@property NSInteger popRetries;
+@property NSInteger webRetries;
 
 @end
 @implementation App
@@ -29,7 +43,9 @@
  NSError *error=nil;if(![self.server launchAndReturnError:&error])NSLog(@"Could not start Bose helper: %@",error.localizedDescription);
  self.statusItem=[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
  NSImage *icon=[NSImage imageWithSystemSymbolName:@"headphones" accessibilityDescription:@"Bose Connections"];icon.template=YES;self.statusItem.button.image=icon;self.statusItem.button.toolTip=@"Bose 700 connections";
- self.deviceMenu=[NSMenu new];self.deviceMenu.autoenablesItems=NO;self.deviceMenu.delegate=self;self.statusItem.menu=self.deviceMenu;
+ self.statusItem.button.target=self;self.statusItem.button.action=@selector(statusClicked:);[self.statusItem.button sendActionOn:NSEventMaskLeftMouseUp|NSEventMaskRightMouseUp];
+ self.deviceMenu=[NSMenu new];self.deviceMenu.autoenablesItems=NO;self.deviceMenu.delegate=self;
+ [self makePopover];
  NSData *cached=[NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"snapshot.json"]];
  if(cached)self.snapshot=[NSJSONSerialization JSONObjectWithData:cached options:0 error:nil];
  [self rebuildMenu];dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{[self refreshMenu];});
@@ -38,68 +54,178 @@
 - (NSMenuItem *)item:(NSString *)title selector:(SEL)selector data:(id)data {
  NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:selector keyEquivalent:@""];item.target=self;item.representedObject=data;item.enabled=selector!=NULL && !self.changing;return item;
 }
+- (NSMenuItem *)sectionHeader:(NSString *)title {
+ if(@available(macOS 14.0,*))return [NSMenuItem sectionHeaderWithTitle:title];
+ return [self item:title selector:NULL data:nil];
+}
 - (NSString *)label:(NSDictionary *)device {
- NSDictionary *labels=@{@"pc":@"Living-room PC",@"phone":@"Phone",@"mac":@"Mac"};
+ NSDictionary *labels=@{@"pc":@"Desktop PC",@"phone":@"Android phone",@"mac":@"MacBook Pro"};
  for(NSString *role in self.snapshot[@"roles"])if([self.snapshot[@"roles"][role] isEqual:device[@"address"]])return labels[role]?:device[@"name"];
  return device[@"name"]?:device[@"address"];
 }
+- (BOOL)isReachable {return [self.snapshot[@"reachable"] boolValue];}
+- (BOOL)canChange {return [self isReachable]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;}
+- (NSString *)clock:(id)epoch {
+ if(![epoch isKindOfClass:[NSNumber class]])return nil;
+ NSDateFormatter *f=[NSDateFormatter new];f.timeStyle=NSDateFormatterShortStyle;f.dateStyle=NSDateFormatterNoStyle;return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:[epoch doubleValue]]];
+}
+- (NSString *)headerTitle {
+ NSMutableArray *parts=[NSMutableArray arrayWithObject:@"Bose 700"];
+ id battery=self.snapshot[@"battery"];if([battery isKindOfClass:[NSNumber class]])[parts addObject:[NSString stringWithFormat:@"%d%%",[battery intValue]]];
+ NSDictionary *noise=self.snapshot[@"noise"];if([noise isKindOfClass:[NSDictionary class]]&&[noise[@"enabled"] boolValue]&&noise[@"level"])[parts addObject:[NSString stringWithFormat:@"ANC %d",[noise[@"level"] intValue]]];
+ return [parts componentsJoinedByString:@" · "];
+}
+- (NSString *)stateLine {
+ if(self.menuMessage)return self.menuMessage;
+ if(!self.snapshot)return self.refreshing?@"Refreshing…":@"Unavailable";
+ if([self.snapshot[@"cached"] boolValue]){NSString *t=[self clock:self.snapshot[@"observed"]];return t?[@"Last known · " stringByAppendingString:t]:@"Last known";}
+ if(![self isReachable])return @"Unavailable";
+ NSUInteger n=0;for(NSDictionary *d in self.snapshot[@"devices"]?:@[])if([d[@"connected"] boolValue])n++;
+ return [NSString stringWithFormat:@"%lu of 2 connected",(unsigned long)n];
+}
+- (NSString *)titleFor:(NSDictionary *)device plain:(NSString *)plain {
+ NSString *address=device[@"address"];
+ if([self.pending[@"address"] isEqual:address])return [self.pending[@"action"] isEqual:@"disconnect"]?@"Disconnecting…":@"Connecting…";
+ if(self.pending[@"replace"]&&[self.pending[@"replace"] isEqual:address])return @"Disconnecting…";
+ return plain;
+}
 - (void)rebuildMenu {
  [self.deviceMenu removeAllItems];
- [self.deviceMenu addItem:[self item:@"Bose 700" selector:NULL data:nil]];
- NSString *status=self.changing?@"Updating connections…":self.refreshing?@"Refreshing…":self.menuMessage;
- if(!status && self.snapshot[@"observed"]){NSDateFormatter *f=[NSDateFormatter new];f.timeStyle=NSDateFormatterShortStyle;status=[@"Updated " stringByAppendingString:[f stringFromDate:[NSDate dateWithTimeIntervalSince1970:[self.snapshot[@"observed"] doubleValue]]]];}
- if(!status)status=[self.snapshot[@"reachable"] boolValue]?@"Select a device":@"Headset unavailable";
- [self.deviceMenu addItem:[self item:status selector:NULL data:nil]];
- [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+ self.statusItem.button.appearsDisabled=![self isReachable];self.statusItem.button.alphaValue=[self isReachable]?1.0:0.55;
+ [self.deviceMenu addItem:[self item:[self headerTitle] selector:NULL data:nil]];
+ [self.deviceMenu addItem:[self item:[self stateLine] selector:NULL data:nil]];
+ BOOL can=[self canChange];
+ NSString *hereRole=self.snapshot[@"here"];NSDictionary *roleMap=self.snapshot[@"roles"];NSString *hereAddress=([hereRole isKindOfClass:[NSString class]]&&[roleMap isKindOfClass:[NSDictionary class]])?roleMap[hereRole]:nil;
  NSArray *devices=self.snapshot[@"devices"]?:@[];
- NSMutableArray *connected=[NSMutableArray new];for(NSDictionary *d in devices)if([d[@"connected"] boolValue])[connected addObject:d];
- for(NSDictionary *d in devices){
-  BOOL on=[d[@"connected"] boolValue];NSString *name=[self label:d];NSDictionary *action=@{@"action":on?@"disconnect":@"connect",@"address":d[@"address"]};
-  NSMenuItem *row=[self item:name selector:@selector(deviceClicked:) data:action];row.state=on?NSControlStateValueOn:NSControlStateValueOff;
-  row.enabled=[self.snapshot[@"reachable"] boolValue]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;
-  if(!on && connected.count>=2){NSMenu *replace=[NSMenu new];replace.autoenablesItems=NO;
-   [replace addItem:[self item:@"Disconnect to connect:" selector:NULL data:nil]];
-   for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];[replace addItem:[self item:[self label:old] selector:@selector(deviceClicked:) data:a]];}row.submenu=replace;
+ NSMutableArray *connected=[NSMutableArray new],*saved=[NSMutableArray new];
+ for(NSDictionary *d in devices)[([d[@"connected"] boolValue]?connected:saved) addObject:d];
+ if(connected.count){
+  [self.deviceMenu addItem:[NSMenuItem separatorItem]];[self.deviceMenu addItem:[self sectionHeader:@"Connected"]];
+  for(NSDictionary *d in connected){
+   NSString *name=[self label:d];if(hereAddress&&[hereAddress isEqual:d[@"address"]])name=[name stringByAppendingString:@" — this Mac"];
+   NSMenuItem *row=[self item:[self titleFor:d plain:name] selector:@selector(deviceClicked:) data:@{@"action":@"disconnect",@"address":d[@"address"]}];
+   row.state=NSControlStateValueOn;row.enabled=can;[self.deviceMenu addItem:row];
   }
-  [self.deviceMenu addItem:row];
  }
- [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+ if(saved.count){
+  [self.deviceMenu addItem:[NSMenuItem separatorItem]];[self.deviceMenu addItem:[self sectionHeader:@"Saved"]];
+  for(NSDictionary *d in saved){
+   NSDictionary *action=@{@"action":@"connect",@"address":d[@"address"]};
+   NSMenuItem *row=[self item:[self titleFor:d plain:[self label:d]] selector:@selector(deviceClicked:) data:action];row.enabled=can;
+   if(connected.count>=2){
+    row.action=NULL;NSMenu *replace=[NSMenu new];replace.autoenablesItems=NO;
+    for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];NSMenuItem *r=[self item:[@"Replace " stringByAppendingString:[self label:old]] selector:@selector(deviceClicked:) data:a];r.enabled=can;[replace addItem:r];}
+    row.submenu=replace;
+   }
+   [self.deviceMenu addItem:row];
+  }
+ }
  NSDictionary *noise=self.snapshot[@"noise"];
  if([noise isKindOfClass:[NSDictionary class]]){
-  NSMenuItem *section=[self item:@"Noise cancellation" selector:NULL data:nil];section.enabled=YES;NSMenu *levels=[NSMenu new];levels.autoenablesItems=NO;
-  NSMenuItem *off=[self item:@"Off" selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":noise[@"level"],@"enabled":@NO}];off.state=[noise[@"enabled"] boolValue]?NSControlStateValueOff:NSControlStateValueOn;off.enabled=[self.snapshot[@"reachable"] boolValue]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;[levels addItem:off];
-  for(int n=0;n<=10;n++){NSString *label=n==0?@"0 — Aware":n==10?@"10 — Maximum":[NSString stringWithFormat:@"%d",n];NSMenuItem *item=[self item:label selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":@(n),@"enabled":@YES}];item.state=[noise[@"enabled"] boolValue]&&[noise[@"level"] intValue]==n?NSControlStateValueOn:NSControlStateValueOff;item.enabled=off.enabled;[levels addItem:item];}section.submenu=levels;[self.deviceMenu addItem:section];
+  BOOL on=[noise[@"enabled"] boolValue];NSNumber *level=noise[@"level"]?:@0;
+  [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+  NSMenuItem *section=[self item:[self.pending[@"action"] isEqual:@"noise"]?@"Setting noise…":@"Noise cancellation" selector:NULL data:nil];section.enabled=can||[self.pending[@"action"] isEqual:@"noise"];
+  NSMenu *levels=[NSMenu new];levels.autoenablesItems=NO;
+  NSMenuItem *toggle=[self item:@"On" selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":level,@"enabled":@(!on)}];toggle.state=on?NSControlStateValueOn:NSControlStateValueOff;toggle.enabled=can;[levels addItem:toggle];
+  [levels addItem:[NSMenuItem separatorItem]];
+  for(NSNumber *n in @[@0,@3,@5,@7,@10]){
+   NSMenuItem *preset=[self item:[n stringValue] selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":n,@"enabled":@YES}];
+   preset.state=[level isEqual:n]?NSControlStateValueOn:NSControlStateValueOff;preset.enabled=can&&on;[levels addItem:preset];
+  }
+  section.submenu=levels;[self.deviceMenu addItem:section];
  }
+ [self.deviceMenu addItem:[NSMenuItem separatorItem]];
  [self.deviceMenu addItem:[self item:@"Refresh" selector:@selector(refreshClicked:) data:nil]];
- [self.deviceMenu addItem:[self item:@"Open dashboard…" selector:@selector(openDashboard:) data:nil]];
+ NSMenuItem *open=[self item:@"Open full window" selector:@selector(openDashboard:) data:nil];open.enabled=YES;[self.deviceMenu addItem:open];
+ [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];quit.target=NSApp;[self.deviceMenu addItem:quit];
 }
 - (void)request:(NSString *)path data:(NSDictionary *)data completion:(void (^)(NSDictionary *,NSString *))completion {
  NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[@"http://127.0.0.1:8847" stringByAppendingString:path]]];r.timeoutInterval=data?120:40;
  if(data){r.HTTPMethod=@"POST";[r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];r.HTTPBody=[NSJSONSerialization dataWithJSONObject:data options:0 error:nil];}
  [[[NSURLSession sharedSession] dataTaskWithRequest:r completionHandler:^(NSData *raw,NSURLResponse *response,NSError *error){
-  NSDictionary *json=raw?[NSJSONSerialization JSONObjectWithData:raw options:0 error:nil]:nil;
+  id parsed=raw?[NSJSONSerialization JSONObjectWithData:raw options:0 error:nil]:nil;NSDictionary *json=[parsed isKindOfClass:[NSDictionary class]]?parsed:nil;
   NSString *failure=error.localizedDescription?:json[@"error"];if(!json&&!failure)failure=@"Controller unavailable";
   dispatch_async(dispatch_get_main_queue(),^{completion(json,failure);});
  }] resume];
 }
 - (void)refreshMenu {
- if(self.refreshing||self.changing)return;self.refreshing=YES;[self rebuildMenu];
- [self request:@"/api/overview" data:nil completion:^(NSDictionary *json,NSString *error){self.refreshing=NO;self.snapshot=error?nil:json;self.menuMessage=error;[self rebuildMenu];}];
+ if(self.refreshing||self.changing)return;self.refreshing=YES;
+ __block BOOL settled=NO;
+ [self request:@"/api/cached" data:nil completion:^(NSDictionary *json,NSString *error){
+  if(!settled&&!self.changing&&!error&&json[@"devices"]){self.snapshot=json;[self rebuildMenu];}
+ }];
+ [self request:@"/api/overview" data:nil completion:^(NSDictionary *json,NSString *error){
+  settled=YES;self.refreshing=NO;if(self.changing)return;
+  if(error||!json){
+   if(self.snapshot){NSMutableDictionary *old=[self.snapshot mutableCopy];old[@"cached"]=@YES;self.snapshot=old;}
+   self.menuMessage=self.snapshot?nil:error;
+  }else{self.snapshot=json;self.menuMessage=nil;}
+  [self rebuildMenu];
+ }];
 }
 - (void)menuWillOpen:(NSMenu *)menu {[self refreshMenu];}
+- (void)menuDidClose:(NSMenu *)menu {if(menu==self.deviceMenu)self.statusItem.menu=nil;}
+- (void)makePopover {
+ WKWebViewConfiguration *config=[WKWebViewConfiguration new];WeakScript *proxy=[WeakScript new];proxy.target=self;
+ [config.userContentController addScriptMessageHandler:proxy name:@"boseSize"];[config.userContentController addScriptMessageHandler:proxy name:@"boseOpenWindow"];
+ self.popWeb=[[WKWebView alloc] initWithFrame:NSMakeRect(0,0,380,480) configuration:config];self.popWeb.navigationDelegate=self;
+ [self.popWeb setValue:@NO forKey:@"drawsBackground"];if(@available(macOS 12.0,*))self.popWeb.underPageBackgroundColor=[NSColor clearColor];
+ NSViewController *controller=[NSViewController new];controller.view=self.popWeb;
+ self.popover=[NSPopover new];self.popover.behavior=NSPopoverBehaviorTransient;self.popover.contentViewController=controller;self.popover.contentSize=NSMakeSize(380,480);self.popover.delegate=self;
+ __weak App *weakSelf=self;
+ self.escMonitor=[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event){
+  App *me=weakSelf;if(event.keyCode==53&&me.popover.shown&&event.window==me.popWeb.window){[me.popover performClose:nil];return nil;}return event;
+ }];
+ [self loadWeb:self.popWeb];
+}
+- (void)loadWeb:(WKWebView *)web {[web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:web==self.popWeb?BosePopoverURL:BoseURL]]];}
+- (void)webView:(WKWebView *)web didFinishNavigation:(WKNavigation *)navigation {if(web==self.popWeb)self.popRetries=0;else self.webRetries=0;}
+- (void)webView:(WKWebView *)web didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+ if([error.domain isEqual:NSURLErrorDomain]&&error.code==NSURLErrorCancelled)return;
+ NSInteger tries=web==self.popWeb?++self.popRetries:++self.webRetries;if(tries>60)return;
+ __weak WKWebView *weakWeb=web;dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{WKWebView *w=weakWeb;if(w)[self loadWeb:w];});
+}
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)web {[self loadWeb:web];}
+- (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
+ if([message.name isEqual:@"boseOpenWindow"]){[self openDashboard:nil];return;}
+ if(![message.name isEqual:@"boseSize"]||![message.body isKindOfClass:[NSDictionary class]])return;
+ id height=((NSDictionary *)message.body)[@"height"];if(![height isKindOfClass:[NSNumber class]])return;
+ CGFloat h=MIN(720,MAX(320,ceil([height doubleValue])));if(fabs(self.popover.contentSize.height-h)<1)return;
+ BOOL animates=self.popover.animates;self.popover.animates=NO;self.popover.contentSize=NSMakeSize(380,h);self.popover.animates=animates;
+}
+- (void)popoverDidClose:(NSNotification *)note {self.popoverClosed=[NSDate date];}
+- (void)statusClicked:(id)sender {
+ NSEvent *event=NSApp.currentEvent;
+ if(event.type==NSEventTypeRightMouseUp||(event.modifierFlags&NSEventModifierFlagOption)){
+  [self.popover performClose:nil];self.statusItem.menu=self.deviceMenu;[self.statusItem.button performClick:nil];return;
+ }
+ if(self.popover.shown){[self.popover performClose:nil];return;}
+ if(self.popoverClosed&&-[self.popoverClosed timeIntervalSinceNow]<0.3)return;
+ NSStatusBarButton *button=self.statusItem.button;
+ [NSApp activateIgnoringOtherApps:YES];[self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
+ [self.popWeb.window makeFirstResponder:self.popWeb];
+}
 - (void)refreshClicked:(id)sender {[self refreshMenu];}
-- (void)openDashboard:(id)sender {[self showWindow];}
+- (void)openDashboard:(id)sender {[self.popover performClose:nil];[self showWindow];}
 - (void)deviceClicked:(NSMenuItem *)sender {
- if(self.changing)return;NSDictionary *data=[sender.representedObject copy];self.changing=YES;self.menuMessage=nil;[self rebuildMenu];
+ if(self.changing)return;NSDictionary *data=[sender.representedObject copy];self.changing=YES;self.pending=data;self.menuMessage=nil;[self rebuildMenu];
  [self request:@"/api/override" data:data completion:^(NSDictionary *json,NSString *error){
-  self.changing=NO;self.menuMessage=error?:([json[@"verified"] boolValue]?@"Connection updated":@"Change not verified");
-  [self rebuildMenu];[self refreshMenu];
+  self.changing=NO;self.pending=nil;
+  NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
+  if(state&&[data[@"action"] isEqual:@"noise"]&&self.snapshot&&![state[@"devices"] count]){NSMutableDictionary *merged=[self.snapshot mutableCopy];if(state[@"noise"])merged[@"noise"]=state[@"noise"];if(state[@"battery"]&&state[@"battery"]!=[NSNull null])merged[@"battery"]=state[@"battery"];self.snapshot=merged;}
+  else if(state)self.snapshot=state;
+  if(error)self.menuMessage=error;
+  else if(![json[@"ok"] boolValue])self.menuMessage=json[@"message"]?:@"Change failed";
+  else if(![json[@"verified"] boolValue])self.menuMessage=json[@"message"]?:@"Change not verified";
+  else self.menuMessage=nil;
+  [self rebuildMenu];
+  if(!state&&!error)[self refreshMenu];
  }];
 }
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {}
 - (void)showWindow {
- if(!self.window){self.window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,1000,830) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];self.window.title=@"Bose Connections";self.web=[[WKWebView alloc] initWithFrame:self.window.contentView.bounds];self.web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;self.window.contentView=self.web;[self.window center];
- dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{[self.web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:8847"]]];});}
+ if(!self.window){self.window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,420,780) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];self.window.title=@"Bose Connections";self.web=[[WKWebView alloc] initWithFrame:self.window.contentView.bounds];self.web.navigationDelegate=self;self.web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;self.window.contentView=self.web;self.window.contentMinSize=NSMakeSize(360,480);self.window.releasedWhenClosed=NO;[self.window center];[self loadWeb:self.web];}
  [self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)flag {[self showWindow];return YES;}

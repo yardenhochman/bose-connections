@@ -15,8 +15,16 @@ if subprocess.run([str(venv/'bin/python3'),'-c','import objc, IOBluetooth, Found
     subprocess.run([str(venv/'bin/python3'),'-m','pip','install',str(root/'vendor/bosectl/python')],check=True)
 app=Path.home()/'Applications/Bose Connections.app/Contents';(app/'MacOS').mkdir(parents=True,exist_ok=True)
 exe=app/'MacOS/Bose Connections'
-info=dict(CFBundleName='Bose Connections',CFBundleIdentifier='local.bose.connections.gui',CFBundleExecutable='Bose Connections',CFBundlePackageType='APPL',CFBundleVersion='1',CFBundleShortVersionString='0.1',LSUIElement=True,NSAppTransportSecurity=dict(NSAllowsLocalNetworking=True),NSBluetoothAlwaysUsageDescription='Choose which remembered devices connect to your Bose 700.',NSBluetoothPeripheralUsageDescription='Control the Bluetooth connections of your Bose 700.',BosePython=str(venv/'bin/python3'),BoseController=str(root/'controller.py'),BoseConfig=str(f))
+info=dict(CFBundleName='Bose Connections',CFBundleIdentifier='local.bose.connections.gui',CFBundleExecutable='Bose Connections',CFBundlePackageType='APPL',CFBundleVersion='1',CFBundleShortVersionString='0.1',CFBundleIconFile='AppIcon',LSUIElement=True,NSAppTransportSecurity=dict(NSAllowsLocalNetworking=True),NSBluetoothAlwaysUsageDescription='Choose which remembered devices connect to your Bose 700.',NSBluetoothPeripheralUsageDescription='Control the Bluetooth connections of your Bose 700.',BosePython=str(venv/'bin/python3'),BoseController=str(root/'controller.py'),BoseConfig=str(f))
 (app/'Info.plist').write_bytes(plistlib.dumps(info))
+# App icon: mac/AppIcon.png (from tools/icon.py) -> Resources/AppIcon.icns.
+iconset=state/'AppIcon.iconset';shutil.rmtree(iconset,ignore_errors=True);iconset.mkdir()
+for px in (16,32,128,256,512):
+    for scale in (1,2):
+        name=f'icon_{px}x{px}'+('@2x' if scale==2 else '')+'.png'
+        subprocess.run(['sips','-z',str(px*scale),str(px*scale),str(root/'mac/AppIcon.png'),'--out',str(iconset/name)],check=True,stdout=subprocess.DEVNULL)
+(app/'Resources').mkdir(exist_ok=True)
+subprocess.run(['iconutil','-c','icns',str(iconset),'-o',str(app/'Resources/AppIcon.icns')],check=True)
 subprocess.run(['xcrun','clang','-fobjc-arc','-framework','Cocoa','-framework','WebKit','-framework','CoreBluetooth',str(root/'mac/Launcher.m'),'-o',str(exe)],check=True)
 subprocess.run(['codesign','--force','--sign','-',str(app.parent)],check=True)
 plist=Path.home()/'Library/LaunchAgents/local.bose.connections.plist';plist.parent.mkdir(parents=True,exist_ok=True)
