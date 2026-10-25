@@ -1,7 +1,7 @@
 import QtQuick
 import qs.Ui as Ui
 import qs.Commons
-
+import qs.Commons as Commons
 // Omarchy bar widget + popup for Bose Connections. The bar shows a headphones
 // glyph with the number of occupied slots, dims when the headset or helper is
 // unreachable, and breathes an ochre dot while a change is being verified.
@@ -14,9 +14,9 @@ Ui.Panel {
 
   readonly property BoseModel model: BoseModel {}
   readonly property BoseTheme theme: BoseTheme {
-    background: Color.popups.background
-    foreground: Color.popups.text
-    urgent: Color.urgent
+    background: Commons.Color.popups.background
+    foreground: Commons.Color.popups.text
+    urgent: Commons.Color.urgent
     themeFont: Style.font.family
     fontScale: Style.font.body / 12
     spaceScale: Style.space(100) / 100
