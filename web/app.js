@@ -28,6 +28,8 @@ function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.class
 function icon(name){const ns='http://www.w3.org/2000/svg';const svg=document.createElementNS(ns,'svg');svg.setAttribute('class','i');svg.setAttribute('aria-hidden','true');const use=document.createElementNS(ns,'use');use.setAttribute('href','#i-'+name);svg.append(use);return svg;}
 function message(text,error=false){const m=$('message');m.replaceChildren();m.className='status'+(error===true?' error':'');if(!text)return;if(error!=='info')m.append(icon(error?'alert':'check'));m.append(node('span','',text));}
 function live(){return !!(state&&state.reachable&&!state.cached);}
+// A live check just ran and no controller could read the headset: the slots shown are only last known.
+function unreachable(){return !!(state&&state.cached&&state.checked);}
 function roles(){return (state&&state.roles)||{};}
 function roleOf(address){const r=roles();return roleIds.find(k=>r[k]===address);}
 function deviceIcon(d){const role=roleOf(d.address);if(role==='pc')return 'desktop';if(role==='phone')return 'phone';if(role==='mac')return 'laptop';const n=(d.name||'').toLowerCase();if(/\btv\b|television/.test(n))return 'tv';if(/phone|pixel|galaxy|iphone/.test(n))return 'phone';if(/mac|book|laptop/.test(n))return 'laptop';if(/\bpc\b|desktop/.test(n))return 'desktop';return 'device';}
@@ -58,7 +60,7 @@ function render(){
  const dot=$('live-dot');
  dot.className=!state.cached&&reachable?'led':'led idle';
  const count=$('slot-count');const occupied=(state.devices||[]).filter(d=>d.connected).length;
- count.hidden=!(state.cached||reachable)||!(state.devices||[]).length;
+ count.hidden=!(state.cached||reachable)||!(state.devices||[]).length||unreachable();
  headerStatus(`${occupied} of 2`);
  const battery=state.battery;$('battery-wrap').hidden=battery==null;
  if(battery!=null){$('battery').textContent=battery+'%';$('battery-wrap').setAttribute('aria-label',`Battery ${battery} percent`);$('battery-fill').setAttribute('width',String(Math.max(1,Math.round(11*battery/100))));}
@@ -68,7 +70,8 @@ function render(){
 // One line under the title: drop words (never the time) until it fits.
 function headerStatus(slots){
  const count=$('slot-count'),status=$('headset-status'),sub=count.parentElement;
- const forms=state.cached?[[slots,'last known '+(state.observed?clock(state.observed):'earlier')]]
+ const known='last known '+(state.observed?clock(state.observed):'earlier');
+ const forms=unreachable()?[['','Not reachable · '+known],['',known]]:state.cached?[[slots,known]]
   :state.reachable?[[slots+' connected','Live · '+ago()],[slots,'Live · '+ago()],[slots,'Live']]:[[slots,'Headset not reachable']];
  const line=parseFloat(getComputedStyle(sub).lineHeight)||18;
  for(const [c,t] of forms){count.textContent=c;status.textContent=t;if(sub.offsetHeight<line*1.5)break;}
@@ -83,9 +86,9 @@ function renderCups(reachable){
   const cup=node(target?'button':'div','cup');
   const head=node('div','state');const led=node('span','led');const label=node('span');head.append(led,label,node('span','slot',`Slot ${i+1}`));cup.append(head);
   if(!d){
-   const known=reachable&&!state.cached;
-   cup.classList.add(known?'open':'unknown');led.className='led idle';label.textContent=known?'Open':state.cached?'Last known':'Unknown';
-   const dev=node('div','dev');dev.append(icon('device'));cup.append(dev,node('div','name',known||state.cached?'Open slot':'Not known'),node('div','tag',known?'Connect a saved device':state.cached?'Refresh to check':'Headset not reachable'),node('div','spacer'));
+   const known=reachable&&!state.cached;const last=state.cached&&!unreachable();
+   cup.classList.add(known?'open':'unknown');led.className='led idle';label.textContent=known?'Open':last?'Last known':'Unknown';
+   const dev=node('div','dev');dev.append(icon('device'));cup.append(dev,node('div','name',known||last?'Open slot':'Not known'),node('div','tag',known?'Connect a saved device':last?'Refresh to check':'Headset not reachable'),node('div','spacer'));
    cups.append(cup);return;
   }
   const dev=node('div','dev');dev.append(icon(deviceIcon(d)));cup.append(dev,node('div','name',d.name));
@@ -148,11 +151,23 @@ function renderControllers(){
  box.append(document.createTextNode('Controllers: '));
  roleIds.forEach((id,i)=>{
   const s=list.find(c=>c.controller===id);
-  // A controller whose own device holds a slot is plainly connected, not "checking".
-  const held=!!deviceByAddress(roles()[id])?.connected;
-  const word=id===state.here&&(hereLive||s?.reachable!==false)?'here':s?.reachable?'available':s?.checking?(held?'connected':'checking…'):s?.error||s?.reachable===false?'offline':'not set up';
+  const word=id===state.here&&(hereLive||s?.reachable!==false)?'here':controllerWord(id,s);
   if(i)box.append(document.createTextNode(' · '));box.append(node('b','',labels[id]),document.createTextNode(' '+word));
  });
+}
+
+// Why a controller cannot read the headset, in a word or two (not just "offline").
+function controllerWord(id,s){
+ if(!s)return 'not set up';
+ if(s.reachable)return 'available';
+ // A controller whose own device holds a slot is plainly connected, not "checking".
+ if(s.checking)return deviceByAddress(roles()[id])?.connected?'connected':'checking…';
+ if(s.link===false)return 'not connected';
+ const e=String(s.error||'');
+ if(/Controller unavailable: ConnectionRefused/.test(e))return 'app not running';
+ if(/Controller unavailable: .*Timeout/i.test(e))return 'no answer';
+ if(!e||/Controller unavailable/.test(e))return 'offline';
+ return 'can’t reach headset';
 }
 
 // ---- Noise cancellation ----
@@ -241,7 +256,7 @@ function syncControls(){
 async function refresh(){
  if(refreshing||op||anc.inFlight)return;
  refreshing=true;choosing=null;syncControls();
- try{adopt(await api('/api/overview'));message('');}catch(e){message(e.message,true);}
+ try{adopt(await api('/api/overview'));message(unreachable()?'No controller can reach the headset right now. Connect it to a phone, PC or Mac in Bluetooth settings, then refresh.':'',unreachable()?'info':false);}catch(e){message(e.message,true);}
  finally{refreshing=false;render();if(!state)syncControls();}
 }
 

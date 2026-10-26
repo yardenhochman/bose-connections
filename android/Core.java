@@ -123,10 +123,17 @@ public class Core {
   JSONArray states=new JSONArray(),devices=new JSONArray();JSONObject roles=new JSONObject(conf.optJSONObject("roles")==null?"{}":conf.getJSONObject("roles").toString());Object battery=JSONObject.NULL,noise=JSONObject.NULL;boolean reachable=false;double freshest=0;
   for(Map.Entry<String,Future<JSONObject>> entry:jobs.entrySet()){
    Future<JSONObject> job=entry.getValue();JSONObject state=job.isDone()?job.get():new JSONObject().put("controller",entry.getKey()).put("node",names.get(entry.getKey())).put("reachable",false).put("checking",true).put("devices",new JSONArray());states.put(state);
-   if(state.optBoolean("reachable")){reachable=true;if(state.optDouble("observed")>=freshest){freshest=state.optDouble("observed");devices=state.getJSONArray("devices");battery=state.opt("battery");noise=state.opt("noise");}JSONArray ds=state.getJSONArray("devices");for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.optBoolean("current"))roles.put(state.getString("controller"),d.getString("address"));}}
+   if(state.optBoolean("reachable")){reachable=true;if(state.optDouble("observed",0)>=freshest){freshest=state.optDouble("observed",0);devices=state.getJSONArray("devices");battery=state.opt("battery");noise=state.opt("noise");}JSONArray ds=state.getJSONArray("devices");for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.optBoolean("current"))roles.put(state.getString("controller"),d.getString("address"));}}
   }
   JSONObject result=new JSONObject().put("controllers",states).put("devices",devices).put("roles",roles).put("reachable",reachable).put("battery",battery).put("capacity",2).put("here","phone").put("observed",freshest).put("cached",false).put("noise",noise==null?JSONObject.NULL:noise);
   if(reachable){snapshot(c,result);LAST_OVERVIEW=result;LAST_OVERVIEW_AT=System.nanoTime();}
+  else{
+   // Nobody read the headset: keep showing the last known slots, marked cached, instead of "connected to nothing".
+   File f=new File(c.getFilesDir(),"snapshot.json");
+   if(f.exists())try(FileInputStream in=new FileInputStream(f)){JSONObject prev=new JSONObject(read(in,65536));JSONArray pd=prev.optJSONArray("devices");
+    if(pd!=null&&pd.length()>0)result.put("devices",pd).put("observed",prev.opt("observed")).put("noise",prev.opt("noise")).put("cached",true);}catch(Exception ignored){}
+   result.put("checked",System.currentTimeMillis()/1000.0);
+  }
   return result;
  }
  static Set<String> connected(JSONObject state)throws Exception{Set<String> set=new HashSet<>();JSONArray ds=state.getJSONArray("devices");for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.getBoolean("connected"))set.add(d.getString("address"));}return set;}

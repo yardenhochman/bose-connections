@@ -73,6 +73,17 @@ class Tests(unittest.TestCase):
   c=self.ctl()
   with patch('controller.sys.platform','linux'),patch('controller.subprocess.run') as run,patch('controller.connection') as connect:
    run.return_value.stdout='b false';result=c.local_status();self.assertFalse(result['reachable']);connect.assert_not_called()
+   self.assertIs(result['link'],False)
+ def test_unreachable_overview_drops_unlinked_slot_and_marks_live_check(self):
+  c=self.ctl();c.config['peers']=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')]
+  with tempfile.TemporaryDirectory() as folder:
+   c.config_path=str(Path(folder)/'config.json')
+   (Path(folder)/'snapshot.json').write_text(json.dumps(dict(devices=[device(PC,True,True),device(PHONE,False)],observed=5,roles={})))
+   with patch.object(c,'local_status',return_value=dict(controller='pc',reachable=False,link=False,error='Headset is not connected to this PC',devices=[])),patch.object(c,'peer_call',return_value=dict(controller='phone',reachable=False,error='Controller unavailable: ConnectionRefusedError')):
+    view=c.overview()
+  self.assertFalse(view['reachable']);self.assertTrue(view['cached']);self.assertIn('checked',view);self.assertEqual(view['observed'],5)
+  self.assertEqual([(d['address'],d['connected'],d['current']) for d in view['devices']],[(PC,False,False),(PHONE,False,False)])
+  c.status_pool.shutdown(wait=True)
  def test_disconnect_already_disconnected_is_verified_without_write(self):
   fake=Fake([device(PC,True,True),device(PHONE,False)])
   self.assertTrue(self.run_action(fake,dict(action='disconnect',address=PHONE))['verified']);self.assertEqual(fake.calls,[])

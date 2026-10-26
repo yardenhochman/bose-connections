@@ -15,7 +15,9 @@ connection to replace when both Bluetooth slots are occupied.
 - macOS menu-bar icon that opens a compact popover; right-click for the native menu.
 - Optional authenticated controller-to-controller relay over Tailscale: an
   unconnected computer can send a request through a controller that reaches the headset.
-- Immediate last-known device list, followed by a live refresh.
+- Immediate last-known device list, followed by a live refresh. When no controller can read the
+  headset, the dashboard says so and gives each controller's reason (not connected, app not
+  running, no answer); a controller with no Bluetooth link never shows in a last-known slot.
 - Connection changes reread headset state, preserve a known control device, and
   verify the result. An ambiguous command is never retried through another peer.
 
@@ -200,7 +202,7 @@ A locked phone must be unlocked before controls open. Long-press opens app setti
 python3 -m unittest discover -s tests -v
 ```
 
-The 43 protocol/controller tests use simulated transports and have no hardware
+The 44 protocol/controller tests use simulated transports and have no hardware
 side effects. They cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
