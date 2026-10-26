@@ -16,6 +16,8 @@ CONNECT_WAIT=10.0      # was 4 s ack + 8 polls x 0.5 s plus eight full status re
 MAC_TEXT=re.compile(r'(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b')
 class HeadsetUnreachable(ProtocolError):
     """Raised only before any command was sent, so another controller may safely be tried."""
+class NotLinked(ProtocolError):
+    """The OS reports no Bluetooth link to the headset: this controller certainly holds no slot."""
 MAIN_TASKS=queue.Queue()
 def on_main(func):
     future=concurrent.futures.Future();MAIN_TASKS.put((future,func));return future.result(timeout=90)
@@ -48,18 +50,20 @@ class Controller:
                     if not adapter.startswith('hci') or not adapter[3:].isdigit():raise ValueError('Invalid BlueZ adapter')
                     path='/org/bluez/'+adapter+'/dev_'+self.config['headset'].replace(':','_')
                     status=subprocess.run(['busctl','get-property','org.bluez',path,'org.bluez.Device1','Connected'],capture_output=True,text=True,timeout=2,check=True)
-                    if status.stdout.strip()!='b true':raise ProtocolError('Headset is not connected to this PC')
+                    if status.stdout.strip()!='b true':raise NotLinked('Headset is not connected to this PC')
                 if sys.platform=='darwin':
                     from IOBluetooth import IOBluetoothDevice
                     device=IOBluetoothDevice.deviceWithAddressString_(self.config['headset'])
-                    if not device or not device.isConnected():raise ProtocolError('Headset is not connected to this Mac')
+                    if not device or not device.isConnected():raise NotLinked('Headset is not connected to this Mac')
                 with connection(self.config['headset'],self.channel) as client:state=client.status()
                 state.update(reachable=True,node=self.config['name'],controller=self.config['id'],observed=time.time())
                 self.cache=state;self.last_error=None
                 return state
             except Exception as e:
                 self.last_error=str(e)
-                return dict(node=self.config['name'],controller=self.config['id'],reachable=False,error=str(e),devices=self.cache.get('devices',[]),stale=True)
+                state=dict(node=self.config['name'],controller=self.config['id'],reachable=False,error=str(e),devices=self.cache.get('devices',[]),stale=True)
+                if isinstance(e,NotLinked):state['link']=False
+                return state
     def peer_call(self,peer,path,data=None):
         parts=urlsplit(peer['url'])
         host=ipaddress.ip_address(parts.hostname)
@@ -128,7 +132,11 @@ class Controller:
         if valid:self.store_snapshot(result);self.last_overview=(time.monotonic(),result)
         elif not wait_all:
             previous=self.cached_overview()
-            result.update(devices=previous['devices'],observed=previous.get('observed'),cached=bool(previous['devices']),noise=previous.get('noise'))
+            devices=previous['devices']
+            # A controller that knows it has no link to the headset holds no slot, whatever the snapshot says.
+            unlinked={self.config.get('roles',{}).get(s['controller']) for s in states if s.get('link') is False}
+            devices=[dict(d,connected=False,current=False) if d.get('address') in unlinked else d for d in devices]
+            result.update(devices=devices,observed=previous.get('observed'),cached=bool(devices),noise=previous.get('noise'),checked=time.time())
         return result
     @contextlib.contextmanager
     def open_headset(self):

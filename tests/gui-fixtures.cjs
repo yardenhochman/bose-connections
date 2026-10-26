@@ -47,6 +47,19 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  await page.setViewportSize({width:390,height:844});await ready();await shot(page,'phone-offline.png');
  check(!await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Mobile horizontal overflow (offline)');
 
+ // Live check found no controller that reaches the headset: last-known slots, reasons per controller
+ cur={...overview([DEV.phone.address]),reachable:false,cached:true,checked:Date.now()/1000,observed:Math.floor(Date.now()/1000)-3*3600,
+  controllers:[{controller:'pc',reachable:false,link:false,error:'Headset is not connected to this PC'},{controller:'phone',reachable:false,error:'Controller unavailable: ConnectionRefusedError'},{controller:'mac',reachable:false,error:'Controller unavailable: TimeoutError'}]};
+ await page.setViewportSize({width:390,height:844});await page.reload();
+ await page.getByText('Not reachable · last known',{exact:false}).waitFor();await ready();
+ check(!await page.locator('#slot-count').isVisible(),'Slot count must hide when no controller reaches the headset');
+ check((await page.locator('#controllers').textContent())==='Controllers: PC not connected · Phone app not running · Mac no answer','Controller reasons: '+await page.locator('#controllers').textContent());
+ check(await page.getByText('No controller can reach the headset right now',{exact:false}).isVisible(),'Unreachable explanation missing');
+ check(await page.locator('.cup.unknown',{hasText:'Not known'}).count()===1,'Open slot must read unknown after a failed live check');
+ check(await page.locator('#devices button:not([disabled])').count()===0,'Last-known state must not offer actions');
+ await shot(page,'phone-unreachable.png');
+ await page.setViewportSize({width:1280,height:950});
+
  // Two slots full, light + dark, phone + desktop
  const both=[DEV.pc.address,DEV.phone.address];
  cur=overview(both);await page.reload();
