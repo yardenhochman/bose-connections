@@ -8,7 +8,9 @@ if sys.platform!='darwin':raise SystemExit('Run this installer on macOS')
 config=json.loads(Path(a.config).read_text())
 if config.get('id')!='mac' or len(config.get('token',''))<32:raise SystemExit('A provisioned Mac config is required')
 state=Path.home()/'.local/state/bose-control';state.mkdir(parents=True,exist_ok=True,mode=0o700)
-f=state/'config.json';f.write_text(json.dumps(config,indent=2));f.chmod(0o600)
+f=state/'config.json'
+if Path(a.config).resolve()!=f.resolve():
+    f.write_text(json.dumps(config,indent=2));f.chmod(0o600)
 venv=state/'venv'
 if not (venv/'bin/python3').exists():subprocess.run([sys.executable,'-m','venv',str(venv)],check=True)
 if subprocess.run([str(venv/'bin/python3'),'-c','import objc, IOBluetooth, Foundation'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
