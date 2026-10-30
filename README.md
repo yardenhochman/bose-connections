@@ -271,8 +271,8 @@ protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
 
 `tests/test_android_contract.py` compiles `android/Switcher.java` with a test-only
-`org.json` stand-in and runs every scenario of `tests/switch-contract.json` against a
-fake headset (skipped without a JDK); `tests/test_mac_contract.py` statically checks that
+`org.json` stand-in and runs every scenario of `tests/switch-contract.json` against a fake
+overview and override (skipped without a JDK); `tests/test_mac_contract.py` statically checks that
 `mac/Launcher.m` posts `/api/switch` with the contract body and texts.
 
 For GUI checks, install Node dependencies (`npm install`) and Chromium, then run
