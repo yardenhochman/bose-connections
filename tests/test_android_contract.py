@@ -43,7 +43,7 @@ class AndroidContract(unittest.TestCase):
    with self.subTest(s['name']):self.assertTrue(self.results.get(s['name']),self.output)
  def test_extra_cases_and_exit_status(self):
   self.assertEqual(self.returncode,0,self.output)
-  for n in ('replace_ignored_when_slot_free','replace_not_held_offers_busy_again','read_failure_is_unreachable','open_failure_is_unreachable','replace_must_leave_a_known_device'):
+  for n in ('replace_ignored_when_slot_free','replace_not_held_offers_busy_again','no_controller_reads_headset_is_unreachable','overview_failure_is_unreachable','replace_must_leave_a_known_device','phone_holds_no_slot_both_busy_is_busy','replace_is_passed_to_override','first_unverified_second_succeeds_after_fresh_overview','executed_via_peer_logs_peer'):
    with self.subTest(n):self.assertTrue(self.results.get(n),self.output)
  def test_android_strings_use_contract_texts_only(self):
   core=(ROOT/'android/Core.java').read_text()

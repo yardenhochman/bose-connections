@@ -5,6 +5,8 @@ public class JSONObject {
  final Map<String,Object> map=new LinkedHashMap<>();
  public JSONObject put(String k,Object v)throws JSONException{map.put(k,v);return this;}
  public JSONObject put(String k,boolean v)throws JSONException{map.put(k,v);return this;}
+ public Iterator<String> keys(){return map.keySet().iterator();}
+ public JSONArray optJSONArray(String k){return map.get(k) instanceof JSONArray?(JSONArray)map.get(k):null;}
  public boolean has(String k){return map.containsKey(k);}
  public Object opt(String k){return map.get(k);}
  public boolean optBoolean(String k){return map.get(k) instanceof Boolean&&(Boolean)map.get(k);}

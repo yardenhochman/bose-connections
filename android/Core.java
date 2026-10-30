@@ -234,23 +234,18 @@ public class Core {
   throw new Switcher.Fail("keep_one","No controller can make this change while retaining access");
  }
  /** One-tap "move the headset here" (here = this phone) per tests/switch-contract.json. Reply shape = POST /api/switch. */
+ static final Object SWITCH_LOCK=new Object();
  static JSONObject switchHere(Context c,String source,String requestId,String replace){
-  synchronized(LOCK){
+  synchronized(SWITCH_LOCK){
    Switcher.Env env=new Switcher.Env(){
     public long millis(){return System.nanoTime()/1000000;}
-    public void sleep(long ms)throws InterruptedException{Thread.sleep(ms);}
     public void log(String line){android.util.Log.i("BoseSwitch",line);}
     public Map<String,String> roles()throws Exception{Map<String,String> m=new HashMap<>();JSONObject r=config(c).optJSONObject("roles");if(r!=null){Iterator<String> it=r.keys();while(it.hasNext()){String k=it.next();m.put(k,r.getString(k));}}return m;}
-    public JSONObject state(JSONObject read)throws Exception{return fullState(c,read.put("observed",System.currentTimeMillis()/1000.0),"phone",null);}
    };
-   return Switcher.switchHere(()->{
-    final Client client=open(c);
-    return new Switcher.Headset(){
-     public JSONObject read()throws Exception{try{JSONObject s=client.status(false,!IDENT_OK);IDENT_OK=true;return s;}catch(Exception e){IDENT_OK=false;throw e;}}
-     public void connect(String a)throws Exception{client.action("connect",a);}
-     public void disconnect(String a)throws Exception{client.action("disconnect",a);}
-     public void close(){client.close();}
-    };
+   // Same prelude and controller choice as override(): the phone may hold no slot, so a PC or Mac controller may have to do the work.
+   return Switcher.switchHere(new Switcher.Mesh(){
+    public JSONObject overview(boolean reuse)throws Exception{JSONObject last=LAST_OVERVIEW;if(reuse&&last!=null&&LAST_OVERVIEW_AT!=Long.MIN_VALUE&&(System.nanoTime()-LAST_OVERVIEW_AT)<=TimeUnit.MILLISECONDS.toNanos(PRELUDE_TTL_MS)&&usable(last,""))return last;return Core.overview(c,"");}
+    public JSONObject override(JSONObject data)throws Exception{return route(c,data);}
    },env,source,requestId,replace);
   }
  }

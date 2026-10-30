@@ -201,8 +201,10 @@ Off controls, sharing the app's private config and cached state. A locked phone 
 unlocked first. Long-press opens the app.
 
 The app and tile share `Core.switchHere` (rules and texts in `tests/switch-contract.json`,
-logic in `android/Switcher.java`): already connected is a success with no command; a
-connect that is not confirmed is resent once after a fresh read; 150 s is the deadline;
+logic in `android/Switcher.java`). It reads the same phone+PC+Mac overview as the other
+changes and hands the connect to `Core.override`'s controller choice, so it works when the
+phone holds no slot: already connected is a success with no command; a
+connect that is not confirmed is resent once after a fresh overview; 150 s is the deadline;
 one `bose.switch …` line per request goes to logcat tag `BoseSwitch` (roles only, no
 addresses). The in-app web page reaches it as `/api/switch` through the same
 `Android.request` bridge as every other call, with the controller's reply shape.
