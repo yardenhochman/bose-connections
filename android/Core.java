@@ -101,26 +101,30 @@ public class Core {
   public void close(){if(expiry!=null)expiry.cancel(false);timer.shutdownNow();try{if(socket!=null)socket.close();}catch(Exception ignored){}}
  }
  static JSONObject status(Context c){synchronized(LOCK){try(Client client=new Client(c)){JSONObject s=client.status();IDENT_OK=true;LOCAL_OK=true;return s.put("reachable",true).put("node","Phone").put("controller","phone").put("observed",System.currentTimeMillis()/1000.0);}catch(Exception e){LOCAL_OK=false;IDENT_OK=false;JSONObject o=error(e);try{o.put("node","Phone").put("controller","phone").put("devices",new JSONArray());}catch(Exception ignored){}return o;}}}
- static JSONObject peer(Context c,JSONObject p,String path,JSONObject data){HttpURLConnection con=null;try{
+ static JSONObject peer(Context c,JSONObject p,String path,JSONObject data){return peer(c,p,path,data,data==null?35000:90000);}
+ /** transport:true in a failed reply = no answer arrived, so the peer may still be acting on a mutation (never resend). */
+ static JSONObject peer(Context c,JSONObject p,String path,JSONObject data,int readTimeoutMs){HttpURLConnection con=null;try{
   JSONObject conf=config(c);if(conf.optString("token").isEmpty())throw new IOException("Set up controller links to use the PC or Mac");
   URL url=new URL(p.getString("url")+path);if(!url.getProtocol().equals("http")||!tailnet(url.getHost()))throw new IOException("Controller must use its Tailscale IPv4 address");
-  con=(HttpURLConnection)url.openConnection();con.setConnectTimeout(2000);con.setReadTimeout(data==null?35000:90000);con.setRequestProperty("Authorization","Bearer "+conf.getString("token"));
+  con=(HttpURLConnection)url.openConnection();con.setConnectTimeout(2000);con.setReadTimeout(readTimeoutMs);con.setRequestProperty("Authorization","Bearer "+conf.getString("token"));
   if(data!=null){con.setRequestMethod("POST");con.setDoOutput(true);con.setRequestProperty("Content-Type","application/json");try(OutputStream out=con.getOutputStream()){out.write(data.toString().getBytes("UTF-8"));}}
   int code=con.getResponseCode();JSONObject result=new JSONObject(read(code>=400?con.getErrorStream():con.getInputStream(),65536));return result;
- }catch(Exception e){JSONObject o=error(data==null?e:new Switcher.Fail(e instanceof SocketTimeoutException?"timeout":"unreachable",e.getMessage()));try{o.put("controller",p.optString("id")).put("node",p.optString("name"));}catch(Exception ignored){}return o;}finally{if(con!=null)con.disconnect();}}
+ }catch(Exception e){JSONObject o=error(data==null?e:new Switcher.Fail(e instanceof SocketTimeoutException?"timeout":"unreachable",e.getMessage()));try{o.put("transport",true).put("controller",p.optString("id")).put("node",p.optString("name"));}catch(Exception ignored){}return o;}finally{if(con!=null)con.disconnect();}}
  static boolean tailnet(String ip){try{String[] p=ip.split("\\.");return p.length==4&&Integer.parseInt(p[0])==100&&Integer.parseInt(p[1])>=64&&Integer.parseInt(p[1])<=127;}catch(Exception e){return false;}}
  static JSONObject overview(Context c)throws Exception{return overview(c,"");}
  static boolean eligible(JSONObject state,String exclude)throws Exception{
   if(!state.optBoolean("reachable"))return false;JSONArray ds=state.optJSONArray("devices");
   if(ds!=null)for(int i=0;i<ds.length();i++){JSONObject d=ds.getJSONObject(i);if(d.optBoolean("current")&&d.optString("address").equals(exclude))return false;}return true;
  }
- static JSONObject overview(Context c,String exclude)throws Exception{
+ static JSONObject overview(Context c,String exclude)throws Exception{return overview(c,exclude,35000);}
+ /** maxMs bounds the wait for controllers (a switch passes what is left of its deadline). */
+ static JSONObject overview(Context c,String exclude,long maxMs)throws Exception{
   JSONObject conf=config(c);JSONArray peers=conf.optJSONArray("peers");Map<String,Future<JSONObject>> jobs=new LinkedHashMap<>();Map<String,String> names=new HashMap<>();
   synchronized(PROBES){
    Future<JSONObject> local=PROBES.get("phone");if(local==null||local.isDone())PROBES.put("phone",local=STATUS_POOL.submit(()->status(c)));jobs.put("phone",local);names.put("phone","Phone");
    if(peers!=null)for(int i=0;i<peers.length();i++){final JSONObject p=peers.getJSONObject(i);String id=p.getString("id");Future<JSONObject> job=PROBES.get(id);if(job==null||job.isDone())PROBES.put(id,job=STATUS_POOL.submit(()->peer(c,p,"/api/status",null)));jobs.put(id,job);names.put(id,p.optString("name",id));}
   }
-  long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(35);
+  long deadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(Math.max(0,Math.min(35000,maxMs)));
   boolean grace=false;
   while(System.nanoTime()<deadline){boolean all=true,ready=false,answered=false;for(Future<JSONObject> job:jobs.values()){if(!job.isDone())all=false;else{if(job.get().optBoolean("reachable"))answered=true;if(eligible(job.get(),exclude))ready=true;}}if(all||ready)break;if(answered&&!grace){grace=true;deadline=Math.min(deadline,System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(EXCLUDE_GRACE_MS));}Thread.sleep(10);}
   JSONArray states=new JSONArray(),devices=new JSONArray();JSONObject roles=new JSONObject(conf.optJSONObject("roles")==null?"{}":conf.getJSONObject("roles").toString());Object battery=JSONObject.NULL,noise=JSONObject.NULL;boolean reachable=false;double freshest=0;
@@ -214,23 +218,25 @@ public class Core {
  static JSONObject override(Context c,JSONObject data)throws Exception{
   String source=data.optString("source","android-app"),id=data.optString("request_id","-");
   boolean log=!data.optString("action").equals("noise");long start=System.nanoTime();String outcome="ok";
-  try{JSONObject result=route(c,data);if(!result.optBoolean("ok")||!result.optBoolean("verified"))outcome="error:"+result.optString("error_key","unverified");return result;}
+  try{JSONObject result;if(!log)result=route(c,data);else synchronized(SWITCH_LOCK){result=route(c,data);}if(!result.optBoolean("ok")||!result.optBoolean("verified"))outcome="error:"+result.optString("error_key","unverified");return result;}
   catch(Exception e){outcome="error:"+keyOf(e);throw e;}
   finally{if(log){String t="-",r="-";try{t=role(c,data.optString("address"));r=data.optString("replace").isEmpty()?"-":role(c,data.optString("replace"));}catch(Exception ignored){}
    android.util.Log.i("BoseSwitch",Switcher.logLine(source,id,t,r,outcome,data.optString("via","local"),(System.nanoTime()-start)/1000000));}}
  }
  static JSONObject route(Context c,JSONObject data)throws Exception{
-  long start=System.nanoTime();
+  long start=System.nanoTime(),budget=data.has("budget_ms")?data.optLong("budget_ms",90000):90000;data.remove("budget_ms");
+  String rid=Switcher.cleanId(data.optString("request_id",null));data.remove("request_id");if(rid!=null)data.put("request_id",rid);
+  if(!Switcher.SOURCES.contains(data.optString("source")))data.remove("source");
   if(data.optString("action").equals("noise")&&LOCAL_OK){try{return action(c,data,0,"skipped");}catch(Unreachable ignored){LAST_OVERVIEW_AT=Long.MIN_VALUE;}}
   String drop=data.getString("action").equals("connect")?data.optString("replace"):data.optString("address");
   JSONObject view=null;String mode="fresh";JSONObject last=LAST_OVERVIEW;
   if(last!=null&&LAST_OVERVIEW_AT!=Long.MIN_VALUE&&(System.nanoTime()-LAST_OVERVIEW_AT)<=TimeUnit.MILLISECONDS.toNanos(PRELUDE_TTL_MS)&&usable(last,drop)){view=last;mode="reused";}
-  if(view==null)view=overview(c,drop);
+  if(view==null)view=overview(c,drop,budget);
   long preludeMs=(System.nanoTime()-start)/1000000;
   JSONArray anchors=new JSONArray();JSONObject roles=view.getJSONObject("roles");Iterator<String> it=roles.keys();while(it.hasNext())anchors.put(roles.getString(it.next()));data.put("anchors",anchors);
   if(data.optString("action").equals("connect")&&data.optString("address").equals(roles.optString("pc"))){JSONArray ps=config(c).getJSONArray("peers");for(int i=0;i<ps.length();i++){JSONObject p=ps.getJSONObject(i);if(p.optString("id").equals("pc")){JSONObject prepared=peer(c,p,"/api/prepare-connect",new JSONObject().put("address",data.getString("address")));if(!prepared.optBoolean("ok"))throw new IOException(prepared.optString("error","PC Bluetooth unavailable"));}}}
   JSONArray states=view.getJSONArray("controllers");
-  for(int i=0;i<states.length();i++){JSONObject s=states.getJSONObject(i);if(!s.optBoolean("reachable"))continue;boolean dropping=false;JSONArray ds=s.getJSONArray("devices");for(int k=0;k<ds.length();k++){JSONObject d=ds.getJSONObject(k);if(d.optBoolean("current")&&d.getString("address").equals(drop))dropping=true;}if(dropping)continue;if(s.getString("controller").equals("phone"))return action(c,data,preludeMs,mode);JSONArray ps=config(c).getJSONArray("peers");for(int k=0;k<ps.length();k++){JSONObject p=ps.getJSONObject(k);if(p.getString("id").equals(s.getString("controller"))){long sent=System.nanoTime();JSONObject result=peer(c,p,"/api/action",data);Map<String,Long> t=new LinkedHashMap<>();t.put("prelude",preludeMs);t.put("relay",(System.nanoTime()-sent)/1000000);timing(data.optString("action"),result.optBoolean("ok")?"ok":"error",label(c,data.optString("address").toUpperCase(Locale.ROOT),view.optJSONArray("devices")),mode,t,(System.nanoTime()-start)/1000000);data.put("via","peer:"+s.getString("controller"));return adoptPeerState(c,result,s.getString("controller"),view);}}}
+  for(int i=0;i<states.length();i++){JSONObject s=states.getJSONObject(i);if(!s.optBoolean("reachable"))continue;boolean dropping=false;JSONArray ds=s.getJSONArray("devices");for(int k=0;k<ds.length();k++){JSONObject d=ds.getJSONObject(k);if(d.optBoolean("current")&&d.getString("address").equals(drop))dropping=true;}if(dropping)continue;if(s.getString("controller").equals("phone"))return action(c,data,preludeMs,mode);JSONArray ps=config(c).getJSONArray("peers");for(int k=0;k<ps.length();k++){JSONObject p=ps.getJSONObject(k);if(p.getString("id").equals(s.getString("controller"))){long sent=System.nanoTime();JSONObject result=peer(c,p,"/api/action",data,(int)Math.max(1000,Math.min(90000,budget-(System.nanoTime()-start)/1000000)));Map<String,Long> t=new LinkedHashMap<>();t.put("prelude",preludeMs);t.put("relay",(System.nanoTime()-sent)/1000000);timing(data.optString("action"),result.optBoolean("ok")?"ok":"error",label(c,data.optString("address").toUpperCase(Locale.ROOT),view.optJSONArray("devices")),mode,t,(System.nanoTime()-start)/1000000);data.put("via","peer:"+s.getString("controller"));return adoptPeerState(c,result,s.getString("controller"),view);}}}
   throw new Switcher.Fail("keep_one","No controller can make this change while retaining access");
  }
  /** One-tap "move the headset here" (here = this phone) per tests/switch-contract.json. Reply shape = POST /api/switch. */
@@ -244,7 +250,7 @@ public class Core {
    };
    // Same prelude and controller choice as override(): the phone may hold no slot, so a PC or Mac controller may have to do the work.
    return Switcher.switchHere(new Switcher.Mesh(){
-    public JSONObject overview(boolean reuse)throws Exception{JSONObject last=LAST_OVERVIEW;if(reuse&&last!=null&&LAST_OVERVIEW_AT!=Long.MIN_VALUE&&(System.nanoTime()-LAST_OVERVIEW_AT)<=TimeUnit.MILLISECONDS.toNanos(PRELUDE_TTL_MS)&&usable(last,""))return last;return Core.overview(c,"");}
+    public JSONObject overview(boolean reuse,long budgetMs)throws Exception{JSONObject last=LAST_OVERVIEW;if(reuse&&last!=null&&LAST_OVERVIEW_AT!=Long.MIN_VALUE&&(System.nanoTime()-LAST_OVERVIEW_AT)<=TimeUnit.MILLISECONDS.toNanos(PRELUDE_TTL_MS)&&usable(last,""))return last;return Core.overview(c,"",budgetMs);}
     public JSONObject override(JSONObject data)throws Exception{return route(c,data);}
    },env,source,requestId,replace);
   }
@@ -267,7 +273,7 @@ public class Core {
   if(path.equals("/api/status"))return status(c);
   if(!mesh&&path.equals("/api/overview"))return overview(c);
   if(mesh&&path.equals("/api/action"))return relayAction(c,data);
-  if(!mesh&&path.equals("/api/switch")){String replace=data==null?"":data.optString("replace");return switchHere(c,"android-app",data==null?null:data.optString("request_id",null),replace);}
+  if(!mesh&&path.equals("/api/switch")){String replace=data==null?"":data.optString("replace");String source=data!=null&&Switcher.SOURCES.contains(data.optString("source"))?data.optString("source"):"android-app";return switchHere(c,source,data==null?null:Switcher.cleanId(data.optString("request_id",null)),replace);}
   if(!mesh&&path.equals("/api/override"))return override(c,data);
   if(!mesh&&path.equals("/api/roles")){JSONObject conf=config(c),roles=data.getJSONObject("roles");Iterator<String> keys=roles.keys();while(keys.hasNext()){String key=keys.next();if(!Arrays.asList("pc","mac","phone").contains(key))throw new IOException("Unknown controller");address(roles.getString(key));}conf.put("roles",roles);save(c,conf);return new JSONObject().put("ok",true);}
   throw new IOException("Unknown request");

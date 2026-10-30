@@ -20,7 +20,7 @@ const anc={desired:null,queued:null,inFlight:false,lastStart:-1e9,timer:0,draggi
 let seq=0;const bridgeCalls=new Map();
 window.finishRequest=(id,json)=>{const p=bridgeCalls.get(id);if(p){bridgeCalls.delete(id);p.resolve(JSON.parse(json));}};
 function api(path,data){
- if(window.Android){return new Promise((resolve,reject)=>{const id=String(++seq);const timer=setTimeout(()=>{bridgeCalls.delete(id);reject(new Error('Controller timed out. Refresh before trying again.'));},120000);bridgeCalls.set(id,{resolve:r=>{clearTimeout(timer);if(r.error)reject(new Error(r.error));else resolve(r);}});Android.request(id,path,data?JSON.stringify(data):'');});}
+ if(window.Android){return new Promise((resolve,reject)=>{const id=String(++seq);const timer=setTimeout(()=>{bridgeCalls.delete(id);reject(new Error('Controller timed out. Refresh before trying again.'));},160000);bridgeCalls.set(id,{resolve:r=>{clearTimeout(timer);if(r.error)reject(new Error(r.error));else resolve(r);}});Android.request(id,path,data?JSON.stringify(data):'');});}
  return fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined}).then(async r=>{const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Request failed');return d;});
 }
 

@@ -390,7 +390,7 @@ class SwitchTests(unittest.TestCase):
   for item in self.patches:item.start()
  def tearDown(self):
   for item in self.patches:item.stop()
- def rig(self,start,script,audio=True,peer_reply=None):
+ def rig(self,start,script,audio=True,peer_reply=None,android=False):
   h=Headset(start,script,self.clock);roles=dict(ROLE)
   pc=Controller(dict(id='pc',name='PC',headset=PC,roles=roles,peers=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')]))
   phone=Controller(dict(id='phone',name='Phone',headset=PC,roles=roles,peers=[]))
@@ -403,13 +403,16 @@ class SwitchTests(unittest.TestCase):
   def act(ctl,reader,data):
    h.reader=reader
    with patch('controller.connection',connect):return ctl.local_action(data)
-  self.relayed=[]
-  def peer_call(peer,path,data=None):
+  self.relayed=[];self.timeouts=[]
+  def peer_call(peer,path,data=None,timeout=None):
    if path=='/api/status':return phone.local_status()
-   self.relayed.append(data)
+   self.relayed.append(data);self.timeouts.append(timeout)
    if peer_reply:return peer_reply
    try:return act(phone,PHONE,data)
-   except Exception as e:return {'ok':False,'error':str(e)}
+   except Exception as e:
+    # Android's Core.error() always adds reachable:false; its contract errors carry error_key.
+    if android:return {'ok':False,'reachable':False,'error_key':controller.error_key(e) if controller.error_key(e)!='busy' else 'unverified','error':'x','detail':str(e)}
+    return {'ok':False,'error':str(e)}
   pc.peer_call=peer_call;pc.prepare_connect=lambda data:{'ok':True}
   orig=pc.local_action
   def local(data,prelude=None,mode=None):
@@ -424,9 +427,9 @@ class SwitchTests(unittest.TestCase):
   for name in ('Desktop','Android'):self.assertNotIn(name,' '.join(lines))
   return result,switch[0],lines
  def abstract(self):return {'here':'pc','other1':'phone','other2':'mac'}
- def scenario(self,sc,audio):
+ def scenario(self,sc,audio,android=False):
   roles=self.abstract();start=[ROLE[roles[r]] for r in sc['start']]
-  pc,phone,h=self.rig(start,sc['headset'],audio)
+  pc,phone,h=self.rig(start,sc['headset'],audio,android=android)
   body={'source':'web','request_id':'r'+sc['name'].replace('_','')[:20]}
   if sc.get('replace'):body['replace']=ROLE[roles[sc['replace']]]
   try:result,line,lines=self.run_switch(pc,body)
@@ -462,11 +465,75 @@ class SwitchTests(unittest.TestCase):
  def test_contract_scenarios_without_sink_step(self):
   for sc in CONTRACT['scenarios']:
    with self.subTest(sc['name']):self.scenario(sc,False)
+ def test_contract_scenarios_relayed_through_android_phone(self):
+  for sc in CONTRACT['scenarios']:
+   with self.subTest(sc['name']):self.scenario(sc,True,android=True)
+ def test_android_unconfirmed_relay_error_is_resent_after_fresh_read(self):
+  pc,phone,h=self.rig([PHONE],['connect_unconfirmed','connect_ok'],android=True)
+  result,line,_=self.run_switch(pc,{'source':'web','request_id':'x1'});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertEqual(h.connects,2);self.assertIn('outcome=ok via=peer:phone',line)
+  self.assertTrue(all(t is not None and t<=90 for t in self.timeouts),self.timeouts)
+ def test_relayed_full_slots_refusal_becomes_busy_reply(self):
+  pc,phone,h=self.rig([PHONE],[])
+  def taken(peer,path,data=None,timeout=None):
+   if path=='/api/status':return phone.local_status()
+   h.devices[2]['connected']=True  # the Mac took the free slot meanwhile; the PC peer refuses with its raw text
+   return {'ok':False,'error':'Both slots are occupied. Choose which device to replace.'}
+  pc.peer_call=taken
+  result,line,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['busy']);self.assertEqual(sorted(s['label'] for s in result['slots']),['Mac','Phone']);self.assertIn('outcome=busy',line)
+ def test_no_resend_without_time_for_a_worst_case_connect(self):
+  pc,phone,h=self.rig([PHONE],['connect_unconfirmed','connect_ok'])
+  orig=pc.override
+  def slow(data,info=None,budget=None):
+   r=orig(data,info,budget);self.clock.now+=controller.SWITCH_DEADLINE-controller.RESEND_MIN;return r
+  pc.override=slow
+  result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual((result['error_key'],h.connects),('timeout',1))
+ def test_verified_connect_after_deadline_still_succeeds(self):
+  pc,phone,h=self.rig([PHONE],['connect_ok'])
+  orig=pc.override
+  def late(data,info=None,budget=None):
+   r=orig(data,info,budget);self.clock.now+=controller.SWITCH_DEADLINE+1;return r
+  pc.override=late
+  result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertEqual(pc.audio.current,'bluez_output.AA_AA_AA_AA_AA_AA.1')
+ def test_concurrent_switches_send_one_connect(self):
+  pc,phone,h=self.rig([PHONE],['connect_ok','connect_ok'])
+  orig=pc.override;entered=threading.Event();release=threading.Event()
+  def gated(data,info=None,budget=None):
+   entered.set();release.wait(5);return orig(data,info,budget)
+  pc.override=gated;results=[]
+  for item in self.patches:item.stop()  # real time: two request threads
+  try:
+   with patch('controller.time.sleep'):
+    first=threading.Thread(target=lambda:results.append(pc.switch_request({'source':'web'})));first.start();entered.wait(5)
+    second=threading.Thread(target=lambda:results.append(pc.switch_request({'source':'omarchy'})));second.start()
+    second.join(.3);self.assertTrue(second.is_alive(),'the second switch must wait for the first')
+    release.set();first.join(10);second.join(10)
+  finally:
+   for item in self.patches:item.start()
+  pc.status_pool.shutdown(wait=True)
+  self.assertEqual([r['ok'] for r in results],[True,True]);self.assertEqual(h.connects,1)
+ def test_relink_that_loses_the_link_is_unreachable(self):
+  h=Headset([PC],[],self.clock);a=FakeAudio(h,sink=False);a.in_use=lambda:True
+  def drop():h.devices[0]['connected']=False;return ''
+  a.drop=drop
+  with self.assertRaises(controller.SwitchError) as caught:controller.ensure_sink(a,self.clock.now+controller.SWITCH_DEADLINE)
+  self.assertEqual(caught.exception.key,'unreachable')
+ def test_relayed_action_cleans_ids_and_logs_one_switch_line(self):
+  pc,phone,h=self.rig([PC,PHONE],[])
+  h.reader=PC
+  with patch('controller.connection',return_value=fake_connect(h)),self.assertLogs('bose.timing',level='INFO') as logs:
+   r=pc.relay_action({'action':'disconnect','address':PHONE,'source':'android-app','request_id':'0f8e7d6c-1234-5678-9abc-def012345678'})
+  self.assertTrue(r['ok']);lines=[l for l in logs.output if 'bose.switch' in l];self.assertEqual(len(lines),1)
+  self.assertIn('source=android-app id=0f8e7d6c-1234-5678-9abc-def01234 ',lines[0]);self.assertIn('target=Phone replace=- outcome=ok via=local',lines[0])
+  pc.status_pool.shutdown(wait=True)
  def test_messages_sources_and_labels_match_contract(self):
   self.assertEqual(controller.MESSAGES,CONTRACT['messages']);self.assertEqual(list(controller.SOURCES),CONTRACT['sources'])
   self.assertEqual(controller.LABELS,CONTRACT['labels']);self.assertEqual(controller.SWITCH_DEADLINE,CONTRACT['rules']['deadline_seconds'])
  def test_outstanding_peer_reply_is_never_resent(self):
-  pc,phone,h=self.rig([PHONE],[],peer_reply={'reachable':False,'controller':'phone','error':'Controller unavailable: TimeoutError'})
+  pc,phone,h=self.rig([PHONE],[],peer_reply={'reachable':False,'transport':True,'controller':'phone','error':'Controller unavailable: TimeoutError'})
   result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
   self.assertEqual((result['error_key'],len(self.relayed)),('timeout',1));self.assertIn('outcome=error:timeout via=peer:phone',line)
  def test_stale_replace_is_ignored_when_a_slot_is_free(self):
@@ -500,13 +567,19 @@ class SwitchTests(unittest.TestCase):
   with self.assertLogs('bose.timing',level='INFO') as logs:
    with self.assertRaises(controller.ReplyError) as caught:pc.override_request({'action':'connect','address':MAC,'source':'web','request_id':'abc'})
   reply=caught.exception.reply;pc.status_pool.shutdown(wait=True)
-  self.assertEqual((reply['error_key'],reply['error']),('busy',controller.MESSAGES['busy']))
+  self.assertEqual({k:reply[k] for k in ('ok','busy','error_key','error')},dict(ok=False,busy=True,error_key='busy',error=controller.MESSAGES['busy']))
+  self.assertEqual(sorted(s['label'] for s in reply['slots']),['PC','Phone'])
   lines=[l for l in logs.output if 'bose.switch' in l];self.assertEqual(len(lines),1)
-  self.assertIn('source=web id=abc target=Mac replace=- outcome=error:busy via=local',lines[0]);self.assertIsNone(MAC_RE.search(' '.join(logs.output)))
+  self.assertIn('source=web id=abc target=Mac replace=- outcome=busy via=local',lines[0]);self.assertIsNone(MAC_RE.search(' '.join(logs.output)))
   pc,phone,h=self.rig([PC,PHONE],[])
   with self.assertLogs('bose.timing',level='INFO') as logs:
    r=pc.override_request({'action':'disconnect','address':PHONE})
   pc.status_pool.shutdown(wait=True)
   self.assertTrue(r['ok']);self.assertIn('bose.switch source=unknown id=- target=Phone replace=- outcome=ok via=local',' '.join(logs.output))
   with self.assertRaises(ValueError):pc.override_request({'action':'noise','level':3,'enabled':True,'source':'nowhere'})
+  pc,phone,h=self.rig([PC,PHONE],[]);pc.cache=state([device(PC,True,True)])
+  h.request=lambda *a,**k:b'\x40\x24\x01';h.set_noise=lambda level,enabled:dict(level=level,enabled=enabled)
+  with self.assertLogs('bose.timing',level='INFO') as logs:
+   pc.override_request({'action':'noise','level':3,'enabled':True,'source':'web'})
+  self.assertFalse(any('bose.switch' in l for l in logs.output),logs.output);pc.status_pool.shutdown(wait=True)
 if __name__=='__main__':unittest.main()

@@ -13,11 +13,14 @@ public class SwitcherTest {
  static{LABEL.put("phone","Phone");LABEL.put("mac","Mac");LABEL.put("pc","PC");}
  static class Fake implements Switcher.Mesh,Switcher.Env {
   final Set<String> connected=new LinkedHashSet<>();final Deque<String> script=new ArrayDeque<>();final List<String> logs=new ArrayList<>();final List<JSONObject> calls=new ArrayList<>();
-  long now=1_000_000;int connects=0,overviews=0;boolean reachable=true;
+  long now=1_000_000;int connects=0,overviews=0;boolean reachable=true,reused=false;long budget=-1;
   JSONObject devices()throws Exception{JSONArray ds=new JSONArray();for(Map.Entry<String,String> e:ADDR.entrySet())ds.put(new JSONObject().put("address",e.getValue()).put("name",e.getKey()+"-device").put("connected",connected.contains(e.getValue())).put("current",false));return new JSONObject().put("devices",ds);}
-  public JSONObject overview(boolean reuse)throws Exception{overviews++;JSONObject o=devices().put("reachable",reachable);JSONObject roles=new JSONObject();for(Map.Entry<String,String> e:ADDR.entrySet())if(!e.getKey().equals("phone"))roles.put(e.getKey(),e.getValue());return o.put("roles",roles);}
+  public JSONObject overview(boolean reuse,long budgetMs)throws Exception{overviews++;reused|=reuse;JSONObject o=devices().put("reachable",reachable);JSONObject roles=new JSONObject();for(Map.Entry<String,String> e:ADDR.entrySet())if(!e.getKey().equals("phone"))roles.put(e.getKey(),e.getValue());return o.put("roles",roles);}
   public JSONObject override(JSONObject data)throws Exception{
-   connects++;calls.add(data);String step=script.poll();if(step==null)throw new AssertionError("unscripted connect");
+   connects++;calls.add(data);budget=data.opt("budget_ms") instanceof Long?(Long)data.opt("budget_ms"):-1;String step=script.poll();if(step==null)throw new AssertionError("unscripted connect");
+   if(step.equals("transport"))return new JSONObject().put("ok",false).put("reachable",false).put("transport",true).put("error_key","timeout").put("error","x").put("detail","SocketTimeoutException");
+   if(step.equals("late_ok")){now+=200_000;step="connect_ok";}
+   if(step.equals("slow_unconfirmed")){now+=125_000;step="connect_unconfirmed";}
    if(step.startsWith("connect_ok")){if(step.endsWith("_via_pc"))data.put("via","peer:pc");connected.remove(data.optString("replace"));connected.add(data.getString("address"));return new JSONObject().put("ok",true).put("verified",true).put("state",devices());}
    if(step.equals("unreachable"))throw new IOException("RFCOMM refused");
    if(step.equals("hang"))now+=200_000;
@@ -73,13 +76,13 @@ public class SwitcherTest {
    JSONObject r=Switcher.switchHere(f,f,"android-app",null,null);
    check("no_controller_reads_headset_is_unreachable",r.optString("error_key").equals("unreachable")&&r.optString("error").equals(Switcher.MESSAGES.get("errors.unreachable"))&&f.logs.get(0).contains("id=- ")&&f.connects==0,r+" "+f.logs);}
   {Fake f=new Fake();
-   Switcher.Mesh broken=new Switcher.Mesh(){public JSONObject overview(boolean r)throws Exception{throw new IOException("Turn on Bluetooth on your phone");}public JSONObject override(JSONObject d){return null;}};
+   Switcher.Mesh broken=new Switcher.Mesh(){public JSONObject overview(boolean r,long b)throws Exception{throw new IOException("Turn on Bluetooth on your phone");}public JSONObject override(JSONObject d){return null;}};
    JSONObject r=Switcher.switchHere(broken,f,"android-app","t3",null);
    check("overview_failure_is_unreachable",r.optString("error_key").equals("unreachable")&&r.optString("detail").contains("Bluetooth"),r.toString());}
   {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.connected.add(ADDR.get("pc"));f.script.add("connect_ok");
    Map<String,String> roles=new HashMap<>();roles.put("phone",ADDR.get("phone"));roles.put("mac","AA:00:00:00:00:77");
    Switcher.Env env=new Switcher.Env(){public long millis(){return f.now;}public void log(String l){f.logs.add(l);}public Map<String,String> roles(){return roles;}};
-   Switcher.Mesh mesh=new Switcher.Mesh(){public JSONObject overview(boolean r)throws Exception{JSONObject o=f.devices().put("reachable",true);return o;}public JSONObject override(JSONObject d)throws Exception{return f.override(d);}};
+   Switcher.Mesh mesh=new Switcher.Mesh(){public JSONObject overview(boolean r,long b)throws Exception{JSONObject o=f.devices().put("reachable",true);return o;}public JSONObject override(JSONObject d)throws Exception{return f.override(d);}};
    JSONObject r=Switcher.switchHere(mesh,env,"android-app","t4",ADDR.get("pc"));
    check("replace_must_leave_a_known_device",r.optString("error_key").equals("keep_one")&&f.connects==0,r.toString());}
   {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.connected.add(ADDR.get("pc"));
@@ -94,6 +97,21 @@ public class SwitcherTest {
   {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.script.add("connect_ok_via_pc");
    JSONObject r=Switcher.switchHere(f,f,"android-app","t8",null);
    check("executed_via_peer_logs_peer",r.optBoolean("ok")&&f.logs.get(0).contains("via=peer:pc "),r+" "+f.logs);}
+  {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.script.add("transport");f.script.add("connect_ok");
+   JSONObject r=Switcher.switchHere(f,f,"android-app","t9",null);
+   check("transport_failure_is_never_resent",r.optString("error_key").equals("timeout")&&f.connects==1,r+" "+f.connects);}
+  {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.script.add("late_ok");
+   JSONObject r=Switcher.switchHere(f,f,"android-app","t10",null);
+   check("verified_connect_after_deadline_is_ok",r.optBoolean("ok"),r.toString());}
+  {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.script.add("slow_unconfirmed");f.script.add("connect_ok");
+   JSONObject r=Switcher.switchHere(f,f,"android-app","t11",null);
+   check("no_resend_without_time_left",r.optString("error_key").equals("timeout")&&f.connects==1,r+" "+f.connects);}
+  {Fake f=new Fake();f.connected.add(ADDR.get("phone"));f.connected.add(ADDR.get("mac"));
+   JSONObject r=Switcher.switchHere(f,f,"android-app","t12",null);
+   check("already_here_comes_from_a_fresh_read",r.optBoolean("ok")&&!f.reused&&f.overviews==1&&f.connects==0,r+" reused="+f.reused);}
+  {Fake f=new Fake();f.connected.add(ADDR.get("mac"));f.script.add("connect_ok");
+   JSONObject r=Switcher.switchHere(f,f,"android-app","0f8e7d6c-1234-5678-9abc-def012345678",null);
+   check("request_id_cleaned_and_budget_passed",r.optBoolean("ok")&&f.calls.get(0).optString("request_id").equals("0f8e7d6c-1234-5678-9abc-def01234")&&f.budget>0&&f.budget<=90000,f.calls+" "+f.budget);}
   System.out.println(count+" checks, "+failures+" failures");
   System.exit(failures==0?0:1);
  }

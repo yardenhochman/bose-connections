@@ -150,22 +150,32 @@ reply shapes and scenarios every front end is tested against.
    A `replace` counts only while both slots are still busy and that device still holds one.
 3. Otherwise connect through the same path as `/api/override` (local or one peer).
    If the connect is not confirmed, one fresh read decides: connected → success; target
-   absent and a slot free → resend once; otherwise `unverified`. Nothing is resent while
-   a peer's reply may still be outstanding (relay timeout).
+   absent and a slot free → resend once, and only with at least 30 s of the deadline left;
+   full slots → a busy reply; otherwise `unverified`. Nothing is resent while a peer's reply
+   may still be outstanding: a relay that got no answer (`transport: true`, including one cut
+   off at the time left) stops the switch. A verified connect counts even after the deadline.
+   One switch or connection change runs at a time per controller; a second tap waits, then
+   reads afresh (already here: no second connect).
 4. On a Linux PC with `pactl`: when no controller reaches the headset, or BlueZ has no
    link after the slot is confirmed, the PC pages it (`Device1.Connect` every 3 s, up
    to 45 s). It then waits for the headset's A2DP sink, recovering step by step
    (select A2DP, reconnect this PC's link, restart WirePlumber only while playback is
    stopped), and makes it the default sink with a read-back. macOS routes audio itself.
-5. One 150 s deadline (`timeout`). Success:
+5. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
+   and the web and Omarchy clients wait 160 s. Success:
    `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
    `{ok:false, error_key, error:<contract text>, detail:<raw reason>}` with keys
    `unreachable`, `timeout`, `unverified`, `keep_one`, `no_audio`, `audio_not_moved`.
 
 `POST /api/override` also accepts optional `source` and `request_id` (absent = `unknown`),
 and its connect/disconnect failures now carry `error_key` and the contract `error` text
-(raw reason in `detail`). Both endpoints log exactly one line per request on the controller
-that received it, with role labels only:
+(raw reason in `detail`); full slots give the busy reply with `slots`. Request ids are cut to
+`[A-Za-z0-9_-]{1,32}` before relaying.
+
+**Log rule.** Every controller that receives a `/api/switch`, a connect/disconnect
+`/api/override`, or a relayed connect/disconnect `/api/action` logs exactly one `bose.switch`
+line for it, with role labels only. The executing peer's line carries the origin's `id` and
+`via=local`; noise changes log none. Python and Android follow the same rule:
 
 ```
 bose.switch source=web id=k3f9a2 target=PC replace=- outcome=ok via=peer:phone total=1.84s
@@ -173,7 +183,8 @@ bose.switch source=web id=k3f9a2 target=PC replace=- outcome=ok via=peer:phone t
 
 `outcome` is `ok`, `busy` or `error:<key>` (`error:invalid` for a refused body); `via` is
 `local` or `peer:<id>`. The relayed `/api/action` carries `source` and `request_id`, so the
-peer's `bose.timing` line shows the same `id=`. Older peers ignore the extra fields.
+peer's `bose.switch` and `bose.timing` lines show the same `id=`. Older peers ignore the extra
+fields; a peer drops an invalid `source` or `request_id` on `/api/action` instead of refusing it.
 
 Dashboard: loopback port **8847**, with Host/Origin checks. Mesh: configured
 Tailscale IPv4 port **8848**, tailnet source checks and shared bearer token.
@@ -259,9 +270,9 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 54 tests use simulated transports and have no hardware side effects. Nine run
+The 73 tests use simulated transports and have no hardware side effects. Seventeen run
 `/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
-Linux sink step, a fake clock for the deadline and a fake `Audio`. They check texts, connect
+Linux sink step and relayed through an Android-shaped phone, with a fake clock and a fake `Audio`. They check texts, connect
 counts, the final slots, the default sink and the single `bose.switch` log line.
 `tests/test_omarchy_contract.py` runs `tests/bose_model.qml` offscreen
 (`QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 qml6 tests/bose_model.qml`). It drives

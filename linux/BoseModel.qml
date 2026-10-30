@@ -11,7 +11,7 @@ QtObject {
   // Optional function(method, path, body, done(error, json)) replacing XHR
   // (used by the offscreen harness with fixtures).
   property var transport: null
-  property int requestTimeoutMs: 120000
+  property int requestTimeoutMs: 160000  // outlasts the 150 s switch deadline
 
   property var snapshot: ({reachable: false, cached: true, devices: [], roles: {}, controllers: []})
   property bool loaded: false
@@ -135,7 +135,7 @@ QtObject {
         if (now < r.deadline) { keep.push(r); continue }
         r.dead = true
         try { r.xhr.abort() } catch (e) {}
-        r.done({timeout: true, message: "No answer from the Bose helper after 2 minutes."}, null)
+        r.done({timeout: true, message: "No answer from the Bose helper."}, null)
       }
       m.inflight = keep
     }

@@ -6,6 +6,7 @@ import java.util.*;
 /** Tap-to-switch rules of tests/switch-contract.json for "here" = this phone. No Android types, so a JVM test can drive it with a fake mesh. */
 public class Switcher {
  static final long DEADLINE_MS=150000;
+ static final long RESEND_MIN_MS=30000; // start a resend only with this much of the deadline left (worst-case connect)
  static final List<String> SOURCES=Arrays.asList("android-app","android-tile","omarchy","web","mac-menu","mac-popover","desk","couch");
  static final Map<String,String> MESSAGES=new LinkedHashMap<>();
  static{
@@ -18,7 +19,7 @@ public class Switcher {
  static final Map<String,String> LABELS=new HashMap<>();
  static{LABELS.put("phone","Phone");LABELS.put("mac","Mac");LABELS.put("pc","PC");}
  /** The mesh as Core.override sees it: a phone+peers overview (optionally a recent one) and the peer-aware connect/replace machinery. override sets data.via to "local" or "peer:<id>". */
- interface Mesh {JSONObject overview(boolean reuse)throws Exception;JSONObject override(JSONObject data)throws Exception;}
+ interface Mesh {JSONObject overview(boolean reuse,long budgetMs)throws Exception;JSONObject override(JSONObject data)throws Exception;}
  interface Env {long millis();void log(String line);Map<String,String> roles()throws Exception;}
  /** A failure with a contract error_key; the message is the contract text and detail the raw reason. */
  static class Fail extends IOException {
@@ -28,6 +29,8 @@ public class Switcher {
  static String text(String key){return key.equals("busy")?MESSAGES.get("busy"):MESSAGES.get("errors."+key);}
  static JSONObject failure(String key,String detail){JSONObject o=new JSONObject();try{o.put("ok",false).put("error_key",key).put("error",text(key)).put("detail",detail==null?"":detail);}catch(JSONException ignored){}return o;}
  static String label(Map<String,String> roles,String address){for(Map.Entry<String,String> e:roles.entrySet())if(address.equalsIgnoreCase(e.getValue()))return LABELS.containsKey(e.getKey())?LABELS.get(e.getKey()):"-";return "-";}
+ /** A request id cut down to the allowed pattern (peers refuse longer ones), or null. */
+ static String cleanId(String s){if(s==null)return null;String c=s.replaceAll("[^A-Za-z0-9_-]","");if(c.length()>32)c=c.substring(0,32);return c.isEmpty()?null:c;}
  static String clean(String s,String fallback){return s!=null&&s.matches("[A-Za-z0-9_-]{1,32}")?s:fallback;}
  static String logLine(String source,String id,String target,String replace,String outcome,String via,long ms){
   return String.format(Locale.ROOT,"bose.switch source=%s id=%s target=%s replace=%s outcome=%s via=%s total=%.2fs",SOURCES.contains(source)?source:"-",clean(id,"-"),target,replace,outcome,via,ms/1000.0);
@@ -39,20 +42,22 @@ public class Switcher {
  static boolean known(String key){return key.equals("busy")||MESSAGES.containsKey("errors."+key);}
  /** Moves the headset to this phone through the mesh. Never throws: every outcome is a contract reply, logged once. */
  static JSONObject switchHere(Mesh mesh,Env env,String source,String requestId,String replace){
-  long t0=env.millis(),deadline=t0+DEADLINE_MS;JSONObject reply=null;String outcome="ok",replaceLabel="-",via="local";
+  long t0=env.millis(),deadline=t0+DEADLINE_MS;JSONObject reply=null;String outcome="ok",replaceLabel="-",via="local";requestId=cleanId(requestId);
   try{
    Map<String,String> configured=new HashMap<>();for(Map.Entry<String,String> e:env.roles().entrySet())configured.put(e.getKey(),e.getValue().toUpperCase(Locale.ROOT));
    for(int attempt=0;reply==null;attempt++){
-    JSONObject ov=mesh.overview(attempt==0);if(!ov.optBoolean("reachable"))throw new Fail("unreachable","No controller could read the headset");
+    // Always a fresh read: "already here" must not come from a reused overview.
+    JSONObject ov=mesh.overview(false,Math.max(1000,deadline-env.millis()));if(!ov.optBoolean("reachable"))throw new Fail("unreachable","No controller could read the headset");
     JSONArray ds=ov.getJSONArray("devices");Map<String,String> roles=new HashMap<>(configured);JSONObject seen=ov.optJSONObject("roles");
     if(seen!=null)for(Iterator<String> it=seen.keys();it.hasNext();){String k=it.next();if(!roles.containsKey(k))roles.put(k,seen.getString(k).toUpperCase(Locale.ROOT));}
     String here=roles.get("phone");if(here==null)throw new Fail("unreachable","This phone's headset address is not known");
     Set<String> conn=connected(ov);
     if(conn.contains(here)){reply=ok(ov);break;}
     if(attempt>=2)throw new Fail("unverified","Headset did not report this phone connected");
-    JSONObject data=new JSONObject().put("action","connect").put("address",here).put("source",source);if(requestId!=null)data.put("request_id",requestId);
+    if(attempt>0&&deadline-env.millis()<RESEND_MIN_MS)throw new Fail("timeout","Too little time left to resend");
+    JSONObject data=new JSONObject().put("action","connect").put("address",here).put("source",source);if(requestId!=null)data.put("request_id",requestId);data.put("budget_ms",Math.min(90000,Math.max(1000,deadline-env.millis())));
     if(conn.size()>=2){
-     if(attempt>0)throw new Fail("unverified","Both slots filled while retrying");
+     if(attempt>0)replace=null; // both slots filled meanwhile: offer Replace per slot, never guess
      String drop=replace==null?"":replace.toUpperCase(Locale.ROOT);
      if(!conn.contains(drop)){
       JSONArray slots=new JSONArray();for(String a:conn){String name=label(roles,a);if(name.equals("-")){name="Other";for(int i=0;i<ds.length();i++)if(ds.getJSONObject(i).getString("address").equalsIgnoreCase(a))name=ds.getJSONObject(i).optString("name",name);}slots.put(new JSONObject().put("address",a).put("label",name));}
@@ -65,9 +70,11 @@ public class Switcher {
     JSONObject r=null;
     try{r=mesh.override(data);}catch(Fail f){if(!f.key.equals("unverified")&&!f.key.equals("busy"))throw f;}
     via=data.optString("via","local");
-    if(env.millis()>deadline)throw new Fail("timeout","No answer within "+DEADLINE_MS/1000+" s");
+    // A verified connect counts even when it lands after the deadline.
     if(r!=null&&r.optBoolean("ok")&&r.optBoolean("verified")){JSONObject state=r.optJSONObject("state");if(state!=null&&state.optJSONArray("devices")!=null&&connected(state).contains(here)){reply=ok(state);break;}}
-    else if(r!=null){String key=r.optString("error_key","");if(known(key)&&!key.equals("unverified")&&!key.equals("busy"))throw new Fail(key,r.optString("detail",r.optString("error")));}
+    if(env.millis()>deadline)throw new Fail("timeout","No answer within "+DEADLINE_MS/1000+" s");
+    if(r!=null&&!(r.optBoolean("ok")&&r.optBoolean("verified"))){
+     if(r.optBoolean("transport"))throw new Fail(r.optString("error_key","timeout").equals("timeout")?"timeout":"unreachable",r.optString("detail",r.optString("error")));String key=r.optString("error_key","");if(known(key)&&!key.equals("unverified")&&!key.equals("busy"))throw new Fail(key,r.optString("detail",r.optString("error")));}
    }
   }catch(Fail f){outcome="error:"+f.key;reply=failure(f.key,f.detail);}
   catch(Exception e){outcome="error:unreachable";reply=failure("unreachable",e.getMessage()==null?e.getClass().getSimpleName():e.getMessage());}

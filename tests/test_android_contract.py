@@ -43,7 +43,7 @@ class AndroidContract(unittest.TestCase):
    with self.subTest(s['name']):self.assertTrue(self.results.get(s['name']),self.output)
  def test_extra_cases_and_exit_status(self):
   self.assertEqual(self.returncode,0,self.output)
-  for n in ('replace_ignored_when_slot_free','replace_not_held_offers_busy_again','no_controller_reads_headset_is_unreachable','overview_failure_is_unreachable','replace_must_leave_a_known_device','phone_holds_no_slot_both_busy_is_busy','replace_is_passed_to_override','first_unverified_second_succeeds_after_fresh_overview','executed_via_peer_logs_peer'):
+  for n in ('replace_ignored_when_slot_free','replace_not_held_offers_busy_again','no_controller_reads_headset_is_unreachable','overview_failure_is_unreachable','replace_must_leave_a_known_device','phone_holds_no_slot_both_busy_is_busy','replace_is_passed_to_override','first_unverified_second_succeeds_after_fresh_overview','executed_via_peer_logs_peer','transport_failure_is_never_resent','verified_connect_after_deadline_is_ok','no_resend_without_time_left','already_here_comes_from_a_fresh_read','request_id_cleaned_and_budget_passed'):
    with self.subTest(n):self.assertTrue(self.results.get(n),self.output)
  def test_android_strings_use_contract_texts_only(self):
   core=(ROOT/'android/Core.java').read_text()
