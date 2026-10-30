@@ -108,7 +108,9 @@ python3 install_mac.py --config ~/.local/state/bose-control/config.json
 
 This installs `~/Applications/Bose Connections.app` and a per-user LaunchAgent
 `local.bose.connections`. The background helper adds a headphones icon to the menu
-bar; click it for the compact popover (right-click for the native menu), which opens the full dashboard. Allow Bluetooth when macOS asks.
+bar; click it for the compact popover (right-click for the native menu, whose first item
+**Use on this Mac** moves the headphones here and offers **Replace <device>** when both
+slots are busy), which opens the full dashboard. Allow Bluetooth when macOS asks.
 IOBluetooth calls run on the Python main thread under the native app for proper
 privacy attribution. Running the backend directly through SSH is not equivalent.
 
@@ -190,11 +192,20 @@ screen-off behavior and direct Bluetooth control remain experimental.
 
 ### Android Quick Settings
 
-Add **Bose** using the Quick Settings panel's edit button after installation. Tap
-the tile for a compact device list, connect/disconnect and explicit slot replacement,
-plus ANC level and Off controls. It uses the same private config and cached state
-as the app; cached entries display immediately, and mutations require live state.
-A locked phone must be unlocked before controls open. Long-press opens app settings.
+Add **Bose** using the Quick Settings panel's edit button after installation. One
+tap moves the headphones to this phone: the subtitle shows "Connecting…" at once, then
+"Playing on Bose 700" or the reason (with " · tap to retry"). If both slots are busy the
+tile says so and opens the compact panel with the replacement choice already asked
+(a tile cannot show two buttons). The panel also has connect/disconnect, ANC level and
+Off controls, sharing the app's private config and cached state. A locked phone must be
+unlocked first. Long-press opens the app.
+
+The app and tile share `Core.switchHere` (rules and texts in `tests/switch-contract.json`,
+logic in `android/Switcher.java`): already connected is a success with no command; a
+connect that is not confirmed is resent once after a fresh read; 150 s is the deadline;
+one `bose.switch …` line per request goes to logcat tag `BoseSwitch` (roles only, no
+addresses). The in-app web page reaches it as `/api/switch` through the same
+`Android.request` bridge as every other call, with the controller's reply shape.
 
 ## Development
 
@@ -206,6 +217,11 @@ The 44 protocol/controller tests use simulated transports and have no hardware
 side effects. They cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
+
+`tests/test_android_contract.py` compiles `android/Switcher.java` with a test-only
+`org.json` stand-in and runs every scenario of `tests/switch-contract.json` against a
+fake headset (skipped without a JDK); `tests/test_mac_contract.py` statically checks that
+`mac/Launcher.m` posts `/api/switch` with the contract body and texts.
 
 For GUI checks, start the local helper, install Node dependencies (`npm install`)
 and Chromium, then run `npm run test:gui`. Set `CHROMIUM_PATH` or `BOSE_URL` if

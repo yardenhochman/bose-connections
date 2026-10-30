@@ -2,6 +2,9 @@
 #import <WebKit/WebKit.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@"http://127.0.0.1:8847/?view=popover";
+// Texts of tests/switch-contract.json (checked verbatim by tests/test_mac_contract.py).
+static NSString *const BosePending=@"Connecting…",*const BoseReplacing=@"Replacing {label}…",*const BoseOk=@"Playing on Bose 700",*const BoseBusy=@"Both slots busy · choose one to replace",*const BoseReplace=@"Replace {label}",*const BoseRetryHint=@" · tap to retry";
+static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*const BoseErrTimeout=@"Took too long to switch",*const BoseErrUnverified=@"The headphones didn’t confirm the switch",*const BoseErrKeepOne=@"Can’t replace that one: keep a phone, PC or Mac connected",*const BoseErrNoAudio=@"Connected, but no sound from the headphones",*const BoseErrAudioNotMoved=@"Headphones connected, but PC audio didn’t switch";
 @interface WeakScript : NSObject <WKScriptMessageHandler>
 @property (weak) id<WKScriptMessageHandler> target;
 @end
@@ -21,6 +24,8 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
 @property BOOL refreshing;
 @property BOOL changing;
 @property NSDictionary *pending;
+@property NSString *switchText;
+@property NSArray *busySlots;
 @property NSPopover *popover;
 @property WKWebView *popWeb;
 @property NSDate *popoverClosed;
@@ -85,7 +90,7 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
 }
 - (NSString *)titleFor:(NSDictionary *)device plain:(NSString *)plain {
  NSString *address=device[@"address"];
- if([self.pending[@"address"] isEqual:address])return [self.pending[@"action"] isEqual:@"disconnect"]?@"Disconnecting…":@"Connecting…";
+ if([self.pending[@"address"] isEqual:address])return [self.pending[@"action"] isEqual:@"disconnect"]?@"Disconnecting…":BosePending;
  if(self.pending[@"replace"]&&[self.pending[@"replace"] isEqual:address])return @"Disconnecting…";
  return plain;
 }
@@ -95,6 +100,11 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
  [self.deviceMenu addItem:[self item:[self headerTitle] selector:NULL data:nil]];
  [self.deviceMenu addItem:[self item:[self stateLine] selector:NULL data:nil]];
  BOOL can=[self canChange];
+ [self.deviceMenu addItem:[NSMenuItem separatorItem]];
+ NSMenuItem *use=[self item:self.switchText?:@"Use on this Mac" selector:@selector(useHereClicked:) data:nil];use.enabled=!self.changing;[self.deviceMenu addItem:use];
+ for(NSDictionary *slot in self.busySlots){
+  NSMenuItem *row=[self item:[BoseReplace stringByReplacingOccurrencesOfString:@"{label}" withString:slot[@"label"]?:@"device"] selector:@selector(replaceClicked:) data:slot[@"address"]];row.enabled=!self.changing;[self.deviceMenu addItem:row];
+ }
  NSString *hereRole=self.snapshot[@"here"];NSDictionary *roleMap=self.snapshot[@"roles"];NSString *hereAddress=([hereRole isKindOfClass:[NSString class]]&&[roleMap isKindOfClass:[NSDictionary class]])?roleMap[hereRole]:nil;
  NSArray *devices=self.snapshot[@"devices"]?:@[];
  NSMutableArray *connected=[NSMutableArray new],*saved=[NSMutableArray new];
@@ -114,7 +124,7 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
    NSMenuItem *row=[self item:[self titleFor:d plain:[self label:d]] selector:@selector(deviceClicked:) data:action];row.enabled=can;
    if(connected.count>=2){
     row.action=NULL;NSMenu *replace=[NSMenu new];replace.autoenablesItems=NO;
-    for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];NSMenuItem *r=[self item:[@"Replace " stringByAppendingString:[self label:old]] selector:@selector(deviceClicked:) data:a];r.enabled=can;[replace addItem:r];}
+    for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];NSMenuItem *r=[self item:[BoseReplace stringByReplacingOccurrencesOfString:@"{label}" withString:[self label:old]] selector:@selector(deviceClicked:) data:a];r.enabled=can;[replace addItem:r];}
     row.submenu=replace;
    }
    [self.deviceMenu addItem:row];
@@ -141,7 +151,7 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];quit.target=NSApp;[self.deviceMenu addItem:quit];
 }
 - (void)request:(NSString *)path data:(NSDictionary *)data completion:(void (^)(NSDictionary *,NSString *))completion {
- NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[@"http://127.0.0.1:8847" stringByAppendingString:path]]];r.timeoutInterval=data?120:40;
+ NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[@"http://127.0.0.1:8847" stringByAppendingString:path]]];r.timeoutInterval=data?160:40;
  if(data){r.HTTPMethod=@"POST";[r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];r.HTTPBody=[NSJSONSerialization dataWithJSONObject:data options:0 error:nil];}
  [[[NSURLSession sharedSession] dataTaskWithRequest:r completionHandler:^(NSData *raw,NSURLResponse *response,NSError *error){
   id parsed=raw?[NSJSONSerialization JSONObjectWithData:raw options:0 error:nil]:nil;NSDictionary *json=[parsed isKindOfClass:[NSDictionary class]]?parsed:nil;
@@ -160,7 +170,7 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
   if(error||!json){
    if(self.snapshot){NSMutableDictionary *old=[self.snapshot mutableCopy];old[@"cached"]=@YES;self.snapshot=old;}
    self.menuMessage=self.snapshot?nil:error;
-  }else{self.snapshot=json;self.menuMessage=nil;}
+  }else{self.snapshot=json;self.menuMessage=nil;NSUInteger n=0;for(NSDictionary *d in json[@"devices"]?:@[])if([d[@"connected"] boolValue])n++;if(n<2)self.busySlots=nil;}
   [self rebuildMenu];
  }];
 }
@@ -208,6 +218,31 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
 }
 - (void)refreshClicked:(id)sender {[self refreshMenu];}
 - (void)openDashboard:(id)sender {[self.popover performClose:nil];[self showWindow];}
+- (NSString *)failureText:(NSDictionary *)json error:(NSString *)error {
+ NSDictionary *texts=@{@"unreachable":BoseErrUnreachable,@"timeout":BoseErrTimeout,@"unverified":BoseErrUnverified,@"keep_one":BoseErrKeepOne,@"no_audio":BoseErrNoAudio,@"audio_not_moved":BoseErrAudioNotMoved};
+ NSString *key=json[@"error_key"];NSString *text=[key isKindOfClass:[NSString class]]?texts[key]:nil;
+ if(!text&&[json[@"error_key"] isEqual:@"busy"])text=BoseBusy;
+ if(!text)text=[error containsString:@"timed out"]?BoseErrTimeout:BoseErrUnreachable;
+ return [text stringByAppendingString:BoseRetryHint];
+}
+- (void)switchHere:(NSString *)replace {
+ if(self.changing)return;
+ NSString *label=nil;for(NSDictionary *slot in self.busySlots)if(replace&&[slot[@"address"] isEqual:replace])label=slot[@"label"];
+ NSMutableDictionary *body=[@{@"source":@"mac-menu",@"request_id":[[[NSUUID UUID].UUIDString substringToIndex:8] lowercaseString]} mutableCopy];if(replace)body[@"replace"]=replace;
+ self.changing=YES;self.menuMessage=nil;self.busySlots=nil;self.switchText=label?[BoseReplacing stringByReplacingOccurrencesOfString:@"{label}" withString:label]:BosePending;[self rebuildMenu];
+ [self request:@"/api/switch" data:body completion:^(NSDictionary *json,NSString *error){
+  self.changing=NO;self.switchText=nil;
+  NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
+  if(state)self.snapshot=state;
+  if([json[@"ok"] boolValue]&&[json[@"verified"] boolValue])self.menuMessage=BoseOk;
+  else if([json[@"busy"] boolValue]){self.menuMessage=BoseBusy;self.busySlots=[json[@"slots"] isKindOfClass:[NSArray class]]?json[@"slots"]:nil;}
+  else self.menuMessage=[self failureText:json error:error];
+  [self rebuildMenu];
+  if(!state&&![json[@"busy"] boolValue])[self refreshMenu];
+ }];
+}
+- (void)useHereClicked:(NSMenuItem *)sender {[self switchHere:nil];}
+- (void)replaceClicked:(NSMenuItem *)sender {[self switchHere:sender.representedObject];}
 - (void)deviceClicked:(NSMenuItem *)sender {
  if(self.changing)return;NSDictionary *data=[sender.representedObject copy];self.changing=YES;self.pending=data;self.menuMessage=nil;[self rebuildMenu];
  [self request:@"/api/override" data:data completion:^(NSDictionary *json,NSString *error){
@@ -215,9 +250,7 @@ static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@
   NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
   if(state&&[data[@"action"] isEqual:@"noise"]&&self.snapshot&&![state[@"devices"] count]){NSMutableDictionary *merged=[self.snapshot mutableCopy];if(state[@"noise"])merged[@"noise"]=state[@"noise"];if(state[@"battery"]&&state[@"battery"]!=[NSNull null])merged[@"battery"]=state[@"battery"];self.snapshot=merged;}
   else if(state)self.snapshot=state;
-  if(error)self.menuMessage=error;
-  else if(![json[@"ok"] boolValue])self.menuMessage=json[@"message"]?:@"Change failed";
-  else if(![json[@"verified"] boolValue])self.menuMessage=json[@"message"]?:@"Change not verified";
+  if(error||![json[@"ok"] boolValue]||![json[@"verified"] boolValue])self.menuMessage=[self failureText:json error:error];
   else self.menuMessage=nil;
   [self rebuildMenu];
   if(!state&&!error)[self refreshMenu];
