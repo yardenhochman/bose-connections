@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from protocol import Client,ProtocolError,ActionUnconfirmed,parse_list,parse_info,mac_bytes,parse_noise
+import controller
 from controller import Controller
 
 PC='AA:AA:AA:AA:AA:AA';PHONE='BB:BB:BB:BB:BB:BB';TV='CC:CC:CC:CC:CC:CC';MAC='DD:DD:DD:DD:DD:DD'
@@ -336,4 +337,176 @@ class SpeedTests(unittest.TestCase):
   with patch.object(c,'overview',return_value=view),patch.object(c,'peer_call',return_value=dict(ok=True,verified=True,state=peer_state)):
    s=c.override(dict(action='disconnect',address=PC))['state']
   self.assertEqual(s['here'],'pc');self.assertEqual(len(s['controllers']),2);self.assertEqual(s['battery'],50)
+
+# ---- Tap to switch: every scenario of tests/switch-contract.json, on the Linux PC (fake sink) and without a sink step (macOS) ----
+CONTRACT=json.loads((Path(__file__).with_name('switch-contract.json')).read_text())
+ROLE={'pc':PC,'phone':PHONE,'mac':MAC}
+def text(key):
+ value=CONTRACT
+ for part in key.split('.'):value=value[part]
+ return value
+class Headset:
+ "Fake NC700 shared by every controller; `script` answers each connect command in turn (contract 'headset' scripts)."
+ def __init__(self,start,script,clock):
+  self.devices=[device(a,a in start) for a in (PC,PHONE,MAC,TV)];self.script=list(script);self.clock=clock;self.reader=None;self.connects=0;self.calls=[]
+ def down(self):return bool(self.script) and self.script[0]=='unreachable'
+ def held(self):return [d['address'] for d in self.devices if d['connected']]
+ def read(self,reader):return [dict(d,current=d['address']==reader) for d in self.devices]
+ def status(self,**kwargs):return state(self.read(self.reader))
+ def action(self,action,a):
+  self.calls.append((action,a))
+  if action=='disconnect':
+   for d in self.devices:
+    if d['address']==a:d['connected']=False
+   return
+  self.connects+=1;step=self.script.pop(0) if self.script else 'connect_unconfirmed'
+  if step=='hang':self.clock.now+=controller.SWITCH_DEADLINE+1;raise ActionUnconfirmed('no answer')
+  if step=='connect_unconfirmed':raise ActionUnconfirmed('no ack')
+  for d in self.devices:
+   if d['address']==a:d['connected']=True
+ def status_of(self,ident):
+  # A controller reads the headset only while its own device holds a slot.
+  if self.down():return dict(controller=ident,reachable=False,error='Headset unreachable',devices=[])
+  if ROLE[ident] not in self.held():return dict(controller=ident,reachable=False,link=False,error='not linked',devices=[])
+  return dict(controller=ident,reachable=True,observed=self.clock.now,devices=self.read(ROLE[ident]),battery=80)
+class FakeAudio:
+ "This PC's BlueZ link and PipeWire sink, derived from the fake headset."
+ def __init__(self,headset,sticky=True,sink=True):self.h=headset;self.current='alsa_output.speakers';self.sticky=sticky;self.has_sink=sink;self.pages=0;self.defaults=[]
+ def linked(self):return not self.h.down() and PC in self.h.held()
+ def page(self):self.pages+=1;return 'org.bluez.Error.Failed: busy'
+ def sink(self):return 'bluez_output.AA_AA_AA_AA_AA_AA.1' if self.linked() and self.has_sink else None
+ def default(self):return self.current
+ def set_default(self,sink):
+  self.defaults.append(sink)
+  if self.sticky:self.current=sink
+ def connect_a2dp(self):return ''
+ def drop(self):return ''
+ def in_use(self):return True
+ def restart_audio(self):pass
+class SwitchTests(unittest.TestCase):
+ def setUp(self):
+  self.clock=Clock()
+  self.patches=[patch('controller.time.sleep',self.clock.sleep),patch('controller.time.monotonic',self.clock.monotonic)]
+  for item in self.patches:item.start()
+ def tearDown(self):
+  for item in self.patches:item.stop()
+ def rig(self,start,script,audio=True,peer_reply=None):
+  h=Headset(start,script,self.clock);roles=dict(ROLE)
+  pc=Controller(dict(id='pc',name='PC',headset=PC,roles=roles,peers=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')]))
+  phone=Controller(dict(id='phone',name='Phone',headset=PC,roles=roles,peers=[]))
+  pc.audio=FakeAudio(h) if audio else False
+  pc.local_status=lambda:h.status_of('pc');phone.local_status=lambda:h.status_of('phone')
+  @contextmanager
+  def connect(*a):
+   if h.down():raise OSError('no route')
+   yield h
+  def act(ctl,reader,data):
+   h.reader=reader
+   with patch('controller.connection',connect):return ctl.local_action(data)
+  self.relayed=[]
+  def peer_call(peer,path,data=None):
+   if path=='/api/status':return phone.local_status()
+   self.relayed.append(data)
+   if peer_reply:return peer_reply
+   try:return act(phone,PHONE,data)
+   except Exception as e:return {'ok':False,'error':str(e)}
+  pc.peer_call=peer_call;pc.prepare_connect=lambda data:{'ok':True}
+  orig=pc.local_action
+  def local(data,prelude=None,mode=None):
+   h.reader=PC
+   with patch('controller.connection',connect):return orig(data,prelude,mode)
+  pc.local_action=local
+  return pc,phone,h
+ def run_switch(self,pc,body):
+  with self.assertLogs('bose.timing',level='INFO') as logs:result=pc.switch_request(body)
+  lines=[l.split(':',2)[2] for l in logs.output];switch=[l for l in lines if l.startswith('bose.switch ')]
+  self.assertEqual(len(switch),1,lines);self.assertIsNone(MAC_RE.search(' '.join(lines)),lines)
+  for name in ('Desktop','Android'):self.assertNotIn(name,' '.join(lines))
+  return result,switch[0],lines
+ def abstract(self):return {'here':'pc','other1':'phone','other2':'mac'}
+ def scenario(self,sc,audio):
+  roles=self.abstract();start=[ROLE[roles[r]] for r in sc['start']]
+  pc,phone,h=self.rig(start,sc['headset'],audio)
+  body={'source':'web','request_id':'r'+sc['name'].replace('_','')[:20]}
+  if sc.get('replace'):body['replace']=ROLE[roles[sc['replace']]]
+  try:result,line,lines=self.run_switch(pc,body)
+  finally:pc.status_pool.shutdown(wait=True)
+  exp=sc['expect'];outcome=exp['outcome']
+  fields=dict(part.split('=',1) for part in line.split()[1:])
+  self.assertEqual((fields['source'],fields['id'],fields['target']),('web',body['request_id'],'PC'))
+  self.assertEqual(fields['replace'],CONTRACT['labels'][roles[sc['replace']]] if sc.get('replace') else '-')
+  self.assertRegex(fields['total'],r'^\d+\.\d\ds$')
+  if outcome=='ok':
+   self.assertEqual(result['ok'],True);self.assertTrue(result['verified']);self.assertEqual(result['message'],text(exp['text']));self.assertEqual(fields['outcome'],'ok')
+   self.assertIn('devices',result['state'])
+   if audio:self.assertEqual(pc.audio.current,'bluez_output.AA_AA_AA_AA_AA_AA.1')
+  elif outcome=='busy':
+   self.assertEqual({k:result[k] for k in ('ok','busy','error_key','error')},dict(ok=False,busy=True,error_key='busy',error=text(exp['text'])));self.assertEqual(fields['outcome'],'busy')
+   offered=[CONTRACT['messages']['replace'].format(label=s['label']) for s in result['slots']]
+   self.assertEqual(sorted(offered),sorted(o.replace('{other1}',CONTRACT['labels'][roles['other1']]).replace('{other2}',CONTRACT['labels'][roles['other2']]) for o in exp['offered']))
+   self.assertEqual(sorted(s['address'] for s in result['slots']),sorted(start))
+  else:
+   self.assertEqual((result['ok'],result['error_key'],result['error']),(False,exp['error_key'],text(exp['text'])));self.assertIn('detail',result)
+   self.assertEqual(fields['outcome'],'error:'+exp['error_key'])
+  if 'connect_commands' in exp:self.assertEqual(h.connects,exp['connect_commands'])
+  self.assertLessEqual(h.connects,2,'at most one resend')
+  if 'connected' in exp:self.assertEqual(sorted(h.held()),sorted(ROLE[roles[r]] for r in exp['connected']))
+  if h.connects:self.assertEqual(fields['via'],'peer:phone')
+  if self.relayed:
+   self.assertTrue(all(d['source']=='web' and d['request_id']==body['request_id'] for d in self.relayed))
+   self.assertTrue(any('id='+body['request_id'] in l and 'action=connect' in l for l in lines),lines)
+  return result,h,pc
+ def test_contract_scenarios_linux_pc(self):
+  for sc in CONTRACT['scenarios']:
+   with self.subTest(sc['name']):self.scenario(sc,True)
+ def test_contract_scenarios_without_sink_step(self):
+  for sc in CONTRACT['scenarios']:
+   with self.subTest(sc['name']):self.scenario(sc,False)
+ def test_messages_sources_and_labels_match_contract(self):
+  self.assertEqual(controller.MESSAGES,CONTRACT['messages']);self.assertEqual(list(controller.SOURCES),CONTRACT['sources'])
+  self.assertEqual(controller.LABELS,CONTRACT['labels']);self.assertEqual(controller.SWITCH_DEADLINE,CONTRACT['rules']['deadline_seconds'])
+ def test_outstanding_peer_reply_is_never_resent(self):
+  pc,phone,h=self.rig([PHONE],[],peer_reply={'reachable':False,'controller':'phone','error':'Controller unavailable: TimeoutError'})
+  result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual((result['error_key'],len(self.relayed)),('timeout',1));self.assertIn('outcome=error:timeout via=peer:phone',line)
+ def test_stale_replace_is_ignored_when_a_slot_is_free(self):
+  pc,phone,h=self.rig([PHONE],['connect_ok'])
+  result,line,_=self.run_switch(pc,{'source':'web','replace':MAC});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertNotIn(('disconnect',MAC),h.calls);self.assertIn('replace=-',line)
+ def test_linux_pages_until_linked_then_needs_default_sink(self):
+  pc,phone,h=self.rig([PC,PHONE],[]);linked=iter([False,False,True])
+  pc.audio.linked=lambda:next(linked,True)
+  result,_,_=self.run_switch(pc,{'source':'desk'});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertEqual(pc.audio.pages,2);self.assertEqual(h.connects,0)
+  pc,phone,h=self.rig([PC,PHONE],[]);pc.audio.sticky=False
+  result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual((result['error_key'],result['error']),('audio_not_moved',controller.MESSAGES['errors']['audio_not_moved']));self.assertIn('outcome=error:audio_not_moved',line)
+  pc,phone,h=self.rig([PC,PHONE],[]);pc.audio.has_sink=False
+  result,_,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual(result['error_key'],'no_audio');self.assertLessEqual(self.clock.now-1000,controller.SWITCH_DEADLINE)
+ def test_unreachable_headset_is_paged_for_45_seconds(self):
+  pc,phone,h=self.rig([PHONE],['unreachable'])
+  result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual(result['error_key'],'unreachable');self.assertGreaterEqual(pc.audio.pages,10);self.assertLessEqual(self.clock.now-1000,controller.PAGE_WAIT+1)
+ def test_invalid_switch_requests_are_refused_and_logged_once(self):
+  pc,phone,h=self.rig([PHONE],[])
+  for body in ({},{'source':'tv'},{'source':'web','extra':1},{'source':'web','request_id':'has space'},{'source':'web','replace':5},{'source':'web','replace':'nope'}):
+   with self.subTest(body),self.assertLogs('bose.timing',level='INFO') as logs:
+    with self.assertRaises(ValueError):pc.switch_request(body)
+   self.assertEqual(len(logs.output),1);self.assertIn('outcome=error:invalid',logs.output[0])
+  self.assertEqual(h.calls,[]);pc.status_pool.shutdown(wait=True)
+ def test_override_errors_use_contract_texts_and_log_one_line(self):
+  pc,phone,h=self.rig([PC,PHONE],[])
+  with self.assertLogs('bose.timing',level='INFO') as logs:
+   with self.assertRaises(controller.ReplyError) as caught:pc.override_request({'action':'connect','address':MAC,'source':'web','request_id':'abc'})
+  reply=caught.exception.reply;pc.status_pool.shutdown(wait=True)
+  self.assertEqual((reply['error_key'],reply['error']),('busy',controller.MESSAGES['busy']))
+  lines=[l for l in logs.output if 'bose.switch' in l];self.assertEqual(len(lines),1)
+  self.assertIn('source=web id=abc target=Mac replace=- outcome=error:busy via=local',lines[0]);self.assertIsNone(MAC_RE.search(' '.join(logs.output)))
+  pc,phone,h=self.rig([PC,PHONE],[])
+  with self.assertLogs('bose.timing',level='INFO') as logs:
+   r=pc.override_request({'action':'disconnect','address':PHONE})
+  pc.status_pool.shutdown(wait=True)
+  self.assertTrue(r['ok']);self.assertIn('bose.switch source=unknown id=- target=Phone replace=- outcome=ok via=local',' '.join(logs.output))
+  with self.assertRaises(ValueError):pc.override_request({'action':'noise','level':3,'enabled':True,'source':'nowhere'})
 if __name__=='__main__':unittest.main()
