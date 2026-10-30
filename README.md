@@ -6,6 +6,8 @@ connection to replace when both Bluetooth slots are occupied.
 
 - Shared dashboard for Linux, macOS and Android, with a new app icon. It follows
   the system light/dark setting.
+- **Use here**: one tap moves the headset to the device in hand and reports a true
+  status. When both slots are busy it offers Replace per slot instead of guessing.
 - Pending states appear instantly and settle only after the headset confirms;
   a failed or unconfirmed change reverts to the verified state.
 - Noise cancellation levels 0–10 and Off, with verified headset state. The slider
@@ -130,6 +132,47 @@ creating that machine's config; swap its ID, bind address and peer list. Keep al
 configs private. Do not put them in this repo. Settings can identify controller
 roles from the headset's saved-device list.
 
+### Switch API (Use here)
+
+`POST /api/switch` on the loopback port moves the headset to this controller's own
+device (`roles[<config id>]`). Body: `{"source": …, "request_id": …, "replace": …}`.
+`source` is required and is one of the sources in
+[`tests/switch-contract.json`](tests/switch-contract.json) (`web`, `mac-popover`,
+`omarchy`, `android-app`, …); `request_id` is an optional short id
+(`[A-Za-z0-9_-]{1,32}`); `replace` is the address of the slot to drop, sent only
+after a busy reply. Other keys are refused. The contract file holds the texts,
+reply shapes and scenarios every front end is tested against.
+
+1. A fresh read. Already connected here: success with no connect command.
+2. Both slots busy and no `replace`: `{ok:false, busy:true, error_key:"busy", error, slots:[{address,label}]}`.
+   A `replace` counts only while both slots are still busy and that device still holds one.
+3. Otherwise connect through the same path as `/api/override` (local or one peer).
+   If the connect is not confirmed, one fresh read decides: connected → success; target
+   absent and a slot free → resend once; otherwise `unverified`. Nothing is resent while
+   a peer's reply may still be outstanding (relay timeout).
+4. On a Linux PC with `pactl`: when no controller reaches the headset, or BlueZ has no
+   link after the slot is confirmed, the PC pages it (`Device1.Connect` every 3 s, up
+   to 45 s). It then waits for the headset's A2DP sink, recovering step by step
+   (select A2DP, reconnect this PC's link, restart WirePlumber only while playback is
+   stopped), and makes it the default sink with a read-back. macOS routes audio itself.
+5. One 150 s deadline (`timeout`). Success:
+   `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
+   `{ok:false, error_key, error:<contract text>, detail:<raw reason>}` with keys
+   `unreachable`, `timeout`, `unverified`, `keep_one`, `no_audio`, `audio_not_moved`.
+
+`POST /api/override` also accepts optional `source` and `request_id` (absent = `unknown`),
+and its connect/disconnect failures now carry `error_key` and the contract `error` text
+(raw reason in `detail`). Both endpoints log exactly one line per request on the controller
+that received it, with role labels only:
+
+```
+bose.switch source=web id=k3f9a2 target=PC replace=- outcome=ok via=peer:phone total=1.84s
+```
+
+`outcome` is `ok`, `busy` or `error:<key>` (`error:invalid` for a refused body); `via` is
+`local` or `peer:<id>`. The relayed `/api/action` carries `source` and `request_id`, so the
+peer's `bose.timing` line shows the same `id=`. Older peers ignore the extra fields.
+
 Dashboard: loopback port **8847**, with Host/Origin checks. Mesh: configured
 Tailscale IPv4 port **8848**, tailnet source checks and shared bearer token.
 HTTP is used inside Tailscale's encrypted network; there is no public server or
@@ -148,7 +191,8 @@ omarchy plugin enable local.bose right
 
 Back up your shell config before layout changes. Copy the whole `linux/` folder:
 it holds several QML files and a `fonts/` directory. Click the headphones icon to
-open the popup. Two slot cups show the connected devices, each with Disconnect;
+open the popup. **Use here** moves the headset to this PC and plays PC audio on it.
+Two slot cups show the connected devices, each with Disconnect;
 saved devices have Connect. When both slots are full, choose which device to
 replace in place. The ANC switch and slider apply on release, and **Open dashboard**
 opens a compact app window through `omarchy-launch-webapp`. Colours follow the
@@ -202,16 +246,26 @@ A locked phone must be unlocked before controls open. Long-press opens app setti
 python3 -m unittest discover -s tests -v
 ```
 
-The 44 protocol/controller tests use simulated transports and have no hardware
-side effects. They cover packet fragmentation, rejected commands, slot/anchor
+The 54 tests use simulated transports and have no hardware side effects. Nine run
+`/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
+Linux sink step, a fake clock for the deadline and a fake `Audio`. They check texts, connect
+counts, the final slots, the default sink and the single `bose.switch` log line.
+`tests/test_omarchy_contract.py` runs `tests/bose_model.qml` offscreen
+(`QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 qml6 tests/bose_model.qml`). It drives
+the Omarchy popup model through the same scenarios and is skipped when `qml6` is missing. The
+protocol/controller tests cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
 
-For GUI checks, start the local helper, install Node dependencies (`npm install`)
-and Chromium, then run `npm run test:gui`. Set `CHROMIUM_PATH` or `BOSE_URL` if
-needed. The runner intercepts API responses with synthetic data and verifies
-mobile/desktop layouts, settings and the replacement dialog. It creates ignored
-screenshots under `artifacts/`; it sends no connection mutations. Set
+For GUI checks, install Node dependencies (`npm install`) and Chromium, then run
+`npm run test:gui` (headless). Without `BOSE_URL`, the page is served from this checkout's
+`web/`, so no helper needs to run. Set `BOSE_URL` to test a running helper's copy, and
+`CHROMIUM_PATH` if needed. The runner intercepts API responses with synthetic data and
+verifies mobile/desktop layouts, settings and the replacement dialog. It also runs Use here
+through every contract scenario: pending text before the reply, final texts, Replace offers,
+the replace payload, the Mac popover source and the Android `switchHere` bridge. It creates
+ignored screenshots under `artifacts/` (`BOSE_ARTIFACTS` overrides the folder); it sends no
+connection mutations. Set
 `SCREENSHOT_SCALE=2` for 2x captures, as used for the images above. The design
 system is described in [DESIGN.md](DESIGN.md).
 

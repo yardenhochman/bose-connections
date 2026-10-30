@@ -168,7 +168,7 @@ Every visible state is a confirmed state or an explicitly pending one. Ochre mea
 - Flat solid grounds (light `ground`, dark `ground-dark`); no mist, gradients or fades in the UI.
 - Ridge band drawn edge to edge across the full width, occluding back ridges with the ground colour.
 - Slot cups: `surface` fill, 1px `cup-edge` hairline, large radius, no shadow.
-- Ochre is scarce: This-device tag, pending states, outlined Connect, Replace.
+- Ochre is scarce: This-device tag, Use here, pending states, outlined Connect, Replace.
 - Jost throughout, two weights (400, 500).
 
 ## Colors
@@ -225,7 +225,7 @@ Numbers that change (battery, level readout) use tabular figures.
 
 ## Layout
 
-- **Phone (default):** single column, max width 1040px. Header 64px min, gutters 20px (`gutter`); ridge band 150px tall, full bleed edge to edge; cups in a two-column grid, 14px gap, 16px side inset; ANC section 22px below; saved devices 28px below; footer 20px below.
+- **Phone (default):** single column, max width 1040px. Header 64px min, gutters 20px (`gutter`); ridge band 150px tall, full bleed edge to edge; Use here full width under the band, 16px side inset; cups in a two-column grid, 14px gap, 16px side inset; ANC section 22px below; saved devices 28px below; footer 20px below.
 - **Desktop and Mac window (≥760px, not popover):** two-column grid `1.12fr / 1fr`, 44px column gap, max width 1000px, vertically centred. Header and ridge band (190px) span both columns; cups, replace prompt and ANC on the left; saved devices and footer on the right.
 - **Mac popover (`?view=popover`):** 380pt wide, always the phone layout with tighter edges: 14px gutters, ridge band 106px, cup gap 10px, cup min-height 164px, footer 12px. The page reports its height to the native popover (clamped 320–720).
 - **Touch targets:** 44px for every button, icon button and the slider.
@@ -258,6 +258,12 @@ Outside sound let through, as 15 stacked smooth ridges from a fixed seeded field
 - **Unknown/offline:** flattened (0.1) and faded to 40% alpha.
 - **Live drag:** the slider previews amplitude while dragging; transitions ease over 180ms (cubic out); reduced motion jumps.
 - Ridges never climb into the caption row; displacement saturates below it.
+
+### Use here (one tap)
+The primary action: a full-width outlined ochre pill "Use here" directly under the ridge band, above the cups (popup: same place, under the band). It shows whenever this device's role is known, even from cached state, because the controller reads the headset itself first. Texts and flow come from `tests/switch-contract.json`.
+- **Tap:** the pill fills ochre and reads `Connecting…` at once. This device's cup turns pending when a slot is free. The status line shows `Connecting…` in `accent-ink` with a breathing ochre LED. Every other mutation disables.
+- **Both slots busy:** the replace prompt shows `Both slots busy · choose one to replace` with one outlined `Replace <label>` button per slot plus Cancel. The prompt wraps to a second row of equal-width buttons. A tap sends the chosen slot and reads `Replacing <label>…`.
+- **Success:** `Playing on Bose 700` with the teal check. **Failure:** the contract error text plus ` · tap to retry` in error red; the pill is immediately tappable again.
 
 ### Slot cups
 Two cups side by side, always in a stable order: a connected device keeps the cup it already holds. Each cup: state row (LED, state word, "Slot N" right), device icon, name, tag line, action at the bottom.
@@ -292,13 +298,13 @@ Label row "Saved devices" with a refresh icon button (spins while checking). Row
 ### Truth and interaction rules
 - Pending is shown immediately, then becomes verified (headset read-back) or reverts to the confirmed state with an error message. No optimistic final state.
 - One mutation in flight across the whole surface: connection changes and ANC writes block each other; other controls disable.
-- No automatic retry. Errors say "Refresh before trying again."
+- No blind retry. Row actions never resend. Use here may resend once on the controller, only after a fresh read shows this device absent and a slot free. Its errors end with " · tap to retry".
 - Cached state renders first and is read-only ("Last known", hollow LEDs); mutations need live state.
 
 ### Per-surface adaptations
 - **Web phone / desktop / popover:** as Layout.
 - **Android QS dialog** (`BoseTileService`): same world in native views, 28dp rounded ground card on the system scrim, 22dp cups, Jost regular/medium, colours from `qs_*` resources; header line `Live · 2 of 2 connected`; adds an App settings and Close footer. **Tile subtitle:** `2 of 2 · ANC 7`, `2 of 2 · ANC off`, `Updating…` while ANC is in flight.
-- **Omarchy popup** (`linux/BoseView.qml`): ground and ink come from the active Omarchy theme; surfaces, hairlines and text tiers are mixes of theme ground and ink (ink tiers held to ≥5:1 and ≥4.5:1); ochre accent and teal LED stay the design's own. Type is scaled down to the bar (title 17, name 13, body 12). Ridge band 86px, 9 ridges.
+- **Omarchy popup** (`linux/BoseView.qml`): Use here, the busy prompt and all connection error texts match the web (contract texts, `source: omarchy`). Ground and ink come from the active Omarchy theme; surfaces, hairlines and text tiers are mixes of theme ground and ink (ink tiers held to ≥5:1 and ≥4.5:1); ochre accent and teal LED stay the design's own. Type is scaled down to the bar (title 17, name 13, body 12). Ridge band 86px, 9 ridges.
 - **Mac:** status-bar template icon (SF Symbol headphones); left click opens an NSPopover hosting the web popover view at 380pt; right click opens a native NSMenu (Connected, Saved with Replace submenus, Noise cancellation submenu, Open full window, Quit).
 - **Desk bar compact panel:** lives in another repo and uses the bar's own theme; not specified here.
 
