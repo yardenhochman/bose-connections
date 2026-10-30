@@ -30,6 +30,8 @@ public class BoseTileService extends TileService {
  // Noise writes: one in flight + the latest queued value, >=250 ms between write starts.
  boolean ancInFlight=false;int[] ancQueued;long ancLastStart=0;Integer shownLevel;Boolean shownEnabled;
  String notice="";boolean noticeError=false;
+ // One-tap switch: the tile subtitle shows the contract text (pending, then ok or the error) until tileNoteUntil.
+ boolean switching=false;String tileNote="";long tileNoteUntil=0;
 
  int dp(float n){return Math.round(n*getResources().getDisplayMetrics().density);}
  int color(int id){return getColor(id);}
@@ -42,7 +44,7 @@ public class BoseTileService extends TileService {
   updateTile();
   if(dialog==null&&!busy()&&!reading&&SystemClock.elapsedRealtime()-lastRead>30000)refresh();
  }
- public void onClick(){super.onClick();if(isLocked())unlockAndRun(this::openPanel);else openPanel();}
+ public void onClick(){super.onClick();if(isLocked())unlockAndRun(this::switchHere);else switchHere();}
  void updateTile(){
   Tile tile=getQsTile();if(tile==null)return;
   tile.setLabel("Bose");tile.setState(live()&&connectedCount()>=1?Tile.STATE_ACTIVE:Tile.STATE_INACTIVE);
@@ -50,6 +52,8 @@ public class BoseTileService extends TileService {
   tile.updateTile();
  }
  String tileSubtitle(){
+  if(switching)return Switcher.MESSAGES.get("pending");
+  if(!tileNote.isEmpty()&&SystemClock.elapsedRealtime()<tileNoteUntil)return tileNote;
   if(mutating)return "connect".equals(pendingAction)?"Connecting…":"Disconnecting…";
   if(ancInFlight)return "Updating…";
   boolean cached=snapshot.optBoolean("cached");
@@ -59,9 +63,36 @@ public class BoseTileService extends TileService {
   return connectedCount()+" of 2"+(noise==null?"":noise.optBoolean("enabled")?" · ANC "+noise.optInt("level"):" · ANC off");
  }
 
+ // ---- One-tap switch (tests/switch-contract.json): tap moves the headset to this phone; long-press opens the app ----
+ void setTileNote(String text,long ms){tileNote=text;tileNoteUntil=SystemClock.elapsedRealtime()+ms;main.postDelayed(this::updateTile,ms+50);}
+ JSONObject switchRequest(String id)throws Exception{
+  File f=previewFile();
+  if(f==null||!f.exists())return Core.switchHere(this,"android-tile",id,null);
+  JSONObject s;try(FileInputStream in=new FileInputStream(f)){s=new JSONObject(Core.read(in,65536));}
+  Thread.sleep(s.optLong("delay",1200));String outcome=s.optString("switch","ok");
+  if(outcome.equals("ok"))return new JSONObject().put("ok",true).put("verified",true).put("message",Switcher.MESSAGES.get("ok")).put("state",s.put("cached",false));
+  if(outcome.equals("busy"))return new JSONObject().put("ok",false).put("busy",true).put("error_key","busy").put("error",Switcher.MESSAGES.get("busy"));
+  return Switcher.failure(outcome,"preview");
+ }
+ void switchHere(){
+  if(switching||busy())return;
+  switching=true;tileNote="";updateTile();final String id=Long.toString(SystemClock.elapsedRealtime(),36);
+  work.submit(()->{
+   JSONObject reply;try{reply=switchRequest(id);}catch(Exception e){reply=Switcher.failure("unreachable",e.getMessage());}
+   final JSONObject result=reply;
+   main.post(()->{
+    switching=false;
+    if(result.optBoolean("ok")){JSONObject state=result.optJSONObject("state");if(overviewShaped(state)){snapshot=state;lastRead=SystemClock.elapsedRealtime();}setTileNote(Switcher.MESSAGES.get("ok"),8000);}
+    else if(result.optBoolean("busy")){setTileNote(Switcher.MESSAGES.get("busy"),30000);openPanel();JSONObject roles=snapshot.optJSONObject("roles");JSONObject phone=roles==null?null:device(roles.optString("phone"));if(phone!=null&&panel!=null){replacing=phone;panel.render();}}
+    else setTileNote(result.optString("error",Switcher.text("unreachable"))+Switcher.MESSAGES.get("retry_hint"),30000);
+    updateTile();
+   });
+  });
+ }
+
  // ---- State helpers ----
  boolean live(){return snapshot.optBoolean("reachable")&&!snapshot.optBoolean("cached");}
- boolean busy(){return mutating||ancInFlight;}
+ boolean busy(){return mutating||ancInFlight||switching;}
  JSONArray devices(){JSONArray list=snapshot.optJSONArray("devices");return list==null?new JSONArray():list;}
  int connectedCount(){int n=0;JSONArray ds=devices();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&d.optBoolean("connected"))n++;}return n;}
  JSONObject device(String address){JSONArray ds=devices();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&address!=null&&address.equals(d.optString("address")))return d;}return null;}
@@ -134,7 +165,7 @@ public class BoseTileService extends TileService {
   work.submit(()->{
    JSONObject state=null;String message,error=null;
    try{
-    JSONObject data=new JSONObject().put("action",action).put("address",address);if(replace!=null)data.put("replace",replace);
+    JSONObject data=new JSONObject().put("action",action).put("address",address).put("source","android-tile");if(replace!=null)data.put("replace",replace);
     JSONObject result=override(data);
     if(!result.optBoolean("ok")||!result.optBoolean("verified"))throw new IOException(result.optString("error",result.optString("message","Change not verified; refresh before retrying")));
     message=result.optString("message","Connection updated");state=result.optJSONObject("state");
