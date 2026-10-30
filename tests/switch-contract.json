@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "about": "Tap-to-switch contract shared by all six front ends (Android app + tile, Omarchy popup, Mac menu bar, web dashboard, desk bar, couch). One tap on the device in hand moves the Bose there with a true status. Every front end's tests load this file and assert the same texts and outcomes. Roles in scenarios are abstract: 'here' is the device the tap happens on; 'other1' and 'other2' are the two other roles in the order phone, mac, pc with 'here' removed.",
+  "sources": ["android-app", "android-tile", "omarchy", "web", "mac-menu", "mac-popover", "desk", "couch"],
+  "labels": {"phone": "Phone", "mac": "Mac", "pc": "PC"},
+  "api": {
+    "switch": {
+      "method": "POST",
+      "path": "/api/switch",
+      "body": {"source": "one of sources (required)", "request_id": "short random id from the front end (optional)", "replace": "address of the slot to drop (optional, only after a busy reply)"},
+      "reply_ok": {"ok": true, "verified": true, "message": "messages.ok", "state": "overview"},
+      "reply_busy": {"ok": false, "busy": true, "error_key": "busy", "error": "messages.busy", "slots": [{"address": "…", "label": "Phone"}]},
+      "reply_error": {"ok": false, "error_key": "one of messages.errors keys", "error": "messages.errors[error_key]", "detail": "raw reason, for logs"}
+    }
+  },
+  "messages": {
+    "pending": "Connecting…",
+    "replacing": "Replacing {label}…",
+    "ok": "Playing on Bose 700",
+    "busy": "Both slots busy · choose one to replace",
+    "replace": "Replace {label}",
+    "retry_hint": " · tap to retry",
+    "errors": {
+      "unreachable": "Couldn’t reach the headphones",
+      "timeout": "Took too long to switch",
+      "unverified": "The headphones didn’t confirm the switch",
+      "keep_one": "Can’t replace that one: keep a phone, PC or Mac connected",
+      "no_audio": "Connected, but no sound from the headphones",
+      "audio_not_moved": "Headphones connected, but PC audio didn’t switch"
+    }
+  },
+  "rules": {
+    "pending_immediately": "messages.pending shows at once on tap, before any reply",
+    "retry": "A connect that is not confirmed is retried (resent at most once after a fresh read shows the target absent and a slot free; on Linux the PC also pages BlueZ every 3 s for up to 45 s). Never resend through another peer while a reply is outstanding.",
+    "both_busy": "Never guess which slot to drop: reply busy with both slots; the front end offers messages.replace per slot; the chosen address goes back as replace",
+    "verified": "Success only after a fresh headset read shows 'here' connected; on Linux PC also the Bose A2DP sink is the default sink",
+    "deadline_seconds": 150,
+    "log": "One line per switch request on the executing controller: 'bose.switch source={source} id={id} target={target_label} replace={label_or_-} outcome={ok|busy|error:<key>} via={local|peer:<id>} total={seconds:.2f}s'. Device role labels only, never addresses or names."
+  },
+  "scenarios": [
+    {"name": "success", "start": ["other1"], "headset": ["connect_ok"],
+     "expect": {"outcome": "ok", "text": "messages.ok", "connected": ["other1", "here"]}},
+    {"name": "already_here", "start": ["here", "other1"], "headset": [],
+     "expect": {"outcome": "ok", "text": "messages.ok", "connect_commands": 0, "connected": ["here", "other1"]}},
+    {"name": "both_busy", "start": ["other1", "other2"], "headset": [],
+     "expect": {"outcome": "busy", "text": "messages.busy", "offered": ["Replace {other1}", "Replace {other2}"], "connect_commands": 0}},
+    {"name": "both_busy_replace", "start": ["other1", "other2"], "replace": "other2", "headset": ["connect_ok"],
+     "expect": {"outcome": "ok", "text": "messages.ok", "connected": ["other1", "here"]}},
+    {"name": "retry_then_ok", "start": ["other1"], "headset": ["connect_unconfirmed", "connect_ok"],
+     "expect": {"outcome": "ok", "text": "messages.ok", "connected": ["other1", "here"]}},
+    {"name": "unverified", "start": ["other1"], "headset": ["connect_unconfirmed", "connect_unconfirmed", "connect_unconfirmed"],
+     "expect": {"outcome": "error", "error_key": "unverified", "text": "messages.errors.unverified"}},
+    {"name": "unreachable", "start": ["other1"], "headset": ["unreachable"],
+     "expect": {"outcome": "error", "error_key": "unreachable", "text": "messages.errors.unreachable"}},
+    {"name": "timeout", "start": ["other1"], "headset": ["hang"],
+     "expect": {"outcome": "error", "error_key": "timeout", "text": "messages.errors.timeout"}}
+  ]
+}
