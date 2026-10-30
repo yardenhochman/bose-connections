@@ -104,6 +104,16 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 .choose{display:flex;align-items:center;gap:12px;margin:2px 16px 12px;padding:6px 6px 6px 18px;border:1.5px dashed var(--accent);border-radius:28px;background:var(--accent-wash);position:relative;z-index:2}
 .choose p{flex:1;font-size:14px;line-height:1.35;color:var(--accent-ink);font-weight:500}
 .choose .btn{flex:none;background:var(--surface)}
+.choose .opts{display:contents}
+.choose.slots{flex-wrap:wrap;padding:12px 12px 12px 18px;row-gap:10px}
+.choose.slots p{flex-basis:100%}
+.choose.slots .opts .btn{flex:1 1 0;min-width:0}
+/* Use here: the one-tap primary action that moves the headset to this device */
+.usehere{margin:2px 16px 12px;position:relative;z-index:2}
+.usehere .btn{width:100%}
+.usehere .btn.pressed{opacity:1}
+.status.pend{color:var(--accent-ink);font-weight:500;align-items:center}
+.status.pend .led{width:7px;height:7px;margin:0 2px 0 4px}
 
 /* Noise cancellation */
 section{padding:0 20px;position:relative;z-index:1}
@@ -178,7 +188,7 @@ dialog .btn.quiet{margin-top:6px;color:var(--ink-2);font-weight:400}
  :root:not(.popover) .top h1{font-size:26px}
  :root:not(.popover) .plot{grid-column:1/-1;height:190px;margin:6px 0 14px}
  :root:not(.popover) .plot .cap{left:4px;right:4px}
- :root:not(.popover) .cups,:root:not(.popover) .choose{margin-left:0;margin-right:0}
+ :root:not(.popover) .cups,:root:not(.popover) .choose,:root:not(.popover) .usehere{margin-left:0;margin-right:0}
  :root:not(.popover) .cups{padding:0;margin-top:0}
  :root:not(.popover) .nc,:root:not(.popover) .col-side section,:root:not(.popover) .foot{padding:0 4px}
  :root:not(.popover) .nc{margin-top:28px}
@@ -194,7 +204,7 @@ dialog .btn.quiet{margin-top:6px;color:var(--ink-2);font-weight:400}
 :root.popover .cups{gap:10px;padding:0 12px;margin-top:6px}
 :root.popover .cup{min-height:164px;padding:14px 11px 12px;border-radius:26px}
 :root.popover .cup .state{column-gap:6px;font-size:12.5px}
-:root.popover .choose{margin:2px 12px 10px}
+:root.popover .choose,:root.popover .usehere{margin:2px 12px 10px}
 :root.popover section{padding:0 14px}
 :root.popover .nc{margin-top:16px}
 :root.popover .saved{margin-top:20px}

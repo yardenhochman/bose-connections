@@ -1,7 +1,8 @@
 const {chromium}=require('playwright-core');
 const path=require('path'),fs=require('fs');
-const artifacts=path.resolve(__dirname,'../artifacts');fs.mkdirSync(artifacts,{recursive:true});
-const fonts=path.resolve(__dirname,'../web/fonts');
+const artifacts=path.resolve(process.env.BOSE_ARTIFACTS||path.join(__dirname,'../artifacts'));fs.mkdirSync(artifacts,{recursive:true});
+const web=path.resolve(__dirname,'../web'),fonts=path.join(web,'fonts');
+const contract=JSON.parse(fs.readFileSync(path.join(__dirname,'switch-contract.json'),'utf8')),M=contract.messages;
 const shot=(page,name,full=true)=>page.screenshot({path:path.join(artifacts,name),fullPage:full});
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function check(ok,text){if(!ok)throw Error(text);}
@@ -22,13 +23,16 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  if(scale!==1){const np=browser.newPage.bind(browser);browser.newPage=(o={})=>np({deviceScaleFactor:scale,...o});}
  const page=await browser.newPage({viewport:{width:1280,height:950}});
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
- let cur=null,overviewCalls=0,overrideHandler=null;const posts=[];
+ let cur=null,overviewCalls=0,overrideHandler=null,switchHandler=null,switchReplied=0;const posts=[],switchPosts=[];
  // Every page gets the same fixture API; nothing reaches a live controller.
  const wire=async page=>{
+  // Without BOSE_URL the page itself comes from this checkout's web/, so no running helper is needed.
+  if(!process.env.BOSE_URL)await page.route(u=>!new URL(u).pathname.startsWith('/api/'),r=>{const p=new URL(r.request().url()).pathname,f=path.join(web,p==='/'?'index.html':p);const types={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'};return f.startsWith(web)&&fs.existsSync(f)&&fs.statSync(f).isFile()?r.fulfill({body:fs.readFileSync(f),contentType:types[path.extname(f)]||'application/octet-stream'}):r.fulfill({status:404,body:''});});
   await page.route('**/fonts/*.woff2',r=>{const f=path.join(fonts,path.basename(new URL(r.request().url()).pathname));return fs.existsSync(f)?r.fulfill({body:fs.readFileSync(f),contentType:'font/woff2'}):r.fulfill({status:404,body:''});});
   await page.route('**/api/cached',r=>r.fulfill({json:{devices:[]}}));
   await page.route('**/api/overview',r=>{overviewCalls++;return r.fulfill({json:cur});});
   await page.route('**/api/override',async r=>{const body=r.request().postDataJSON();posts.push({body,at:Date.now()});const res=await overrideHandler(body);return r.fulfill({json:res});});
+  await page.route('**/api/switch',async r=>{const body=r.request().postDataJSON();switchPosts.push({body,at:Date.now()});const res=await switchHandler(body);switchReplied=Date.now();return r.fulfill({json:res});});
  };
  await wire(page);
  const ready=(p=page)=>p.evaluate(()=>document.fonts.ready.then(()=>new Promise(r=>setTimeout(r,400))));
@@ -226,7 +230,71 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await pop.close();
  }
 
+ // ---- Use here: every scenario of tests/switch-contract.json against scripted /api/switch replies ----
+ const other={other1:'phone',other2:'mac',here:'pc'},lab=r=>contract.labels[other[r]],addr=r=>DEV[other[r]].address;
+ const fill=(t,label)=>t.replace('{label}',label);
+ const textOf=k=>k.split('.').slice(1).reduce((o,p)=>o[p],M);
+ const reply=(sc,body)=>{const e=sc.expect;
+  if(e.outcome==='busy'||(sc.replace&&!body.replace))return {ok:false,busy:true,error_key:'busy',error:M.busy,slots:sc.start.map(r=>({address:addr(r),label:lab(r)}))};
+  if(e.outcome==='ok'){cur=overview((e.connected||[]).map(addr),cur.noise);return {ok:true,verified:true,message:M.ok,state:cur};}
+  return {ok:false,error_key:e.error_key,error:M.errors[e.error_key],detail:'scripted'};};
+ const settle=async()=>{await sw.mouse.move(1,1);await sleep(250);};
+ const sw=await browser.newPage({viewport:{width:390,height:844}});sw.on('pageerror',e=>errors.push(e.message));await wire(sw);
+ const status=()=>sw.locator('#message').textContent();
+ for(const sc of contract.scenarios){
+  cur=overview(sc.start.map(addr));await sw.goto(base);await sw.getByText('Live · just now').waitFor();await ready(sw);
+  switchPosts.length=0;switchReplied=0;switchHandler=async b=>{await sleep(700);return reply(sc,b);};
+  if(sc.name==='success')await shot(sw,'switch-idle.png');
+  const tapped=Date.now();await sw.getByRole('button',{name:/^Use here/}).click();
+  await sw.locator('#message.pend',{hasText:M.pending}).waitFor({timeout:400});
+  check(!switchReplied,`${sc.name}: "${M.pending}" must show before the reply`);
+  check(await sw.locator('#use-here').textContent()===M.pending&&await sw.locator('#use-here').isDisabled(),`${sc.name}: Use here must turn pending at once`);
+  if(sc.name==='success')await shot(sw,'switch-pending.png');
+  await sw.waitForFunction(()=>!document.querySelector('#message.pend'),null,{timeout:5000});
+  const first=switchPosts[0].body;
+  check(switchPosts.length===1&&first.source==='web'&&/^[a-z0-9]{1,32}$/.test(first.request_id)&&!('replace' in first)&&Object.keys(first).length===2,`${sc.name}: bad switch payload ${JSON.stringify(first)}`);
+  if(sc.expect.outcome==='busy'||sc.replace){
+   await sw.getByText(M.busy,{exact:true}).waitFor();
+   const offered=await sw.locator('#choose-options button').allTextContents();
+   const want=(sc.expect.offered||sc.start.map(r=>'Replace {'+r+'}')).map(o=>o.replace(/\{(other\d)\}/,(_,r)=>lab(r)));
+   check(JSON.stringify(offered)===JSON.stringify(want),`${sc.name}: offered ${JSON.stringify(offered)}, want ${JSON.stringify(want)}`);
+   check(JSON.stringify(want)===JSON.stringify(sc.start.map(r=>fill(M.replace,lab(r)))),`${sc.name}: offers must be messages.replace per slot`);
+   if(sc.name==='both_busy'){await settle();await shot(sw,'switch-busy.png');};
+   if(!sc.replace){check(switchPosts.length===1,`${sc.name}: busy must not resend`);await sw.getByRole('button',{name:'Cancel',exact:true}).click();check(await sw.locator('#choose').isHidden(),'Cancel hides the busy prompt');continue;}
+   switchReplied=0;await sw.getByRole('button',{name:fill(M.replace,lab(sc.replace)),exact:true}).click();
+   await sw.locator('#message.pend',{hasText:fill(M.replacing,lab(sc.replace))}).waitFor({timeout:400});check(!switchReplied,`${sc.name}: "${fill(M.replacing,lab(sc.replace))}" must show before the reply`);
+   await sw.waitForFunction(()=>!document.querySelector('#message.pend'),null,{timeout:5000});
+   const second=switchPosts[1]?.body;
+   check(switchPosts.length===2&&second.replace===addr(sc.replace)&&second.source==='web'&&second.request_id!==first.request_id,`${sc.name}: bad replace payload ${JSON.stringify(second)}`);
+  }
+  const want=sc.expect.outcome==='ok'?textOf(sc.expect.text):textOf(sc.expect.text)+M.retry_hint;
+  check(await status()===want,`${sc.name}: status "${await status()}", want "${want}"`);
+  check((await sw.locator('#message.error').count()===1)===(sc.expect.outcome==='error'),`${sc.name}: error styling`);
+  if(sc.expect.outcome==='ok')for(const r of sc.expect.connected)check(await sw.locator('.cup',{hasText:DEV[other[r]].name}).count()===1,`${sc.name}: ${r} should hold a cup`);
+  check(await sw.locator('#use-here').isEnabled(),`${sc.name}: Use here must be tappable again`);
+  if(sc.name==='success'){await settle();await shot(sw,'switch-ok.png');};
+  if(sc.name==='unreachable'){await settle();await shot(sw,'switch-error.png');};
+ }
+ // The Mac popover sends its own source
+ cur=overview([DEV.phone.address],undefined,{here:'mac'});switchPosts.length=0;switchHandler=async()=>({ok:true,verified:true,message:M.ok,state:overview([DEV.phone.address,DEV.mac.address],undefined,{here:'mac'})});
+ await sw.goto(base+'/?view=popover');await sw.getByText('Live · just now').waitFor();await sw.getByRole('button',{name:/^Use here/}).click();await sw.getByText(M.ok,{exact:true}).waitFor();
+ check(switchPosts[0].body.source==='mac-popover','Mac popover source: '+JSON.stringify(switchPosts[0].body));
+ // Per-row Connect shows the controller's contract text on failure
+ cur=overview([DEV.pc.address,DEV.phone.address]);await sw.goto(base);await sw.getByText('Live · just now').waitFor();
+ overrideHandler=async()=>({ok:false,error_key:'keep_one',error:M.errors.keep_one,detail:'scripted'});
+ await sw.getByRole('button',{name:'Connect MacBook Pro'}).click();await sw.getByRole('button',{name:'Replace Android phone'}).click();
+ await sw.getByText(M.errors.keep_one,{exact:true}).waitFor();
+ // Android WebView: the bridge's switchHere is used when present, with the same reply shape
+ await sw.addInitScript(()=>{window.__switched=[];window.Android={request:(id,p,d)=>fetch(p,d?{method:'POST',headers:{'Content-Type':'application/json'},body:d}:{}).then(r=>r.text()).then(t=>window.finishRequest(id,t)),
+  switchHere:(id,body)=>{window.__switched.push(JSON.parse(body));setTimeout(()=>window.finishRequest(id,JSON.stringify({ok:false,error_key:'timeout',error:'Took too long to switch'})),300);},settings:()=>{}};});
+ cur=overview([DEV.phone.address]);switchPosts.length=0;await sw.goto(base);await sw.getByText('Live · just now').waitFor();
+ await sw.getByRole('button',{name:/^Use here/}).click();await sw.locator('#message.pend',{hasText:M.pending}).waitFor({timeout:250});
+ await sw.getByText(M.errors.timeout+M.retry_hint,{exact:true}).waitFor();
+ const bridged=await sw.evaluate(()=>window.__switched);
+ check(bridged.length===1&&bridged[0].source==='android-app'&&!switchPosts.length,'Android bridge switchHere: '+JSON.stringify(bridged));
+ await sw.close();
+
  check(!errors.length,errors.join('\n'));
- console.log('GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window).');
+ console.log(`GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window); Use here through ${contract.scenarios.length} contract scenarios + popover source, row contract text, Android bridge.`);
  await browser.close();
 })().catch(e=>{console.error(e);process.exit(1);});

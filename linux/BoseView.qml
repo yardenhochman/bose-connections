@@ -26,7 +26,7 @@ FocusScope {
 
   implicitHeight: content.implicitHeight
   Keys.onEscapePressed: function(e) {
-    if (view.model.replacing) view.model.cancelReplace()
+    if (view.model.replacing || view.model.busySlots) view.model.cancelReplace()
     else if (view.showSettings) view.showSettings = false
     else view.closeRequested()
     e.accepted = true
@@ -186,6 +186,64 @@ FocusScope {
         color: view.theme.ink
         font.family: view.theme.family
         font.pixelSize: view.theme.fCaption
+      }
+    }
+
+    // ------------------------------------------- use here (one tap)
+    Item { width: 1; height: view.theme.sp(8); visible: useHere.visible }
+    PillButton {
+      id: useHere
+      objectName: "useHere"
+      theme: view.theme
+      visible: !view.showSettings && view.model.hereAddress !== "" && !view.model.helperDown
+      width: parent.width
+      variant: "accent"
+      readonly property bool mine: !!view.model.pending && !!view.model.pending.here
+      text: !mine ? "Use here" : view.model.notice ? view.model.notice.text : view.model.messages.pending
+      busy: mine
+      enabled: view.model.canUseHere
+      onClicked: view.model.switchHere()
+    }
+
+    // ------------------------------- both slots busy: Replace per slot
+    Column {
+      visible: !!view.model.busySlots && !view.showSettings
+      width: parent.width
+      topPadding: view.theme.sp(8)
+      spacing: view.theme.sp(6)
+      Text {
+        width: parent.width
+        text: view.model.messages.busy
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        color: view.theme.accentInk
+        font.family: view.theme.family
+        font.pixelSize: view.theme.fSmall
+        font.weight: Font.Medium
+      }
+      Row {
+        id: busyRow
+        width: parent.width
+        spacing: view.theme.sp(6)
+        Repeater {
+          model: view.model.busySlots || []
+          delegate: PillButton {
+            required property var modelData
+            theme: view.theme
+            compact: true
+            variant: "accent"
+            width: (busyRow.width - busyRow.spacing * 2 - busyCancel.width) / 2
+            text: view.model.replaceText(modelData)
+            onClicked: view.model.switchHere(modelData.address)
+          }
+        }
+        PillButton {
+          id: busyCancel
+          theme: view.theme
+          compact: true
+          text: "Cancel"
+          onClicked: view.model.cancelReplace()
+        }
       }
     }
 
@@ -580,18 +638,27 @@ FocusScope {
       width: parent.width
       spacing: view.theme.sp(8)
       bottomPadding: view.theme.sp(4)
+      readonly property bool pend: !!view.model.notice && view.model.notice.tone === "pending"
       BoseIcon {
         id: noticeIcon
+        visible: !parent.pend
         name: view.model.notice && view.model.notice.tone === "error" ? "alert" : "check"
         size: view.theme.sp(16)
         color: view.model.notice && view.model.notice.tone === "error" ? view.theme.error : view.theme.ok
+      }
+      Item {
+        id: noticeLed
+        visible: parent.pend
+        width: view.theme.sp(16); height: width
+        Rectangle { anchors.centerIn: parent; width: view.theme.sp(7); height: width; radius: width / 2; color: view.theme.accent }
       }
       Text {
         width: parent.width - noticeIcon.width - parent.spacing
         wrapMode: Text.Wrap
         text: view.model.notice ? view.model.notice.text : ""
         textFormat: Text.PlainText
-        color: view.theme.ink
+        font.weight: parent.pend ? Font.Medium : Font.Normal
+        color: parent.pend ? view.theme.accentInk : view.theme.ink
         font.family: view.theme.family
         font.pixelSize: view.theme.fSmall
       }

@@ -20,13 +20,25 @@ QtObject {
   property bool savingRoles: false
   property var pending: null       // {action, address, replace, name, replaceName}
   property var replacing: null     // saved device waiting for a slot choice
-  property var notice: null        // {text, tone: "ok" | "error"}
+  property var busySlots: null     // Use here: [{address, label}] offered after a busy reply
+  property var notice: null        // {text, tone: "ok" | "error" | "pending"}
   property var slotOrder: [null, null]
   property var ancInFlight: null   // {level, enabled}
   property var ancQueued: null
   property real ancLastStart: 0
 
   readonly property var roleNames: ({pc: "PC", mac: "Mac", phone: "Phone"})
+  // Tap-to-switch texts from tests/switch-contract.json (tests/bose_model.qml keeps them equal).
+  readonly property var messages: ({
+    pending: "Connecting…", replacing: "Replacing {label}…", ok: "Playing on Bose 700",
+    busy: "Both slots busy · choose one to replace", replace: "Replace {label}", retry_hint: " · tap to retry",
+    errors: {unreachable: "Couldn’t reach the headphones", timeout: "Took too long to switch",
+             unverified: "The headphones didn’t confirm the switch", keep_one: "Can’t replace that one: keep a phone, PC or Mac connected",
+             no_audio: "Connected, but no sound from the headphones", audio_not_moved: "Headphones connected, but PC audio didn’t switch"}
+  })
+  readonly property string hereAddress: (snapshot.roles || {})[snapshot.here] || ""
+  // Use here works from cached state too: the controller reads the headset itself first.
+  readonly property bool canUseHere: loaded && !helperDown && hereAddress !== "" && !busy
   readonly property bool live: !!snapshot.reachable && !snapshot.cached
   readonly property bool ancBusy: ancInFlight !== null || ancQueued !== null
   readonly property bool busy: pending !== null || ancBusy || savingRoles
@@ -128,10 +140,10 @@ QtObject {
       m.inflight = keep
     }
   }
-  function request(method, path, body, done) {
+  function request(method, path, body, done, timeoutMs) {
     if (transport) { transport(method, path, body, done); return }
     var xhr = new XMLHttpRequest()
-    var rec = {xhr: xhr, deadline: Date.now() + requestTimeoutMs, done: done, dead: false}
+    var rec = {xhr: xhr, deadline: Date.now() + (timeoutMs || requestTimeoutMs), done: done, dead: false}
     inflight = inflight.concat([rec])
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== XMLHttpRequest.DONE || rec.dead) return
@@ -167,6 +179,7 @@ QtObject {
     loaded = true
     helperDown = false
     if (replacing && (!live || connectedCount < 2)) replacing = null
+    if (busySlots && connectedCount < 2) busySlots = null
     snapshotApplied()
   }
   // Noise read-backs can carry an empty device list when the controller has no
@@ -226,7 +239,7 @@ QtObject {
     mutate({action: "connect", address: d.address, replace: slotDevice.address},
            {action: "connect", address: d.address, name: nameOf(d), replace: slotDevice.address, replaceName: nameOf(slotDevice)})
   }
-  function cancelReplace() { replacing = null }
+  function cancelReplace() { replacing = null; busySlots = null }
   function disconnectDevice(d) {
     if (!canMutate || !d) return
     notice = null
@@ -237,19 +250,56 @@ QtObject {
     if (p.action === "disconnect") return p.name + " disconnected"
     return p.replace ? p.name + " connected in place of " + p.replaceName : p.name + " connected"
   }
+  // Contract text for a failed connection change: the controller's error_key, else the transport failure.
+  function errorText(err, json) {
+    var key = json && json.error_key
+    if (key === "busy") return messages.busy
+    if (key && messages.errors[key]) return messages.errors[key]
+    if (err && err.timeout) return messages.errors.timeout
+    if (err && err.network) return messages.errors.unreachable
+    return String((json && (json.error || json.message)) || messages.errors.unreachable)
+  }
+  function replaceText(slot) { return messages.replace.replace("{label}", slot ? slot.label : "") }
+  // One tap: move the headset to this PC (POST /api/switch). Busy offers a Replace per slot; never guesses.
+  function switchHere(replace) {
+    if (!canUseHere) return
+    var label = ""
+    for (var i = 0; replace && busySlots && i < busySlots.length; i++) if (busySlots[i].address === replace) label = busySlots[i].label
+    busySlots = null
+    replacing = null
+    var here = hereAddress
+    pending = {action: "connect", address: here, name: nameOf(deviceFor(here)) || "This PC", replace: replace || "", replaceName: label, here: true}
+    notice = {tone: "pending", text: replace ? messages.replacing.replace("{label}", label || "device") : messages.pending}
+    var body = {source: "omarchy", request_id: Math.random().toString(36).slice(2, 10)}
+    if (replace) body.replace = replace
+    request("POST", "/api/switch", body, function(err, json) {
+      m.pending = null
+      if (json && json.ok && json.verified) {
+        var order = m.slotOrder.slice()
+        var at = replace ? order.indexOf(replace) : order.indexOf(null)
+        if (at >= 0 && order.indexOf(here) < 0) { order[at] = here; m.slotOrder = order }
+        if (json.state) m.applySnapshot(json.state)
+        m.notice = {tone: "ok", text: m.messages.ok}
+      } else if (json && json.busy) {
+        m.busySlots = json.slots || []
+        m.notice = null
+      } else {
+        m.notice = {tone: "error", text: m.errorText(err, json && json.error_key ? json : null) + m.messages.retry_hint}
+      }
+    }, 160000)
+  }
   function mutate(body, p) {
     pending = p
     request("POST", "/api/override", body, function(err, json) {
       if (err || !json || json.ok === false) {
         m.pending = null
-        var why = err ? err.message : String((json && (json.error || json.message)) || "The change failed.")
-        m.notice = {tone: "error", text: why + (err && err.timeout ? " It may still have happened; refresh before retrying." : "")}
+        m.notice = {tone: "error", text: m.errorText(err, json)}
         return
       }
       if (!json.verified) {
         if (json.state) m.applySnapshot(json.state)
         m.pending = null
-        m.notice = {tone: "error", text: json.message || "Change not verified. Refresh before retrying."}
+        m.notice = {tone: "error", text: m.messages.errors.unverified}
         return
       }
       // Keep the confirmed device in the cup it was drawn in.

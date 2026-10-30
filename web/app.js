@@ -10,6 +10,7 @@ const popover=document.documentElement.classList.contains('popover'); // Mac men
 let state=null;          // last overview-shaped object we received
 let op=null;             // connect/disconnect in flight: {action,address,replace?}
 let choosing=null;       // address waiting for the user to pick a slot to replace
+let busySlots=null;      // Use here: both slots busy, the controller's {address,label} per slot to offer as Replace
 let refreshing=false;
 let slotOrder=[null,null];
 let receivedAt=0;
@@ -26,7 +27,7 @@ function api(path,data){
 // ---- Small helpers ----
 function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
 function icon(name){const ns='http://www.w3.org/2000/svg';const svg=document.createElementNS(ns,'svg');svg.setAttribute('class','i');svg.setAttribute('aria-hidden','true');const use=document.createElementNS(ns,'use');use.setAttribute('href','#i-'+name);svg.append(use);return svg;}
-function message(text,error=false){const m=$('message');m.replaceChildren();m.className='status'+(error===true?' error':'');if(!text)return;if(error!=='info')m.append(icon(error?'alert':'check'));m.append(node('span','',text));}
+function message(text,error=false){const m=$('message');m.replaceChildren();m.className='status'+(error===true?' error':error==='pending'?' pend':'');if(!text)return;if(error==='pending')m.append(node('span','led pending'));else if(error!=='info')m.append(icon(error?'alert':'check'));m.append(node('span','',text));}
 function live(){return !!(state&&state.reachable&&!state.cached);}
 // A live check just ran and no controller could read the headset: the slots shown are only last known.
 function unreachable(){return !!(state&&state.cached&&state.checked);}
@@ -64,7 +65,7 @@ function render(){
  headerStatus(`${occupied} of 2`);
  const battery=state.battery;$('battery-wrap').hidden=battery==null;
  if(battery!=null){$('battery').textContent=battery+'%';$('battery-wrap').setAttribute('aria-label',`Battery ${battery} percent`);$('battery-fill').setAttribute('width',String(Math.max(1,Math.round(11*battery/100))));}
- renderChoice();renderCups(reachable);renderDevices(reachable);renderControllers();renderNoise();syncControls();reportSize();
+ renderHere();renderChoice();renderCups(reachable);renderDevices(reachable);renderControllers();renderNoise();syncControls();reportSize();
 }
 
 // One line under the title: drop words (never the time) until it fits.
@@ -118,8 +119,19 @@ function renderCups(reachable){
 
 function pendingPill(text){const p=node('div','pill pending',text);p.setAttribute('aria-busy','true');return p;}
 function renderChoice(){
- const target=choosing&&deviceByAddress(choosing);$('choose').hidden=!target;
- if(target)$('choose-text').textContent=`Both slots are in use. Choose which connection ${target.name} replaces.`;
+ const target=choosing&&deviceByAddress(choosing),box=$('choose'),opts=$('choose-options');
+ box.hidden=!target&&!busySlots;box.classList.toggle('slots',!!busySlots);opts.replaceChildren();
+ if(busySlots){
+  $('choose-text').textContent=MSG.busy;
+  for(const s of busySlots){const b=node('button','btn connect',MSG.replace.replace('{label}',s.label));b.type='button';b.onclick=()=>useHere(s.address);opts.append(b);}
+ }else if(target)$('choose-text').textContent=`Both slots are in use. Choose which connection ${target.name} replaces.`;
+}
+// The one-tap primary action. It works from cached state too: the controller reads the headset itself first.
+function renderHere(){
+ const here=hereAddress(),b=$('use-here');$('here').hidden=!here;if(!here)return;
+ const mine=!!op?.here;b.classList.toggle('pressed',mine);b.setAttribute('aria-busy',String(mine));
+ b.textContent=mine?(op.replace?MSG.replacing.replace('{label}',op.label):MSG.pending):'Use here';
+ b.setAttribute('aria-label',mine?b.textContent:'Use here: move the headphones to this '+(state.here==='phone'?'phone':labels[state.here]||'device'));
 }
 
 function renderDevices(reachable){
@@ -237,10 +249,43 @@ function connect(address){
  choosing=address;message('');render();
  const first=document.querySelector('.cup.target');if(first)first.focus();
 }
-function cancelChoice(restoreFocus){const a=choosing;choosing=null;message('');render();if(restoreFocus&&a)focusRow(a);}
+function cancelChoice(restoreFocus){const a=choosing;choosing=null;busySlots=null;message('');render();if(restoreFocus&&a)focusRow(a);}
 function focusRow(address){const b=document.querySelector(`.device[data-address="${CSS.escape(address)}"] button`);if(b&&!b.disabled)b.focus();}
 $('cancel-replace').onclick=()=>cancelChoice(true);
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&choosing&&!document.querySelector('dialog[open]'))cancelChoice(true);});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&(choosing||busySlots)&&!document.querySelector('dialog[open]'))cancelChoice(true);});
+
+// ---- Use here: one tap moves the headset to this device (texts and flow: tests/switch-contract.json) ----
+const MSG={pending:'Connecting…',replacing:'Replacing {label}…',ok:'Playing on Bose 700',busy:'Both slots busy · choose one to replace',replace:'Replace {label}',retry_hint:' · tap to retry',
+ errors:{unreachable:'Couldn’t reach the headphones',timeout:'Took too long to switch',unverified:'The headphones didn’t confirm the switch',keep_one:'Can’t replace that one: keep a phone, PC or Mac connected',no_audio:'Connected, but no sound from the headphones',audio_not_moved:'Headphones connected, but PC audio didn’t switch'}};
+function hereAddress(){return state?roles()[state.here]:null;}
+function switchSource(){return window.Android?'android-app':state?.here==='mac'?'mac-popover':'web';}
+// Resolves with the controller's reply whatever its outcome; busy and error replies are answers, not exceptions.
+function switchCall(body){
+ if(window.Android)return new Promise(resolve=>{const id=String(++seq);const timer=setTimeout(()=>{bridgeCalls.delete(id);resolve({ok:false,error_key:'timeout'});},160000);
+  bridgeCalls.set(id,{resolve:r=>{clearTimeout(timer);resolve(r);}});const json=JSON.stringify(body);
+  if(typeof Android.switchHere==='function')Android.switchHere(id,json);else Android.request(id,'/api/switch',json);});
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),160000);
+ return fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:abort.signal}).then(r=>r.json())
+  .catch(e=>({ok:false,error_key:e.name==='AbortError'?'timeout':'unreachable'})).finally(()=>clearTimeout(timer));
+}
+async function useHere(replace){
+ const here=hereAddress();if(!here||op||anc.inFlight||anc.queued)return;
+ const label=replace?(busySlots?.find(s=>s.address===replace)?.label||'device'):null;
+ busySlots=null;choosing=null;op={action:'connect',address:here,replace:replace||undefined,label,here:true};
+ message(replace?MSG.replacing.replace('{label}',label):MSG.pending,'pending');render();
+ const body={source:switchSource(),request_id:Math.random().toString(36).slice(2,10)};if(replace)body.replace=replace;
+ let r;try{r=await switchCall(body);}catch(e){r=null;}
+ op=null;
+ if(r&&r.ok&&r.verified){
+  if(r.state)adopt(r.state);else try{adopt(await api('/api/overview'));}catch(e){}
+  const i=replace?slotOrder.indexOf(replace):slotOrder.indexOf(null);if(i>=0&&!slotOrder.includes(here))slotOrder[i]=here;
+  message(MSG.ok);
+ }else if(r&&r.busy){busySlots=Array.isArray(r.slots)?r.slots:[];message('');}
+ else message((MSG.errors[r?.error_key]||r?.error||MSG.errors.unreachable)+MSG.retry_hint,true);
+ render();pumpNoise();
+ if(busySlots)document.querySelector('#choose-options .btn')?.focus();
+}
+$('use-here').onclick=()=>useHere();
 
 // One mutation at a time; the busy item stays legible, the rest just disables.
 function syncControls(){
@@ -250,6 +295,7 @@ function syncControls(){
   else if(el.id==='noise-level'){el.disabled=!ok||!!op||!state?.noise||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
   else el.disabled=!ok||!!op||ancBusy;
  });
+ $('use-here').disabled=!!op||ancBusy;
  const rb=$('refresh');rb.disabled=refreshing||!!op||ancBusy;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
 }
 
