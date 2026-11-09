@@ -1,7 +1,7 @@
 {
   "version": 1,
   "about": "Tap-to-switch contract shared by all six front ends (Android app + tile, Omarchy popup, Mac menu bar, web dashboard, desk bar, couch). One tap on the device in hand moves the Bose there with a true status. Every front end's tests load this file and assert the same texts and outcomes. Roles in scenarios are abstract: 'here' is the device the tap happens on; 'other1' and 'other2' are the two other roles in the order phone, mac, pc with 'here' removed.",
-  "sources": ["android-app", "android-tile", "omarchy", "web", "mac-menu", "mac-popover", "desk", "couch"],
+  "sources": ["android-app", "android-tile", "omarchy", "web", "mac-menu", "mac-popover", "desk", "couch", "repair"],
   "labels": {"phone": "Phone", "mac": "Mac", "pc": "PC"},
   "api": {
     "switch": {
@@ -26,7 +26,8 @@
       "unverified": "The headphones didn’t confirm the switch",
       "keep_one": "Can’t replace that one: keep a phone, PC or Mac connected",
       "no_audio": "Connected, but no sound from the headphones",
-      "audio_not_moved": "Headphones connected, but PC audio didn’t switch"
+      "audio_not_moved": "Headphones connected, but PC audio didn’t switch",
+      "forgotten": "The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”"
     }
   },
   "rules": {
@@ -34,6 +35,7 @@
     "retry": "A connect that is not confirmed is retried (resent at most once after a fresh read shows the target absent and a slot free; on Linux the PC also pages BlueZ every 3 s for up to 45 s). Never resend through another peer while a reply is outstanding.",
     "both_busy": "Never guess which slot to drop: reply busy with both slots; the front end offers messages.replace per slot; the chosen address goes back as replace",
     "verified": "Success only after a fresh headset read shows 'here' connected; on Linux PC also the Bose A2DP sink is the default sink",
+    "forgotten": "Linux PC only: the link comes up but the headset refuses this PC's stored key (BlueZ logs AVDTP 'Permission denied (13)' and the control channel is refused). Reply forgotten at once; the PC then scans for up to 120 s and, only once the headset shows up in pairing mode, drops its stale key, pairs, trusts and runs the switch itself (one bose.switch line with source=repair).",
     "deadline_seconds": 150,
     "log": "One line per switch request on the executing controller: 'bose.switch source={source} id={id} target={target_label} replace={label_or_-} outcome={ok|busy|error:<key>} via={local|peer:<id>} total={seconds:.2f}s'. Device role labels only, never addresses or names."
   },

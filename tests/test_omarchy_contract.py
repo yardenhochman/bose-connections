@@ -6,7 +6,7 @@ class OmarchyContract(unittest.TestCase):
  """Runs tests/bose_model.qml offscreen: the Omarchy popup model through every switch-contract scenario."""
  @unittest.skipUnless(shutil.which('qml6'),'qml6 (Qt 6 declarative tools) not installed')
  def test_bose_model_follows_switch_contract(self):
-  env={k:v for k,v in os.environ.items() if k not in ('DISPLAY','WAYLAND_DISPLAY')}
+  env={k:v for k,v in os.environ.items() if k not in ('DISPLAY','WAYLAND_DISPLAY','QT_QPA_PLATFORMTHEME')}
   env.update(QT_QPA_PLATFORM='offscreen',QML_XHR_ALLOW_FILE_READ='1',QT_FORCE_STDERR_LOGGING='1')
   run=subprocess.run(['qml6',str(HERE/'bose_model.qml')],cwd=HERE,env=env,capture_output=True,text=True,timeout=120)
   out=run.stdout+run.stderr

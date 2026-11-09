@@ -34,7 +34,8 @@ QtObject {
     busy: "Both slots busy · choose one to replace", replace: "Replace {label}", retry_hint: " · tap to retry",
     errors: {unreachable: "Couldn’t reach the headphones", timeout: "Took too long to switch",
              unverified: "The headphones didn’t confirm the switch", keep_one: "Can’t replace that one: keep a phone, PC or Mac connected",
-             no_audio: "Connected, but no sound from the headphones", audio_not_moved: "Headphones connected, but PC audio didn’t switch"}
+             no_audio: "Connected, but no sound from the headphones", audio_not_moved: "Headphones connected, but PC audio didn’t switch",
+             forgotten: "The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”"}
   })
   readonly property string hereAddress: (snapshot.roles || {})[snapshot.here] || ""
   // Use here works from cached state too: the controller reads the headset itself first.

@@ -15,16 +15,17 @@ DISCONNECT_WAIT=4.0    # was 6 polls x 0.4 s plus six full status reads
 CONNECT_WAIT=10.0      # was 4 s ack + 8 polls x 0.5 s plus eight full status reads, from command send
 MAC_TEXT=re.compile(r'(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b')
 # Tap-to-switch contract (tests/switch-contract.json; a test keeps these equal to it).
-SOURCES=('android-app','android-tile','omarchy','web','mac-menu','mac-popover','desk','couch')
+SOURCES=('android-app','android-tile','omarchy','web','mac-menu','mac-popover','desk','couch','repair')
 LABELS={'phone':'Phone','mac':'Mac','pc':'PC'}
 MESSAGES={'pending':'Connecting…','replacing':'Replacing {label}…','ok':'Playing on Bose 700','busy':'Both slots busy · choose one to replace',
     'replace':'Replace {label}','retry_hint':' · tap to retry','errors':{'unreachable':'Couldn’t reach the headphones','timeout':'Took too long to switch',
     'unverified':'The headphones didn’t confirm the switch','keep_one':'Can’t replace that one: keep a phone, PC or Mac connected',
-    'no_audio':'Connected, but no sound from the headphones','audio_not_moved':'Headphones connected, but PC audio didn’t switch'}}
+    'no_audio':'Connected, but no sound from the headphones','audio_not_moved':'Headphones connected, but PC audio didn’t switch','forgotten':'The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”'}}
 REQUEST_ID=re.compile(r'[A-Za-z0-9_-]{1,32}')
 SWITCH_DEADLINE=150.0  # contract rules.deadline_seconds
 PAGE_WAIT=45.0;PAGE_GAP=3.0;SINK_WAIT=6.0  # Linux: page BlueZ every 3 s for up to 45 s; wait up to 6 s for the sink per recovery step
 RESEND_MIN=30.0  # start a resend only with this much of the deadline left (worst-case connect)
+REPAIR_WAIT=120.0  # how long the PC waits for the headset to enter pairing mode after a refused key
 COST=dict(page=17,a2dp=12,relink=25,restart=17)  # worst-case seconds of a blocking step: start it only when it can finish in time
 A2DP_SINK='0000110b-0000-1000-8000-00805f9b34fb'
 class HeadsetUnreachable(ProtocolError):
@@ -99,6 +100,34 @@ class Audio:
         try:return json.loads((Path(os.environ.get('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'))/'playback-state.json').read_text()).get('state')!='stopped'
         except (OSError,ValueError,AttributeError):return True
     def restart_audio(self):self.run(['systemctl','--user','restart','wireplumber'],15)
+    def key_refused(self,since):
+        """BlueZ logged an AVDTP refusal from the headset since `since` (epoch s). Only meaningful after this PC's page
+        brought the link up: btmon 2026-11-09 showed the headset rejecting the stored key ('Pairing Not Allowed'), then
+        refusing every profile (AVDTP 111 or 13, HFP 111, control channel 111). Full slots refuse the link itself instead."""
+        code,out,_=self.run(['journalctl','-u','bluetooth','--since','@%d'%int(since),'-o','cat','--no-pager','-q'],6)
+        return code==0 and any('avdtp' in line and self.headset in line.upper() and ('Permission denied (13)' in line or 'Connection refused (111)' in line)
+                               for line in out.splitlines())
+    def prop(self,name):return self.run(['busctl','get-property','org.bluez',self.path,'org.bluez.Device1',name])
+    def repair(self,wait=REPAIR_WAIT):
+        """Re-pair, but only once the headset answers a scan (it is in pairing mode): drop the stale key, pair (just works), trust."""
+        adapter=self.path.rsplit('/',1)[0];end=time.monotonic()+wait
+        scan=subprocess.Popen(['bluetoothctl','--timeout',str(int(wait)+5),'scan','on'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            while self.prop('RSSI')[0]!=0:
+                if time.monotonic()>end:return False
+                time.sleep(.5)
+            self.run(['busctl','call','org.bluez',adapter,'org.bluez.Adapter1','RemoveDevice','o',self.path])
+            while self.prop('RSSI')[0]!=0:  # the scan finds it again as a new device
+                if time.monotonic()>end:return False
+                time.sleep(.3)
+            self.run(['bluetoothctl','--agent','NoInputNoOutput','--timeout','30','pair',self.headset],40)
+            if self.prop('Paired')[1]!='b true':return False
+            self.run(['busctl','set-property','org.bluez',self.path,'org.bluez.Device1','Trusted','b','true'])
+            return True
+        finally:
+            scan.terminate()
+            try:scan.wait(5)
+            except subprocess.TimeoutExpired:scan.kill()
 def page_until_linked(audio,end):
     """Page the headset from BlueZ every PAGE_GAP s for up to PAGE_WAIT s while this PC has no link."""
     stop=min(time.monotonic()+PAGE_WAIT,end);busy=False
@@ -144,6 +173,7 @@ class Controller:
         self.probes={};self.probe_lock=threading.Lock();self.snapshot_lock=threading.Lock()
         self.last_overview=None;self.ident_ok=False
         self.switch_lock=threading.Lock()  # one switch or connection change at a time; a second one waits, then reads afresh
+        self.repair_lock=threading.Lock();self.repairing=False
         self.audio=None  # Linux sink control for /api/switch: None = detect, False = none, or an Audio-like object (tests)
     def cached_overview(self):
         try:
@@ -503,11 +533,30 @@ class Controller:
             if 'replace' in data and not isinstance(data['replace'],str):raise ValueError('Invalid replace address')
             if data.get('replace'):mac_bytes(data['replace'])
             with self.switch_lock:
+                wall=time.time()
                 try:result=self.switch(data,info)
-                except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)
+                except Exception as e:
+                    key=error_key(e) if error_key(e)!='busy' else 'unverified'
+                    if info.get('paged_unreadable') and key=='unreachable' and self.key_forgotten(wall-1):key='forgotten';self.start_repair()
+                    result=error_reply(key,e)
             outcome='ok' if result.get('ok') else 'busy' if result.get('busy') else 'error:'+result['error_key']
             return result
         finally:self.log_switch(source,rid,info,outcome,start)
+    def key_forgotten(self,since):
+        audio=self.switch_audio()
+        return bool(audio and getattr(audio,'key_refused',None) and audio.key_refused(since))
+    def start_repair(self):
+        """Background: wait for pairing mode, re-pair, then run the switch once (source=repair). One at a time."""
+        with self.repair_lock:
+            if self.repairing:return
+            self.repairing=True
+        def run():
+            try:
+                if self.switch_audio().repair():self.switch_request(dict(source='repair'))
+            except Exception as e:TIMING.warning('bose.repair failed: %s',MAC_TEXT.sub('device',str(e)))
+            finally:
+                with self.repair_lock:self.repairing=False
+        threading.Thread(target=run,daemon=True).start()
     def switch_audio(self):
         if self.audio is None:
             self.audio=Audio(self.config['headset'],self.config.get('adapter','hci0')) if sys.platform.startswith('linux') and shutil.which('pactl') else False
@@ -534,6 +583,7 @@ class Controller:
         if not view.get('reachable') and audio:
             # No controller reaches the headset: this PC pages it from BlueZ, then reads again.
             page_until_linked(audio,end);view=self.overview(budget=left());check_time('Read after paging')
+            info['paged_unreadable']=not view.get('reachable')  # linked, yet the headset refuses even its control channel
         if not view.get('reachable'):raise SwitchError('unreachable','No controller can read the headset')
         held={d['address'] for d in self.held(view)}
         if target in held:return self.switch_done(view,end)

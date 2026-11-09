@@ -383,6 +383,7 @@ class FakeAudio:
  def drop(self):return ''
  def in_use(self):return True
  def restart_audio(self):pass
+ def key_refused(self,since):return False
 class SwitchTests(unittest.TestCase):
  def setUp(self):
   self.clock=Clock()
@@ -555,6 +556,25 @@ class SwitchTests(unittest.TestCase):
   pc,phone,h=self.rig([PHONE],['unreachable'])
   result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
   self.assertEqual(result['error_key'],'unreachable');self.assertGreaterEqual(pc.audio.pages,10);self.assertLessEqual(self.clock.now-1000,controller.PAGE_WAIT+1)
+ def test_refused_key_replies_forgotten_and_starts_one_repair(self):
+  # 2026-11-09: the link comes up, the headset refuses the PC's stored key; reply at once and re-pair in the background.
+  pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;repairs=[]
+  pc.audio.page=lambda:'';pc.audio.linked=lambda:True  # the page brings the link up; reads still fail
+  pc.start_repair=lambda:repairs.append(1)
+  result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual((result['error_key'],result['error']),('forgotten',controller.MESSAGES['errors']['forgotten']))
+  self.assertIn('outcome=error:forgotten',line);self.assertEqual(repairs,[1])
+ def test_refused_profiles_without_a_link_stay_unreachable(self):
+  # Full slots refuse the link itself: no link, so no re-pair even when BlueZ logged refusals.
+  pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;repairs=[];pc.start_repair=lambda:repairs.append(1)
+  result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
+  self.assertEqual((result['error_key'],repairs),('unreachable',[]))
+ def test_repair_runs_the_switch_once_after_pairing(self):
+  pc,phone,h=self.rig([PHONE],[]);runs=[];pc.audio.repair=lambda:True;pc.switch_request=lambda data:runs.append(data)
+  with patch('controller.threading.Thread') as thread:
+   pc.start_repair();pc.start_repair()  # the second call is ignored while the first runs
+   self.assertEqual(thread.call_count,1);thread.call_args.kwargs['target']()
+  self.assertEqual(runs,[{'source':'repair'}]);self.assertFalse(pc.repairing);pc.status_pool.shutdown(wait=True)
  def test_invalid_switch_requests_are_refused_and_logged_once(self):
   pc,phone,h=self.rig([PHONE],[])
   for body in ({},{'source':'tv'},{'source':'web','extra':1},{'source':'web','request_id':'has space'},{'source':'web','replace':5},{'source':'web','replace':'nope'}):

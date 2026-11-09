@@ -161,11 +161,18 @@ reply shapes and scenarios every front end is tested against.
    to 45 s). It then waits for the headset's A2DP sink, recovering step by step
    (select A2DP, reconnect this PC's link, restart WirePlumber only while playback is
    stopped), and makes it the default sink with a read-back. macOS routes audio itself.
-5. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
+5. **Forgotten pairing (Linux PC).** If this PC's page brings the link up but the headset still refuses
+   everything, including its control channel, and BlueZ logged an AVDTP refusal (111 or 13) during the attempt, the
+   headset has dropped this PC's link key. Seen 2026-11-07 to 11-09: btmon showed the stored key rejected, then
+   "Pairing Not Allowed". Full slots look different: the headset refuses the link itself. The reply is `forgotten`
+   ("The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”") within seconds. The PC
+   then scans for up to 120 s. Only when the headset answers in pairing mode does it drop the stale key, pair (just
+   works), trust, and run the switch itself (`bose.switch source=repair`). Holding the button is the only manual step.
+6. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
    and the web and Omarchy clients wait 160 s. Success:
    `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
    `{ok:false, error_key, error:<contract text>, detail:<raw reason>}` with keys
-   `unreachable`, `timeout`, `unverified`, `keep_one`, `no_audio`, `audio_not_moved`.
+   `unreachable`, `timeout`, `unverified`, `keep_one`, `no_audio`, `audio_not_moved`, `forgotten`.
 
 `POST /api/override` also accepts optional `source` and `request_id` (absent = `unknown`),
 and its connect/disconnect failures now carry `error_key` and the contract `error` text
@@ -270,7 +277,7 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 73 tests use simulated transports and have no hardware side effects. Seventeen run
+The 76 tests use simulated transports and have no hardware side effects. Seventeen run
 `/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
 Linux sink step and relayed through an Android-shaped phone, with a fake clock and a fake `Audio`. They check texts, connect
 counts, the final slots, the default sink and the single `bose.switch` log line.

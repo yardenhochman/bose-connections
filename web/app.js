@@ -36,6 +36,8 @@ function roleOf(address){const r=roles();return roleIds.find(k=>r[k]===address);
 function deviceIcon(d){const role=roleOf(d.address);if(role==='pc')return 'desktop';if(role==='phone')return 'phone';if(role==='mac')return 'laptop';const n=(d.name||'').toLowerCase();if(/\btv\b|television/.test(n))return 'tv';if(/phone|pixel|galaxy|iphone/.test(n))return 'phone';if(/mac|book|laptop/.test(n))return 'laptop';if(/\bpc\b|desktop/.test(n))return 'desktop';return 'device';}
 function deviceByAddress(a){return state?.devices?.find(d=>d.address===a);}
 function nameOf(a){return deviceByAddress(a)?.name||'device';}
+// Older than today: say the day too, so a days-old slot view never reads as current.
+function stamp(epoch){const d=new Date(epoch*1000);return d.toDateString()===new Date().toDateString()?clock(epoch):d.toLocaleDateString([],{weekday:'short',day:'numeric',month:'short'})+' '+clock(epoch);}
 function clock(epoch){return new Date(epoch*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 function ago(){const t=state?.observed?state.observed*1000:receivedAt;const s=Math.max(0,(Date.now()-t)/1000);if(s<60)return 'just now';const m=Math.round(s/60);return m<60?`${m} min ago`:`at ${clock(t/1000)}`;}
 
@@ -71,7 +73,7 @@ function render(){
 // One line under the title: drop words (never the time) until it fits.
 function headerStatus(slots){
  const count=$('slot-count'),status=$('headset-status'),sub=count.parentElement;
- const known='last known '+(state.observed?clock(state.observed):'earlier');
+ const known='last known '+(state.observed?stamp(state.observed):'earlier');
  const forms=unreachable()?[['','Not reachable · '+known],['',known]]:state.cached?[[slots,known]]
   :state.reachable?[[slots+' connected','Live · '+ago()],[slots,'Live · '+ago()],[slots,'Live']]:[[slots,'Headset not reachable']];
  const line=parseFloat(getComputedStyle(sub).lineHeight)||18;
@@ -256,7 +258,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&(choosing||busySlot
 
 // ---- Use here: one tap moves the headset to this device (texts and flow: tests/switch-contract.json) ----
 const MSG={pending:'Connecting…',replacing:'Replacing {label}…',ok:'Playing on Bose 700',busy:'Both slots busy · choose one to replace',replace:'Replace {label}',retry_hint:' · tap to retry',
- errors:{unreachable:'Couldn’t reach the headphones',timeout:'Took too long to switch',unverified:'The headphones didn’t confirm the switch',keep_one:'Can’t replace that one: keep a phone, PC or Mac connected',no_audio:'Connected, but no sound from the headphones',audio_not_moved:'Headphones connected, but PC audio didn’t switch'}};
+ errors:{unreachable:'Couldn’t reach the headphones',timeout:'Took too long to switch',unverified:'The headphones didn’t confirm the switch',keep_one:'Can’t replace that one: keep a phone, PC or Mac connected',no_audio:'Connected, but no sound from the headphones',audio_not_moved:'Headphones connected, but PC audio didn’t switch',forgotten:'The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”'}};
 function hereAddress(){return state?roles()[state.here]:null;}
 function switchSource(){return window.Android?'android-app':state?.here==='mac'?'mac-popover':'web';}
 // Resolves with the controller's reply whatever its outcome; busy and error replies are answers, not exceptions.

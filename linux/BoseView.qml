@@ -32,11 +32,17 @@ FocusScope {
     e.accepted = true
   }
 
+  // " 5 min ago" / " 3 h ago" / " 6 d ago" for a cached snapshot, so a stale slot view is never mistaken for live.
+  function age(observed) {
+    if (!observed) return ""
+    var s = Math.max(0, Date.now() / 1000 - observed)
+    return s < 3600 ? " " + Math.max(1, Math.round(s / 60)) + " min ago" : s < 86400 ? " " + Math.round(s / 3600) + " h ago" : " " + Math.round(s / 86400) + " d ago"
+  }
   function statusText() {
     if (model.helperDown) return "Helper not running"
     if (!model.loaded) return "Checking…"
     var n = model.connectedCount + " of 2 connected"
-    if (cached) return (model.loading ? "Checking… · last known " : "Last known · ") + n
+    if (cached) return (model.loading ? "Checking… · last known " : "Last known" + age(snap.observed) + " · ") + n
     if (!snap.reachable) return model.loading ? "Checking…" : "Headset unavailable"
     return (model.loading ? "Refreshing · " : "Live · ") + n
   }

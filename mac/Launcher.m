@@ -4,7 +4,7 @@
 static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@"http://127.0.0.1:8847/?view=popover";
 // Texts of tests/switch-contract.json (checked verbatim by tests/test_mac_contract.py).
 static NSString *const BosePending=@"Connecting…",*const BoseReplacing=@"Replacing {label}…",*const BoseOk=@"Playing on Bose 700",*const BoseBusy=@"Both slots busy · choose one to replace",*const BoseReplace=@"Replace {label}",*const BoseRetryHint=@" · tap to retry";
-static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*const BoseErrTimeout=@"Took too long to switch",*const BoseErrUnverified=@"The headphones didn’t confirm the switch",*const BoseErrKeepOne=@"Can’t replace that one: keep a phone, PC or Mac connected",*const BoseErrNoAudio=@"Connected, but no sound from the headphones",*const BoseErrAudioNotMoved=@"Headphones connected, but PC audio didn’t switch";
+static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*const BoseErrTimeout=@"Took too long to switch",*const BoseErrUnverified=@"The headphones didn’t confirm the switch",*const BoseErrKeepOne=@"Can’t replace that one: keep a phone, PC or Mac connected",*const BoseErrNoAudio=@"Connected, but no sound from the headphones",*const BoseErrAudioNotMoved=@"Headphones connected, but PC audio didn’t switch",*const BoseErrForgotten=@"The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”";
 @interface WeakScript : NSObject <WKScriptMessageHandler>
 @property (weak) id<WKScriptMessageHandler> target;
 @end
@@ -219,7 +219,7 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
 - (void)refreshClicked:(id)sender {[self refreshMenu];}
 - (void)openDashboard:(id)sender {[self.popover performClose:nil];[self showWindow];}
 - (NSString *)failureText:(NSDictionary *)json error:(NSString *)error {
- NSDictionary *texts=@{@"unreachable":BoseErrUnreachable,@"timeout":BoseErrTimeout,@"unverified":BoseErrUnverified,@"keep_one":BoseErrKeepOne,@"no_audio":BoseErrNoAudio,@"audio_not_moved":BoseErrAudioNotMoved};
+ NSDictionary *texts=@{@"unreachable":BoseErrUnreachable,@"timeout":BoseErrTimeout,@"unverified":BoseErrUnverified,@"keep_one":BoseErrKeepOne,@"no_audio":BoseErrNoAudio,@"audio_not_moved":BoseErrAudioNotMoved,@"forgotten":BoseErrForgotten};
  NSString *key=json[@"error_key"];NSString *text=[key isKindOfClass:[NSString class]]?texts[key]:nil;
  if(!text&&[json[@"error_key"] isEqual:@"busy"])text=BoseBusy;
  if(!text)text=[error containsString:@"timed out"]?BoseErrTimeout:BoseErrUnreachable;

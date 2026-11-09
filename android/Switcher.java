@@ -7,7 +7,7 @@ import java.util.*;
 public class Switcher {
  static final long DEADLINE_MS=150000;
  static final long RESEND_MIN_MS=30000; // start a resend only with this much of the deadline left (worst-case connect)
- static final List<String> SOURCES=Arrays.asList("android-app","android-tile","omarchy","web","mac-menu","mac-popover","desk","couch");
+ static final List<String> SOURCES=Arrays.asList("android-app","android-tile","omarchy","web","mac-menu","mac-popover","desk","couch","repair");
  static final Map<String,String> MESSAGES=new LinkedHashMap<>();
  static{
   MESSAGES.put("pending","Connecting…");MESSAGES.put("replacing","Replacing {label}…");MESSAGES.put("ok","Playing on Bose 700");
@@ -15,6 +15,7 @@ public class Switcher {
   MESSAGES.put("errors.unreachable","Couldn’t reach the headphones");MESSAGES.put("errors.timeout","Took too long to switch");
   MESSAGES.put("errors.unverified","The headphones didn’t confirm the switch");MESSAGES.put("errors.keep_one","Can’t replace that one: keep a phone, PC or Mac connected");
   MESSAGES.put("errors.no_audio","Connected, but no sound from the headphones");MESSAGES.put("errors.audio_not_moved","Headphones connected, but PC audio didn’t switch");
+  MESSAGES.put("errors.forgotten","The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”");
  }
  static final Map<String,String> LABELS=new HashMap<>();
  static{LABELS.put("phone","Phone");LABELS.put("mac","Mac");LABELS.put("pc","PC");}
