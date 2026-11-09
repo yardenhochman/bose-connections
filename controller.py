@@ -583,7 +583,7 @@ class Controller:
             audio=self.switch_audio()
             for attempt in range(REPAIR_READS):
                 if not audio.linked():
-                    try:page_until_linked(audio,time.monotonic()+15)
+                    try:page_until_linked(audio,time.monotonic()+COST['page']+PAGE_GAP+15)  # room for two pages
                     except SwitchError:pass
                 try:result=self.switch({k:v for k,v in data.items() if k!='replace'},info)
                 except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)

@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-import unittest,re
+import unittest,re,time
 import threading
 import tempfile,json
 from unittest.mock import patch
@@ -597,9 +597,12 @@ class SwitchTests(unittest.TestCase):
    return dict(ok=True,verified=True,message=controller.MESSAGES['ok'],state={})
   pc.switch=switch;links=iter([True,False,True]);pages=[]
   pc.audio.linked=lambda:next(links,True);pc.audio.page=lambda:pages.append(1) or ''
-  with patch('controller.time.sleep',lambda s:None):result,line,_=self.run_switch(pc,{'source':'omarchy'})
+  budgets=[];real=controller.page_until_linked
+  def paging(audio,end):budgets.append(end-time.monotonic());return real(audio,end)
+  with patch('controller.time.sleep',lambda s:None),patch('controller.page_until_linked',paging):result,line,_=self.run_switch(pc,{'source':'omarchy'})
   pc.status_pool.shutdown(wait=True)
-  self.assertTrue(result['ok']);self.assertEqual((len(calls),given),(4,[[PHONE]]));self.assertTrue(pages)
+  self.assertTrue(result['ok']);self.assertEqual((len(calls),given),(4,[[PHONE]]))
+  self.assertTrue(budgets and min(budgets)>=controller.COST['page'],'a pass after a dropped link must get a deadline page_until_linked accepts')
  def test_pairing_action_needs_a_known_controller_and_reports_who_was_connected(self):
   pc,phone,h=self.rig([PHONE,MAC],[]);sent=[];h.pairing_mode=lambda:sent.append(1)
   with patch('controller.connection',lambda *a:nullcontext(h)):
