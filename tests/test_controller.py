@@ -584,6 +584,20 @@ class SwitchTests(unittest.TestCase):
   result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
   self.assertTrue(result['ok']);self.assertIn('outcome=ok',line)
   self.assertEqual((asked,given,repairs,len(calls)),([PC],[[PHONE]],[],2))
+ def test_same_tap_repair_retries_reads_while_the_device_list_settles(self):
+  pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;pc.audio.page=lambda:'';pc.audio.linked=lambda:True
+  given=[];calls=[]
+  pc.remote_pairing=lambda target:[PHONE];pc.audio.repair=lambda wait=0:True;pc.start_repair=lambda:None;pc.give_back=lambda held,here:given.append(held)
+  orig=pc.switch
+  def switch(data,info):
+   calls.append(data)
+   if len(calls)==1:return orig(data,info)
+   if len(calls)==2:raise controller.SwitchError('unreachable','Unexpected device information layout; refusing changes')
+   return dict(ok=True,verified=True,message=controller.MESSAGES['ok'],state={})
+  pc.switch=switch
+  with patch('controller.time.sleep',lambda s:None):result,line,_=self.run_switch(pc,{'source':'omarchy'})
+  pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertEqual((len(calls),given),(3,[[PHONE]]))
  def test_pairing_action_needs_a_known_controller_and_reports_who_was_connected(self):
   pc,phone,h=self.rig([PHONE,MAC],[]);sent=[];h.pairing_mode=lambda:sent.append(1)
   with patch('controller.connection',lambda *a:nullcontext(h)):

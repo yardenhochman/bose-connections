@@ -67,6 +67,8 @@ def request_tags(data,allowed=None):
     if 'request_id' in data and not (isinstance(rid,str) and REQUEST_ID.fullmatch(rid)):raise ValueError('Invalid request id')
     return source,rid
 
+REPAIR_READS=3  # switch passes after a same-tap re-pair while the headset's device list settles
+
 class Audio:
     """This PC's BlueZ link to the headset and its PipeWire sink (ported from the desk bar). Tests pass a fake with the same methods."""
     def __init__(self,headset,adapter='hci0'):
@@ -575,8 +577,13 @@ class Controller:
         here=str(self.config.get('roles',{}).get(self.config['id'],'')).upper()
         held=self.remote_pairing(here)
         if held is not None and self.switch_audio().repair(wait=30):
-            try:result=self.switch({k:v for k,v in data.items() if k!='replace'},info)
-            except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)
+            # Just after pairing the headset briefly sends a device list no controller accepts ("Unexpected device information
+            # layout", QA 2026-11-09): an unreachable read there is retried, not reported.
+            for attempt in range(REPAIR_READS):
+                try:result=self.switch({k:v for k,v in data.items() if k!='replace'},info)
+                except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)
+                if result.get('error_key')!='unreachable' or attempt==REPAIR_READS-1:break
+                time.sleep(1.5)
             self.give_back(held,here)
             return result
         self.start_repair()
