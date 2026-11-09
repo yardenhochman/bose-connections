@@ -173,6 +173,18 @@ reply shapes and scenarios every front end is tested against.
    until “Ready to connect”") within seconds, and the PC keeps scanning for up to 120 s. Once the headset answers in
    pairing mode, the PC re-pairs and runs the switch itself (`bose.switch source=repair`). The PC, Mac and Android
    controllers all accept `pairing`, for known controller addresses only.
+
+   QA 2026-11-09, recovery started directly with the PC already re-paired (a controlled repeat of step 5, since the
+   headset can't be made to forget on purpose): 4 of 8 runs played on the PC with the phone back, in 8–24 s. The
+   misses were the headset's, not a single code path. Right after pairing it sends a device list that neither the PC
+   nor the phone accepts, drops the new PC link about 4 s later, or refuses every profile on the new key (111). After
+   each pairing the switch therefore runs up to three passes, 1.5 s apart, and pages from the PC first when the link
+   is gone. A run that still fails ends as `unreachable` or `unverified`, and a normal tap a few seconds later
+   connects. Back-to-back pairing cycles made it worse, so that may be the test itself.
+   Normal taps, same day (PC dropped, phone kept, Android 0.7): 8 of 8 played on the PC, 3.0–10.9 s from the tap
+   (median 4 s). The spread is the headset's own connect; it took 2–9.6 s to confirm. Before 0.7, one tap in four
+   failed in 0.7 s, because the phone redialled the control channel 30 ms after closing it. 0.7 redials quick
+   refusals.
 6. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
    and the web and Omarchy clients wait 160 s. Success:
    `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
