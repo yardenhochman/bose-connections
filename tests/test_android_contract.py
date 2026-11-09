@@ -53,4 +53,29 @@ class AndroidContract(unittest.TestCase):
   self.assertIn('"android-tile"',(ROOT/'android/BoseTileService.java').read_text())
   self.assertIn('bose.switch source=',(ROOT/'android/Switcher.java').read_text())
 
+@unittest.skipUnless(JAVAC and JAVA,'JDK (javac/java) not available')
+class AndroidRelay(unittest.TestCase):
+ def test_listen_address_prefers_tunnel_over_carrier_cgnat(self):
+  with tempfile.TemporaryDirectory(prefix='bose-android-net-') as tmp:
+   build=subprocess.run([JAVAC,'-encoding','UTF-8','-d',tmp,str(ROOT/'android/Tailnet.java'),str(ROOT/'tests/android/TailnetTest.java')],capture_output=True,text=True)
+   self.assertEqual(build.returncode,0,build.stderr)
+   run=subprocess.run([JAVA,'-cp',tmp,'local.bose.connections.TailnetTest'],capture_output=True,text=True)
+   self.assertEqual(run.returncode,0,run.stdout+run.stderr);self.assertNotIn('FAIL',run.stdout)
+
+class AndroidSource(unittest.TestCase):
+ core=(ROOT/'android/Core.java').read_text()
+ def test_pairing_action_refuses_unknown_targets_before_bluetooth(self):
+  head=self.core[self.core.index('static JSONObject action(Context c,JSONObject data,long preludeMs'):]
+  self.assertLess(head.index('pairingTarget(c,who)'),head.index('open(c)'),'unknown pairing targets must be refused before opening the headset')
+  self.assertIn('out.write(new byte[]{4,8,5,1,1})',self.core)  # BMAP 4.8 START, payload 01, as protocol.py pairing_mode
+  self.assertIn('put("held",',self.core)
+ def test_bmap_dials_channel_8(self):
+  self.assertIn('BMAP_CHANNEL=8',self.core);self.assertIn('getMethod("createRfcommSocket",int.class)',self.core)
+ def test_relay_starts_on_boot_update_and_tile(self):
+  manifest=(ROOT/'android/AndroidManifest.xml').read_text()
+  for needed in ('RECEIVE_BOOT_COMPLETED','android.intent.action.BOOT_COMPLETED','android.intent.action.MY_PACKAGE_REPLACED','.RelayStarter'):self.assertIn(needed,manifest)
+  self.assertIn('RelayStarter.start(this)',(ROOT/'android/BoseTileService.java').read_text())
+  relay=(ROOT/'android/RelayService.java').read_text()
+  self.assertIn('foreground();return START_STICKY',relay)  # every startForegroundService call is answered
+
 if __name__=='__main__':unittest.main()

@@ -22,7 +22,7 @@ public class Core {
  static final ExecutorService STATUS_POOL=Executors.newFixedThreadPool(3);
  static final Map<String,Future<JSONObject>> PROBES=new HashMap<>();
  static final String HEADSET="";
- static final UUID BMAP=UUID.fromString("00000000-deca-fade-deca-deafdecacaff");
+ static final UUID BMAP=UUID.fromString("00000000-deca-fade-deca-deafdecacaff");static final int BMAP_CHANNEL=8;
  static JSONObject config(Context c)throws Exception{
   File f=new File(c.getFilesDir(),"config.json");
   if(f.exists())try(FileInputStream in=new FileInputStream(f)){return new JSONObject(read(in,65536));}
@@ -48,9 +48,15 @@ public class Core {
    String headset=config(c).optString("headset",HEADSET);
    if(headset.isEmpty())throw new IOException("Choose your headset in Settings → Set up controller links");
    address(headset);BluetoothDevice d=a.getRemoteDevice(headset);
-   socket=d.createRfcommSocketToServiceRecord(BMAP);
+   socket=socketFor(d,config(c).optInt("channel",BMAP_CHANNEL));
    expiry=timer.schedule(()->{try{socket.close();}catch(Exception ignored){}},10,TimeUnit.SECONDS);
    try{socket.connect();expiry.cancel(false);in=socket.getInputStream();out=socket.getOutputStream();}catch(Exception e){close();throw e;}
+  }
+  /** BMAP answers on RFCOMM channel 8 (as on the PC and Mac). Its SDP UUID resolves to another Bose service (channel 14) that never
+   replies, so dial the channel; the UUID lookup is only a fallback if the platform hides createRfcommSocket(int). */
+  static BluetoothSocket socketFor(BluetoothDevice d,int channel)throws Exception{
+   try{return (BluetoothSocket)BluetoothDevice.class.getMethod("createRfcommSocket",int.class).invoke(d,channel);}
+   catch(ReflectiveOperationException hidden){android.util.Log.w("BoseTiming","RFCOMM channel API unavailable, using SDP lookup: "+hidden);return d.createRfcommSocketToServiceRecord(BMAP);}
   }
   static class ReadTimeout extends IOException {ReadTimeout(){super("No acknowledgement; verify state without repeating the command");}}
   byte[] exact(int n,long deadline)throws Exception {
@@ -98,6 +104,13 @@ public class Core {
    return new JSONObject().put("noise",noise).put("devices",devices).put("battery",battery).put("capacity",2).put("product","Bose 700");
   }
   void action(String action,String target)throws Exception{byte[] a=address(target);try{if(action.equals("connect")){byte[] p=new byte[7];System.arraycopy(a,0,p,1,6);request(4,1,5,p,7,1000);}else if(action.equals("disconnect"))request(4,2,5,a,7,250);else throw new IOException("Unknown action");}catch(ReadTimeout unconfirmed){/* State verification is mandatory in Core.action. Do not resend. */}}
+  /** START pairing mode (BMAP 4.8, payload 01), as protocol.py pairing_mode: the headset may not acknowledge before it drops a link. */
+  void pairingMode()throws Exception{
+   out.write(new byte[]{4,8,5,1,1});out.flush();long deadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(1000);
+   try{for(int count=0;count<100;count++){byte[] h=exact(4,deadline);exact(h[3]&255,deadline);if((h[0]&255)!=4||(h[1]&255)!=8)continue;int kind=h[2]&15;if(kind==15)throw new IOException("Headset rejected pairing mode");if(kind==3||kind==6||kind==7)return;}}
+   catch(ReadTimeout unacknowledged){/* Pairing mode often starts without an acknowledgement. */}
+   catch(IOException e){if(!String.valueOf(e.getMessage()).startsWith("Incomplete")&&!String.valueOf(e.getMessage()).startsWith("Headset closed"))throw e;}
+  }
   public void close(){if(expiry!=null)expiry.cancel(false);timer.shutdownNow();try{if(socket!=null)socket.close();}catch(Exception ignored){}}
  }
  static JSONObject status(Context c){synchronized(LOCK){try(Client client=new Client(c)){JSONObject s=client.status();IDENT_OK=true;LOCAL_OK=true;return s.put("reachable",true).put("node","Phone").put("controller","phone").put("observed",System.currentTimeMillis()/1000.0);}catch(Exception e){LOCAL_OK=false;IDENT_OK=false;JSONObject o=error(e);try{o.put("node","Phone").put("controller","phone").put("devices",new JSONArray());}catch(Exception ignored){}return o;}}}
@@ -110,7 +123,7 @@ public class Core {
   if(data!=null){con.setRequestMethod("POST");con.setDoOutput(true);con.setRequestProperty("Content-Type","application/json");try(OutputStream out=con.getOutputStream()){out.write(data.toString().getBytes("UTF-8"));}}
   int code=con.getResponseCode();JSONObject result=new JSONObject(read(code>=400?con.getErrorStream():con.getInputStream(),65536));return result;
  }catch(Exception e){JSONObject o=error(data==null?e:new Switcher.Fail(e instanceof SocketTimeoutException?"timeout":"unreachable",e.getMessage()));try{o.put("transport",true).put("controller",p.optString("id")).put("node",p.optString("name"));}catch(Exception ignored){}return o;}finally{if(con!=null)con.disconnect();}}
- static boolean tailnet(String ip){try{String[] p=ip.split("\\.");return p.length==4&&Integer.parseInt(p[0])==100&&Integer.parseInt(p[1])>=64&&Integer.parseInt(p[1])<=127;}catch(Exception e){return false;}}
+ static boolean tailnet(String ip){return Tailnet.is(ip);}
  static JSONObject overview(Context c)throws Exception{return overview(c,"");}
  static boolean eligible(JSONObject state,String exclude)throws Exception{
   if(!state.optBoolean("reachable"))return false;JSONArray ds=state.optJSONArray("devices");
@@ -171,7 +184,9 @@ public class Core {
  }
  static Client open(Context c)throws Exception{try{return new Client(c);}catch(Exception e){IDENT_OK=false;throw new Unreachable(e);}}
  static JSONObject action(Context c,JSONObject data)throws Exception{return action(c,data,-1,null);}
+ static boolean pairingTarget(Context c,String address)throws Exception{JSONObject roles=config(c).optJSONObject("roles");if(roles==null)return false;for(Iterator<String> it=roles.keys();it.hasNext();)if(roles.getString(it.next()).equalsIgnoreCase(address))return true;return false;}
  static JSONObject action(Context c,JSONObject data,long preludeMs,String mode)throws Exception{
+  if(data.optString("action").equals("pairing")){String who=data.optString("address").toUpperCase(Locale.ROOT);address(who);if(!pairingTarget(c,who))throw new IOException("Pairing mode only for a known controller");}
   long start=System.nanoTime();Map<String,Long> t=new LinkedHashMap<>();if(preludeMs>=0)t.put("prelude",preludeMs);String outcome="ok",target="-";
   try{synchronized(LOCK){try(Client client=open(c)){
   if(data.getString("action").equals("noise")){
@@ -182,6 +197,13 @@ public class Core {
    JSONObject reply=new JSONObject().put("ok",true).put("verified",true).put("noise",result).put("message","Noise cancellation updated");
    if(fresh==null)return reply;
    return reply.put("state",fullState(c,fresh.put("noise",result).put("observed",System.currentTimeMillis()/1000.0),"phone",null));
+  }
+  if(data.getString("action").equals("pairing")){
+   // A peer controller whose key the headset dropped asks for pairing mode (controller.py recover_forgotten). Known controllers only.
+   String who=data.getString("address").toUpperCase(Locale.ROOT);
+   JSONObject before;try{long s0=System.nanoTime();before=client.status(false,!IDENT_OK);IDENT_OK=true;add(t,"before",s0);}catch(Exception e){IDENT_OK=false;throw e;}
+   target=label(c,who,before.getJSONArray("devices"));long s1=System.nanoTime();client.pairingMode();add(t,"command",s1);IDENT_OK=false;
+   return new JSONObject().put("ok",true).put("verified",false).put("held",new JSONArray(connected(before))).put("message","Pairing mode");
   }
   String a=data.getString("action");target=data.getString("address").toUpperCase(Locale.ROOT);String replace=data.optString("replace").toUpperCase(Locale.ROOT);address(target);if(!a.equals("connect")&&!a.equals("disconnect"))throw new IOException("Unknown action");
   JSONObject before;try{long s0=System.nanoTime();before=client.status(true,!IDENT_OK);IDENT_OK=true;add(t,"before",s0);}catch(Exception e){IDENT_OK=false;throw e;}

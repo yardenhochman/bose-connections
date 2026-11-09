@@ -39,6 +39,7 @@ public class BoseTileService extends TileService {
  // ---- Tile ----
  public void onStartListening(){
   super.onStartListening();
+  RelayStarter.start(this); // the panel is open: a good moment to revive a relay the system stopped
   boolean fresh=live()&&SystemClock.elapsedRealtime()-lastRead<30000;
   if(dialog==null&&!busy()&&!fresh)try{snapshot=Core.dispatch(this,"/api/cached",null,false);}catch(Exception e){snapshot=new JSONObject();}
   updateTile();

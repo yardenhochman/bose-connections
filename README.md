@@ -171,8 +171,8 @@ reply shapes and scenarios every front end is tested against.
    device that pairing mode dropped. Measured 2026-11-09 on the NC700: playing on the PC 21 s after the tap, phone back
    at 24.5 s. Without such a peer, the reply is `forgotten` ("The headphones forgot this PC · hold their Bluetooth button
    until “Ready to connect”") within seconds, and the PC keeps scanning for up to 120 s. Once the headset answers in
-   pairing mode, the PC re-pairs and runs the switch itself (`bose.switch source=repair`). The Python controllers (PC,
-   Mac) accept `pairing`; the Android relay does not yet.
+   pairing mode, the PC re-pairs and runs the switch itself (`bose.switch source=repair`). The PC, Mac and Android
+   controllers all accept `pairing`, for known controller addresses only.
 6. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
    and the web and Omarchy clients wait 160 s. Success:
    `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
@@ -253,9 +253,19 @@ empty for phone-only Bluetooth access.
 
 Alternatively, create a private config with `configure.py --id phone` and
 provision it into the installed app's `files/config.json` using Android `run-as`.
-The app's foreground service listens on its detected Tailscale interface while
-running and retains a notification. No boot receiver is installed. VPN rebinding,
-screen-off behavior and direct Bluetooth control remain experimental.
+The app's foreground service is the relay that the PC and Mac call (status, switches, `pairing`
+for a forgotten PC). It keeps a quiet notification and starts by itself after a reboot or an
+app update, and whenever the Quick Settings panel opens, once a connection code is set. It
+listens on the Tailscale tunnel (`tun*`). Carriers give mobile data addresses from the same
+100.64/10 range, so `rmnet*` addresses never count (`android/Tailnet.java`). The phone talks
+to the headset on RFCOMM channel 8, like the PC and Mac. The NC700's control UUID resolves to
+a different Bose service (channel 14) that never answers. Set `channel` in the private config
+to override it.
+
+Verified 2026-11-09 on the Galaxy S22 Ultra (0.6): the relay came back on its own after the
+update. From the PC over Tailscale, `/api/status` read the headset in 0.3–1 s, and a
+`pairing` request for an unknown address was refused without touching the headset. Pairing
+mode and switching through the phone were not run, because the headphones were in use.
 
 ### Android Quick Settings
 
@@ -282,7 +292,7 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 78 tests use simulated transports and have no hardware side effects. Seventeen run
+The 82 tests use simulated transports and have no hardware side effects. Seventeen run
 `/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
 Linux sink step and relayed through an Android-shaped phone, with a fake clock and a fake `Audio`. They check texts, connect
 counts, the final slots, the default sink and the single `bose.switch` log line.
