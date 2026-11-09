@@ -48,10 +48,19 @@ public class Core {
    String headset=config(c).optString("headset",HEADSET);
    if(headset.isEmpty())throw new IOException("Choose your headset in Settings → Set up controller links");
    address(headset);BluetoothDevice d=a.getRemoteDevice(headset);
-   socket=socketFor(d,config(c).optInt("channel",BMAP_CHANNEL));
-   expiry=timer.schedule(()->{try{socket.close();}catch(Exception ignored){}},10,TimeUnit.SECONDS);
-   try{socket.connect();expiry.cancel(false);in=socket.getInputStream();out=socket.getOutputStream();}catch(Exception e){close();throw e;}
+   expiry=timer.schedule(()->{try{if(socket!=null)socket.close();}catch(Exception ignored){}},10,TimeUnit.SECONDS);
+   // Reopening right after a close can be refused within milliseconds while the headset still holds the channel
+   // (logcat 2026-11-09 20:48:52: closed, redialled 30 ms later, refused in 3 ms). Redial such fast refusals a few times.
+   for(int attempt=0;;attempt++){
+    socket=socketFor(d,config(c).optInt("channel",BMAP_CHANNEL));long dialled=System.nanoTime();
+    try{socket.connect();break;}
+    catch(Exception e){try{socket.close();}catch(Exception ignored){}
+     if(attempt>=REDIALS||System.nanoTime()-dialled>TimeUnit.MILLISECONDS.toNanos(500)||expiry.isDone()){close();throw e;}
+     Thread.sleep(250);}
+   }
+   try{expiry.cancel(false);in=socket.getInputStream();out=socket.getOutputStream();}catch(Exception e){close();throw e;}
   }
+  static final int REDIALS=3;
   /** BMAP answers on RFCOMM channel 8 (as on the PC and Mac). Its SDP UUID resolves to another Bose service (channel 14) that never
    replies, so dial the channel; the UUID lookup is only a fallback if the platform hides createRfcommSocket(int). */
   static BluetoothSocket socketFor(BluetoothDevice d,int channel)throws Exception{

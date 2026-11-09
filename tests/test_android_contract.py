@@ -71,6 +71,9 @@ class AndroidSource(unittest.TestCase):
   self.assertIn('put("held",',self.core)
  def test_bmap_dials_channel_8(self):
   self.assertIn('BMAP_CHANNEL=8',self.core);self.assertIn('getMethod("createRfcommSocket",int.class)',self.core)
+ def test_fast_refusal_is_redialled(self):
+  # QA 2026-11-09: a redial 30 ms after a close was refused in 3 ms; only quick refusals retry, within the 10 s expiry.
+  self.assertIn('REDIALS=3',self.core);self.assertIn('TimeUnit.MILLISECONDS.toNanos(500)',self.core);self.assertIn('expiry.isDone()',self.core)
  def test_relay_starts_on_boot_update_and_tile(self):
   manifest=(ROOT/'android/AndroidManifest.xml').read_text()
   for needed in ('RECEIVE_BOOT_COMPLETED','android.intent.action.BOOT_COMPLETED','android.intent.action.MY_PACKAGE_REPLACED','.RelayStarter'):self.assertIn(needed,manifest)
