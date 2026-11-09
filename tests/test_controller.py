@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import unittest,re
 import threading
 import tempfile,json
@@ -560,7 +561,7 @@ class SwitchTests(unittest.TestCase):
   # 2026-11-09: the link comes up, the headset refuses the PC's stored key; reply at once and re-pair in the background.
   pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;repairs=[]
   pc.audio.page=lambda:'';pc.audio.linked=lambda:True  # the page brings the link up; reads still fail
-  pc.start_repair=lambda:repairs.append(1)
+  pc.start_repair=lambda:repairs.append(1);pc.remote_pairing=lambda target:None  # no peer reaches the headset
   result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
   self.assertEqual((result['error_key'],result['error']),('forgotten',controller.MESSAGES['errors']['forgotten']))
   self.assertIn('outcome=error:forgotten',line);self.assertEqual(repairs,[1])
@@ -569,6 +570,27 @@ class SwitchTests(unittest.TestCase):
   pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;repairs=[];pc.start_repair=lambda:repairs.append(1)
   result,_,_=self.run_switch(pc,{'source':'web'});pc.status_pool.shutdown(wait=True)
   self.assertEqual((result['error_key'],repairs),('unreachable',[]))
+ def test_forgotten_key_with_a_peer_repairs_in_the_same_tap(self):
+  pc,phone,h=self.rig([PHONE],['unreachable']);pc.audio.key_refused=lambda since:True;pc.audio.page=lambda:'';pc.audio.linked=lambda:True
+  asked=[];given=[];repairs=[];calls=[]
+  pc.remote_pairing=lambda target:asked.append(target) or [PHONE]
+  pc.audio.repair=lambda wait=0:True;pc.start_repair=lambda:repairs.append(1);pc.give_back=lambda held,here:given.append(held)
+  orig=pc.switch
+  def switch(data,info):
+   calls.append(data)
+   if len(calls)==1:return orig(data,info)  # the first pass hits the refused key
+   return dict(ok=True,verified=True,message=controller.MESSAGES['ok'],state={})
+  pc.switch=switch
+  result,line,_=self.run_switch(pc,{'source':'omarchy'});pc.status_pool.shutdown(wait=True)
+  self.assertTrue(result['ok']);self.assertIn('outcome=ok',line)
+  self.assertEqual((asked,given,repairs,len(calls)),([PC],[[PHONE]],[],2))
+ def test_pairing_action_needs_a_known_controller_and_reports_who_was_connected(self):
+  pc,phone,h=self.rig([PHONE,MAC],[]);sent=[];h.pairing_mode=lambda:sent.append(1)
+  with patch('controller.connection',lambda *a:nullcontext(h)):
+   h.reader=PHONE;reply=phone.local_action(dict(action='pairing',address=PC,source='repair'))
+   self.assertEqual((reply['ok'],sorted(reply['held']),sent),(True,sorted([PHONE,MAC]),[1]))
+   with self.assertRaises(ValueError):phone.local_action(dict(action='pairing',address=TV))
+  self.assertEqual(sent,[1]);pc.status_pool.shutdown(wait=True);phone.status_pool.shutdown(wait=True)
  def test_repair_runs_the_switch_once_after_pairing(self):
   pc,phone,h=self.rig([PHONE],[]);runs=[];pc.audio.repair=lambda:True;pc.switch_request=lambda data:runs.append(data)
   with patch('controller.threading.Thread') as thread:

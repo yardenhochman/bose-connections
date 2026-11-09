@@ -166,8 +166,13 @@ reply shapes and scenarios every front end is tested against.
    headset has dropped this PC's link key. Seen 2026-11-07 to 11-09: btmon showed the stored key rejected, then
    "Pairing Not Allowed". Full slots look different: the headset refuses the link itself. The reply is `forgotten`
    ("The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”") within seconds. The PC
-   then scans for up to 120 s. Only when the headset answers in pairing mode does it drop the stale key, pair (just
-   works), trust, and run the switch itself (`bose.switch source=repair`). Holding the button is the only manual step.
+   first asks each peer that still reaches the headset (`/api/action` with `action: "pairing"`, BMAP 4.8 START) to put
+   it into pairing mode. Then, in the same tap, it drops its stale key, pairs (just works), switches, and reconnects any
+   device that pairing mode dropped. Measured 2026-11-09 on the NC700: playing on the PC 21 s after the tap, phone back
+   at 24.5 s. Without such a peer, the reply is `forgotten` ("The headphones forgot this PC · hold their Bluetooth button
+   until “Ready to connect”") within seconds, and the PC keeps scanning for up to 120 s. Once the headset answers in
+   pairing mode, the PC re-pairs and runs the switch itself (`bose.switch source=repair`). The Python controllers (PC,
+   Mac) accept `pairing`; the Android relay does not yet.
 6. One 150 s deadline (`timeout`); reads and the relay timeout are bounded by the time left,
    and the web and Omarchy clients wait 160 s. Success:
    `{ok:true, verified:true, message:"Playing on Bose 700", state:<overview>}`. Failure:
@@ -277,7 +282,7 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 76 tests use simulated transports and have no hardware side effects. Seventeen run
+The 78 tests use simulated transports and have no hardware side effects. Seventeen run
 `/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
 Linux sink step and relayed through an Android-shaped phone, with a fake clock and a fake `Audio`. They check texts, connect
 counts, the final slots, the default sink and the single `bose.switch` log line.

@@ -120,8 +120,17 @@ class Audio:
             while self.prop('RSSI')[0]!=0:  # the scan finds it again as a new device
                 if time.monotonic()>end:return False
                 time.sleep(.3)
-            self.run(['bluetoothctl','--agent','NoInputNoOutput','--timeout','30','pair',self.headset],40)
-            if self.prop('Paired')[1]!='b true':return False
+            # bluetoothctl's own NoInputNoOutput agent accepts just-works (verified 2026-11-09); stop it as soon as Paired flips.
+            pair=subprocess.Popen(['bluetoothctl','--agent','NoInputNoOutput','--timeout','30','pair',self.headset],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            try:
+                stop=time.monotonic()+32
+                while self.prop('Paired')[1]!='b true':
+                    if time.monotonic()>stop or pair.poll() is not None and self.prop('Paired')[1]!='b true':return False
+                    time.sleep(.3)
+            finally:
+                pair.terminate()
+                try:pair.wait(5)
+                except subprocess.TimeoutExpired:pair.kill()
             self.run(['busctl','set-property','org.bluez',self.path,'org.bluez.Device1','Trusted','b','true'])
             return True
         finally:
@@ -377,6 +386,15 @@ class Controller:
             return dict(ok=True,verified=True,noise=result,state=state,message='Noise cancellation updated')
         action=data.get('action');target=data.get('address','').upper();replace=data.get('replace','').upper()
         mac_bytes(target)
+        if action=='pairing':
+            # Only for a configured controller whose key the headset dropped; returns who was connected, since pairing mode drops a device.
+            if target not in set(self.config.get('roles',{}).values()):raise ValueError('Pairing mode only for a known controller')
+            with self.lock:
+                with self.open_headset() as client:
+                    before=client.status(check_ident=not self.ident_ok);self.ident_ok=True
+                    info['target']=self.label(target,before['devices'])
+                    client.pairing_mode()
+            return dict(ok=True,verified=False,held=[d['address'] for d in before['devices'] if d['connected']],message='Pairing mode')
         if action not in ('connect','disconnect'):raise ValueError('Unknown action')
         if replace:mac_bytes(replace)
         with self.lock:
@@ -537,14 +555,38 @@ class Controller:
                 try:result=self.switch(data,info)
                 except Exception as e:
                     key=error_key(e) if error_key(e)!='busy' else 'unverified'
-                    if info.get('paged_unreadable') and key=='unreachable' and self.key_forgotten(wall-1):key='forgotten';self.start_repair()
-                    result=error_reply(key,e)
+                    if info.get('paged_unreadable') and key=='unreachable' and self.key_forgotten(wall-1):result=self.recover_forgotten(data,info,wall)
+                    else:result=error_reply(key,e)
             outcome='ok' if result.get('ok') else 'busy' if result.get('busy') else 'error:'+result['error_key']
             return result
         finally:self.log_switch(source,rid,info,outcome,start)
     def key_forgotten(self,since):
         audio=self.switch_audio()
         return bool(audio and getattr(audio,'key_refused',None) and audio.key_refused(since))
+    def remote_pairing(self,target):
+        """Ask each peer that can reach the headset to start pairing mode. Returns the addresses it saw connected, or None."""
+        for peer in self.config.get('peers',[]):
+            reply=self.peer_call(peer,'/api/action',dict(action='pairing',address=target,source='repair'),15)
+            if isinstance(reply,dict) and reply.get('ok'):return [a for a in reply.get('held',[]) if a!=target]
+        return None
+    def recover_forgotten(self,data,info,wall):
+        """The headset dropped this PC's key. With a peer's help: pairing mode, re-pair, switch, give back the dropped slot, all in
+        this tap. Without one: reply forgotten (hold the button) and keep waiting for pairing mode in the background."""
+        here=str(self.config.get('roles',{}).get(self.config['id'],'')).upper()
+        held=self.remote_pairing(here)
+        if held is not None and self.switch_audio().repair(wait=30):
+            try:result=self.switch({k:v for k,v in data.items() if k!='replace'},info)
+            except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)
+            self.give_back(held,here)
+            return result
+        self.start_repair()
+        return error_reply('forgotten','Headset refused this PC\'s key; waiting for pairing mode')
+    def give_back(self,held,here):
+        """Pairing mode drops a connected device: reconnect the ones that were connected before, while a slot is free."""
+        for address in held:
+            if address==here:continue
+            try:self.override(dict(action='connect',address=address,source='repair'),{},40)
+            except Exception as e:TIMING.warning('bose.repair reconnect failed: %s',MAC_TEXT.sub('device',str(e)))
     def start_repair(self):
         """Background: wait for pairing mode, re-pair, then run the switch once (source=repair). One at a time."""
         with self.repair_lock:

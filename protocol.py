@@ -50,6 +50,11 @@ class Client:
             self.buf.extend(data)
             if len(self.buf)>16384:raise ProtocolError('Invalid oversized Bluetooth response')
         raise ProtocolError('Headset did not acknowledge the command')
+    def pairing_mode(self):
+        """START pairing mode (4.8). Verified on the NC700 2026-11-09: discoverable within 4 s; it drops the other connected device."""
+        try:self.request(4,8,5,b'\x01',expected=(3,6,7),timeout=1)
+        except Exception as e:
+            if not (isinstance(e,socket.timeout) or (isinstance(e,ProtocolError) and 'acknowledge' in str(e))):raise
     def noise(self):return parse_noise(self.request(1,5))
     def write_noise(self,level,enabled):
         try:self.request(1,5,2,bytes([10-level,int(enabled)]),timeout=.25)
