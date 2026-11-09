@@ -578,11 +578,16 @@ class Controller:
         held=self.remote_pairing(here)
         if held is not None and self.switch_audio().repair(wait=30):
             # Just after pairing the headset briefly sends a device list no controller accepts ("Unexpected device information
-            # layout", QA 2026-11-09): an unreachable read there is retried, not reported.
+            # layout") and may drop the new link; a peer's connect then goes unconfirmed (QA 2026-11-09). So each pass first
+            # pages from this PC, which brought the link straight back, and an unreachable/unverified pass is retried.
+            audio=self.switch_audio()
             for attempt in range(REPAIR_READS):
+                if not audio.linked():
+                    try:page_until_linked(audio,time.monotonic()+15)
+                    except SwitchError:pass
                 try:result=self.switch({k:v for k,v in data.items() if k!='replace'},info)
                 except Exception as e:result=error_reply(error_key(e) if error_key(e)!='busy' else 'unverified',e)
-                if result.get('error_key')!='unreachable' or attempt==REPAIR_READS-1:break
+                if result.get('error_key') not in ('unreachable','unverified') or attempt==REPAIR_READS-1:break
                 time.sleep(1.5)
             self.give_back(held,here)
             return result

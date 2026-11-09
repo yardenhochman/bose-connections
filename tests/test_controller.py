@@ -593,11 +593,13 @@ class SwitchTests(unittest.TestCase):
    calls.append(data)
    if len(calls)==1:return orig(data,info)
    if len(calls)==2:raise controller.SwitchError('unreachable','Unexpected device information layout; refusing changes')
+   if len(calls)==3:raise controller.SwitchError('unverified','Change not verified')
    return dict(ok=True,verified=True,message=controller.MESSAGES['ok'],state={})
-  pc.switch=switch
+  pc.switch=switch;links=iter([True,False,True]);pages=[]
+  pc.audio.linked=lambda:next(links,True);pc.audio.page=lambda:pages.append(1) or ''
   with patch('controller.time.sleep',lambda s:None):result,line,_=self.run_switch(pc,{'source':'omarchy'})
   pc.status_pool.shutdown(wait=True)
-  self.assertTrue(result['ok']);self.assertEqual((len(calls),given),(3,[[PHONE]]))
+  self.assertTrue(result['ok']);self.assertEqual((len(calls),given),(4,[[PHONE]]));self.assertTrue(pages)
  def test_pairing_action_needs_a_known_controller_and_reports_who_was_connected(self):
   pc,phone,h=self.rig([PHONE,MAC],[]);sent=[];h.pairing_mode=lambda:sent.append(1)
   with patch('controller.connection',lambda *a:nullcontext(h)):
