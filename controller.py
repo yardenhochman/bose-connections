@@ -217,8 +217,13 @@ class Controller:
                 return state
             except Exception as e:
                 self.last_error=str(e)
-                state=dict(node=self.config['name'],controller=self.config['id'],reachable=False,error=str(e),devices=self.cache.get('devices',[]),stale=True)
-                if isinstance(e,NotLinked):state['link']=False
+                # The last read, marked stale: this controller is not reading now (current=False), and with no OS link its own
+                # device holds no slot, whatever that read said (2026-11-10: a stale row showed the PC connected after the Mac let go).
+                own=self.config.get('roles',{}).get(self.config['id'])
+                unlinked=isinstance(e,NotLinked)
+                devices=[dict(d,current=False,**({'connected':False} if unlinked and d.get('address')==own else {})) for d in self.cache.get('devices',[])]
+                state=dict(node=self.config['name'],controller=self.config['id'],reachable=False,error=str(e),devices=devices,stale=True)
+                if unlinked:state['link']=False
                 return state
     def peer_call(self,peer,path,data=None,timeout=None):
         parts=urlsplit(peer['url'])
@@ -280,7 +285,9 @@ class Controller:
                 for ident,name,job in jobs]
         valid=[s for s in states if s.get('reachable')]
         freshest=max(valid,key=lambda s:s.get('observed',0),default=None)
-        devices=(freshest or {}).get('devices',[])
+        # A controller that knows it has no link to the headset holds no slot, even if the headset's list still shows it.
+        unlinked={self.config.get('roles',{}).get(s['controller']) for s in states if s.get('link') is False}-{None}
+        devices=[dict(d,connected=False,current=False) if d.get('address') in unlinked else d for d in (freshest or {}).get('devices',[])]
         roles=dict(self.config.get('roles',{}))
         for state in valid:
             for d in state.get('devices',[]):
@@ -289,10 +296,7 @@ class Controller:
         if valid:self.store_snapshot(result);self.last_overview=(time.monotonic(),result)
         elif not wait_all:
             previous=self.cached_overview()
-            devices=previous['devices']
-            # A controller that knows it has no link to the headset holds no slot, whatever the snapshot says.
-            unlinked={self.config.get('roles',{}).get(s['controller']) for s in states if s.get('link') is False}
-            devices=[dict(d,connected=False,current=False) if d.get('address') in unlinked else d for d in devices]
+            devices=[dict(d,connected=False,current=False) if d.get('address') in unlinked else d for d in previous['devices']]
             result.update(devices=devices,observed=previous.get('observed'),cached=bool(devices),noise=previous.get('noise'),checked=time.time())
         return result
     @contextlib.contextmanager

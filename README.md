@@ -17,6 +17,8 @@ connection to replace when both Bluetooth slots are occupied.
 - macOS menu-bar icon that opens a compact popover; right-click for the native menu.
 - Optional authenticated controller-to-controller relay over Tailscale: an
   unconnected computer can send a request through a controller that reaches the headset.
+- A controller with no OS Bluetooth link never reports its own device connected, not in its stale `/api/status` rows and
+  not in the overview, even if the headset's list still shows it (2026-11-10).
 - Immediate last-known device list, followed by a live refresh. When no controller can read the
   headset, the dashboard says so and gives each controller's reason (not connected, app not
   running, no answer); a controller with no Bluetooth link never shows in a last-known slot.
@@ -147,6 +149,8 @@ reply shapes and scenarios every front end is tested against.
 
 1. A fresh read. Already connected here: success with no connect command.
 2. Both slots busy and no `replace`: `{ok:false, busy:true, error_key:"busy", error, slots:[{address,label}]}`.
+   The PC desk bar and couch (living-room-media) keep the phone instead: with the phone and one other device connected,
+   they release that device, then connect the PC (`rules.both_busy_desk`, `expect_desk` in the contract; since 2026-11-10).
    A `replace` counts only while both slots are still busy and that device still holds one.
 3. Otherwise connect through the same path as `/api/override` (local or one peer).
    If the connect is not confirmed, one fresh read decides: connected → success; target

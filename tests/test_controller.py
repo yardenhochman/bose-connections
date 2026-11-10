@@ -76,6 +76,20 @@ class Tests(unittest.TestCase):
   with patch('controller.sys.platform','linux'),patch('controller.subprocess.run') as run,patch('controller.connection') as connect:
    run.return_value.stdout='b false';result=c.local_status();self.assertFalse(result['reachable']);connect.assert_not_called()
    self.assertIs(result['link'],False)
+ def test_unlinked_status_never_reports_its_own_slot_from_the_last_read(self):
+  # 2026-11-10: /api/status said "not connected to this PC" yet listed the PC connected and current from its last read.
+  c=self.ctl();c.cache=dict(devices=[device(PC,True,True),device(PHONE,True)])
+  with patch('controller.sys.platform','linux'),patch('controller.subprocess.run') as run:
+   run.return_value.stdout='b false';result=c.local_status()
+  self.assertTrue(result['stale']);self.assertIs(result['link'],False)
+  self.assertEqual([(d['address'],d['connected'],d['current']) for d in result['devices']],[(PC,False,False),(PHONE,True,False)])
+ def test_live_overview_drops_the_slot_of_a_controller_with_no_link(self):
+  c=self.ctl();c.config['peers']=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')]
+  with patch.object(c,'local_status',return_value=dict(controller='pc',reachable=False,link=False,error='Headset is not connected to this PC',devices=[])),patch.object(c,'peer_call',return_value=dict(controller='phone',reachable=True,observed=9,devices=[device(PC,True),device(PHONE,True,True)])):
+   view=c.overview(wait_all=True)
+  self.assertTrue(view['reachable'])
+  self.assertEqual([(d['address'],d['connected']) for d in view['devices']],[(PC,False),(PHONE,True)])
+  c.status_pool.shutdown(wait=True)
  def test_unreachable_overview_drops_unlinked_slot_and_marks_live_check(self):
   c=self.ctl();c.config['peers']=[dict(id='phone',name='Phone',url='http://100.64.0.2:8848')]
   with tempfile.TemporaryDirectory() as folder:
