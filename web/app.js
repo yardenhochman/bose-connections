@@ -57,6 +57,7 @@ function slotView(){
 
 // ---- Render ----
 function render(){
+ if(stateMode())return renderState();
  if(!state)return;
  const r=roles();const reachable=!!state.reachable;
  // header
@@ -65,9 +66,13 @@ function render(){
  const count=$('slot-count');const occupied=(state.devices||[]).filter(d=>d.connected).length;
  count.hidden=!(state.cached||reachable)||!(state.devices||[]).length||unreachable();
  headerStatus(`${occupied} of 2`);
- const battery=state.battery;$('battery-wrap').hidden=battery==null;
- if(battery!=null){$('battery').textContent=battery+'%';$('battery-wrap').setAttribute('aria-label',`Battery ${battery} percent`);$('battery-fill').setAttribute('width',String(Math.max(1,Math.round(11*battery/100))));}
+ renderBattery(state.battery);
  renderHere();renderChoice();renderCups(reachable);renderDevices(reachable);renderControllers();renderNoise();syncControls();reportSize();
+}
+
+function renderBattery(battery){
+ $('battery-wrap').hidden=battery==null;
+ if(battery!=null){$('battery').textContent=battery+'%';$('battery-wrap').setAttribute('aria-label',`Battery ${battery} percent`);$('battery-fill').setAttribute('width',String(Math.max(1,Math.round(11*battery/100))));}
 }
 
 // One line under the title: drop words (never the time) until it fits.
@@ -206,7 +211,7 @@ function renderNoise(){
 }
 function setFill(){const el=$('noise-level');el.style.setProperty('--pct',(Number(el.value)*10)+'%');}
 function requestNoise(level,enabled){
- if(!live()||op)return;
+ if(!live()||busy())return;
  anc.desired={level,enabled};anc.queued={level,enabled};message('');renderNoise();syncControls();pumpNoise();
 }
 function pumpNoise(){
@@ -224,14 +229,14 @@ function pumpNoise(){
 }
 
 // ---- Connections ----
-function adopt(next){state=next;receivedAt=Date.now();}
+function adopt(next){if(stateMode()){const m={};if(next&&'noise' in next)m.noise=next.noise;if(next?.battery!=null)m.battery=next.battery;state={...state,...m};return;}state=next;receivedAt=Date.now();}
 // A noise response may carry an empty device list (Android without an earlier overview): merge only what it verified.
 function adoptNoise(next){
- if(Array.isArray(next.devices)&&next.devices.length)return adopt(next);
+ if(Array.isArray(next.devices)&&next.devices.length||stateMode())return adopt(next);
  const merged={...state};if('noise' in next)merged.noise=next.noise;if(next.battery!=null)merged.battery=next.battery;state=merged;
 }
 async function perform(data){
- if(op||!live()||anc.inFlight||anc.queued)return;
+ if(busy()||!live()||anc.inFlight||anc.queued)return;
  const opener=choosing;choosing=null;op=data;message('');render();
  try{
   const r=await api('/api/override',data);
@@ -244,7 +249,7 @@ async function perform(data){
  finally{op=null;render();pumpNoise();if(opener)focusRow(opener);}
 }
 function connect(address){
- const target=deviceByAddress(address);if(!target||!live()||op)return;
+ const target=deviceByAddress(address);if(!target||!live()||busy())return;
  if(target.connected)return message(`${target.name} is already connected.`);
  const connected=state.devices.filter(d=>d.connected);
  if(connected.length<2)return perform({action:'connect',address});
@@ -271,6 +276,7 @@ function switchCall(body){
   .catch(e=>({ok:false,error_key:e.name==='AbortError'?'timeout':'unreachable'})).finally(()=>clearTimeout(timer));
 }
 async function useHere(replace){
+ if(stateMode())return startSwitch(ST.here,replace);
  const here=hereAddress();if(!here||op||anc.inFlight||anc.queued)return;
  const label=replace?(busySlots?.find(s=>s.address===replace)?.label||'device'):null;
  busySlots=null;choosing=null;op={action:'connect',address:here,replace:replace||undefined,label,here:true};
@@ -291,21 +297,274 @@ $('use-here').onclick=()=>useHere();
 
 // One mutation at a time; the busy item stays legible, the rest just disables.
 function syncControls(){
- const ok=live();const ancBusy=!!(anc.inFlight||anc.queued);
+ const ok=live();const ancBusy=!!(anc.inFlight||anc.queued);const b=busy();
  document.querySelectorAll('[data-live="true"]').forEach(el=>{
-  if(el.id==='noise-enabled')el.disabled=!ok||!!op||!state?.noise;
-  else if(el.id==='noise-level'){el.disabled=!ok||!!op||!state?.noise||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
-  else el.disabled=!ok||!!op||ancBusy;
+  if(el.id==='noise-enabled')el.disabled=!ok||b||!state?.noise;
+  else if(el.id==='noise-level'){el.disabled=!ok||b||!state?.noise||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
+  else el.disabled=!ok||b||ancBusy;
  });
- $('use-here').disabled=!!op||ancBusy;
- const rb=$('refresh');rb.disabled=refreshing||!!op||ancBusy;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
+ // Switch targets work from any state (the controller reads the headset itself first); one operation at a time.
+ document.querySelectorAll('[data-switch="true"]').forEach(el=>{el.disabled=b||ancBusy;});
+ $('use-here').disabled=b||ancBusy;
+ const rb=$('refresh');rb.disabled=refreshing||b||ancBusy;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
 }
 
 async function refresh(){
+ if(stateMode())return refreshState();
  if(refreshing||op||anc.inFlight)return;
  refreshing=true;choosing=null;syncControls();
  try{adopt(await api('/api/overview'));message(unreachable()?'No controller can reach the headset right now. Connect it to a phone, PC or Mac in Bluetooth settings, then refresh.':'',unreachable()?'info':false);}catch(e){message(e.message,true);}
  finally{refreshing=false;render();if(!state)syncControls();}
+}
+
+// ---- Shared state: GET /api/state long-poll (docs/state-machine.md §3). The page only renders it. ----
+// ST.snap is the controller's last snapshot; ST.tap is a tap whose POST has not answered yet (shown at once);
+// ST.fail a tap the controller never took (network). Nothing here infers a connection state of its own.
+const ST={mode:null,snap:null,at:0,offset:0,seq:null,tap:null,fail:null,here:null,lost:false};
+const STEP={reading:'Checking the headphones'}; // first step shown before the controller answers (contract steps.reading)
+const DONE_LINGER=8;
+function stateMode(){return ST.mode==='state';}
+function serverNow(){return Date.now()/1000+ST.offset;}
+function since(){return Date.now()/1000-ST.at;}
+function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
+function rid(){return Math.random().toString(36).slice(2,10);}
+async function fetchState(after,wait){
+ const q=after==null?'':`?after=${after}&wait=${wait}`;
+ const r=await fetch('/api/state'+q,{cache:'no-store'});
+ if(r.status===404)return null;
+ if(!r.ok)throw new Error('state '+r.status);
+ return r.json();
+}
+async function postJSON(path,body){
+ try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return await r.json();}
+ catch(e){return null;}
+}
+function enterState(s){ST.mode='state';applySnap(s);follow();setInterval(tick,1000);}
+async function follow(){
+ for(let backoff=1000;;){
+  try{
+   const s=await fetchState(ST.seq,25);
+   if(s===null){ST.mode='legacy';refresh();return;} // the controller was replaced by an older one
+   ST.lost=false;backoff=1000;applySnap(s);
+  }catch(e){ST.lost=true;stateHeader();await sleepMs(backoff);backoff=Math.min(backoff*2,8000);}
+ }
+}
+function applySnap(s){
+ ST.snap=s;ST.seq=s.seq;ST.at=Date.now()/1000;ST.offset=(s.now||ST.at)-ST.at;
+ if(!ST.here)ST.here=s.here||s.headset?.controllers?.[0]?.id||'pc';
+ if(s.operation)ST.fail=null;
+ const prev=state;state=overviewFrom(s);
+ if(prev&&anc.desired)state.noise=prev.noise; // an ANC write in flight keeps its own pending value
+ render();
+}
+// The legacy overview shape, so ANC, settings and per-row Connect keep their existing code.
+function overviewFrom(s){
+ const h=s.headset||{},slots=(s.slots||[]).filter(x=>x.address),seen=new Set(slots.map(x=>x.address));
+ const all=[...slots,...(s.devices||[]).filter(d=>d.address&&!seen.has(d.address))];
+ const roles={};for(const d of all)if(roleIds.includes(d.role))roles[d.role]=d.address;
+ return {here:ST.here,reachable:!!h.reachable,cached:!h.reachable,battery:h.battery??null,noise:h.noise||null,roles,observed:null,
+  devices:all.map(d=>({address:d.address,name:d.name||d.label||'Device',connected:d.state==='connected'||d.state==='releasing'})),controllers:[]};
+}
+function serverOp(){
+ const o=ST.snap?.operation;if(!o)return null;
+ // Done/failed linger 8 s on the controller; hide them here too even if no new state arrives.
+ if(o.result&&serverNow()-((o.started_at||0)+(o.result.seconds||0))>DONE_LINGER+1)return null;
+ return o;
+}
+function shownOp(){return ST.tap||serverOp()||(ST.fail&&serverNow()-ST.fail.at<DONE_LINGER?ST.fail:null);}
+function opRunning(){const o=ST.tap||serverOp();return !!o&&!o.result;}
+function busy(){return !!op||(stateMode()&&opRunning());}
+function agoText(sec){if(sec==null)return '';if(sec<3)return 'just now';if(sec<60)return `${Math.round(sec)} s ago`;if(sec<3600)return `${Math.round(sec/60)} min ago`;return 'at '+clock(Date.now()/1000-sec);}
+function secs(v){return (Math.round(v*10)/10).toFixed(1)+' s';}
+function the(role){return role===ST.here?'this '+(role==='phone'?'phone':labels[role]):role==='phone'?'the phone':'the '+(labels[role]||'device');}
+const SOURCE_WORDS={desk:'the desk bar',couch:'the couch',web:'the dashboard','mac-popover':'the Mac','mac-menu':'the Mac','android-app':'the phone','android-tile':'the phone',omarchy:'the PC popup',repair:'a re-pair'};
+
+function renderState(){
+ stateHeader();renderBattery(state.battery);renderOp();renderStateCups();renderStateDevices();renderStateControllers();renderNoise();syncControls();reportSize();
+}
+function stateHeader(){
+ if(!ST.snap)return;
+ const s=ST.snap,h=s.headset||{},count=$('slot-count'),status=$('headset-status'),sub=count.parentElement;
+ const n=(s.slots||[]).filter(x=>x.state==='connected').length,age=h.read_age==null?null:h.read_age+since();
+ const via=h.via?(h.via===ST.here?'this '+(h.via==='phone'?'phone':labels[h.via]):labels[h.via]||h.via):'a controller';
+ $('live-dot').className=ST.lost?'led checking':opRunning()?'led pending':h.reachable?'led':'led idle';
+ const forms=ST.lost?[['','Reconnecting to the controller…']]
+  :!h.reachable?[['','Not reachable'+(age!=null?' · last read '+agoText(age):'')],['','Not reachable']]
+  :[[`${n} of 2 connected`,`Live via ${via} · read ${agoText(age)}`],[`${n} of 2`,`Live via ${via} · read ${agoText(age)}`],[`${n} of 2`,`via ${via} · read ${agoText(age)}`],[`${n} of 2`,`via ${via}`],[`${n} of 2`,'Live']];
+ const line=parseFloat(getComputedStyle(sub).lineHeight)||18;
+ for(const [c,t] of forms){count.textContent=c;count.hidden=!c;status.textContent=t;if(sub.offsetHeight<line*1.5)break;}
+}
+
+// Operation card: the steps of the one switch running anywhere (this page, the desk, the couch, the phone…).
+function renderOp(){
+ const box=$('op'),o=shownOp(),here=hereAddress();
+ $('here').hidden=!here||!!o;
+ const b=$('use-here');b.classList.remove('pressed');b.removeAttribute('aria-busy');b.textContent='Use here';
+ b.setAttribute('aria-label','Use here: move the headphones to '+the(ST.here));
+ box.replaceChildren();box.hidden=!o;if(!o)return;
+ const res=o.result,choosing=o.phase==='choose'&&!res;
+ box.className='op '+(res?(res.ok?'ok':'failed'):choosing?'choosing':'run');
+ const target=the(o.target);
+ const title=res?(res.ok?'Moved to '+target:'Didn’t move to '+target):'Moving to '+target;
+ const head=node('div','op-h');head.append(node('span','op-t',title));
+ const time=node('span','op-time num');
+ if(res){if(!res.ok)time.textContent=secs(res.seconds||0);}else if(o.started_at){time.dataset.since=String(o.started_at);time.textContent=secs(Math.max(0,serverNow()-o.started_at));}
+ head.append(time);box.append(head);
+ if(o.source&&o.source!==switchSource()&&SOURCE_WORDS[o.source])box.append(node('div','op-src','Started on '+SOURCE_WORDS[o.source]));
+ const steps=(o.steps||[]).filter(x=>x.name!=='choose');
+ const failedStep=res&&!res.ok?steps.find(x=>x.state==='failed'):null;
+ if(steps.length){
+  const ol=node('ol','steps');
+  for(const x of steps){
+   const li=node('li','step '+x.state);const mk=node('span','mk');
+   if(x.state==='done')mk.append(icon('check'));else if(x.state==='failed')mk.append(icon('alert'));else mk.append(node('i',x.state==='active'?'led pending':''));
+   const t=node('span','ss num');
+   if(x.state==='done'||x.state==='failed'){if(x.seconds!=null)t.textContent=secs(x.seconds);}
+   else if(x.state==='active'&&x.since){t.dataset.since=String(x.since);t.textContent=secs(Math.max(0,serverNow()-x.since));}
+   li.append(mk,node('span','sl',x.label+(x.state==='active'?'…':'')),t);
+   if(x===failedStep&&res.text)li.append(node('span','why',res.text));
+   li.setAttribute('aria-label',`${x.label}: ${x.state}${x.seconds!=null?', '+secs(x.seconds):''}`);
+   ol.append(li);
+  }
+  box.append(ol);
+ }
+ if(choosing){
+  const c=node('div','op-choose');c.append(node('p','',MSG.busy));const opts=node('div','opts');
+  for(const ch of o.choices||[]){const btn=node('button','btn connect',MSG.replace.replace('{label}',ch.label));btn.type='button';btn.onclick=()=>startSwitch(o.target,ch.address);opts.append(btn);}
+  const cancel=node('button','btn ghost','Cancel');cancel.type='button';cancel.onclick=cancelSwitch;opts.append(cancel);
+  c.append(opts);box.append(c);
+ }else if(res){
+  const r=node('div','op-r '+(res.ok?'good':'error'));r.append(icon(res.ok?'check':'alert'));
+  if(res.ok)r.append(node('span','',`${res.text||MSG.ok} · ${secs(res.seconds||0)}`));
+  else{
+   // What the controller's state shows now, so the next move is obvious (the reason is on the failed step).
+   const held=(ST.snap?.slots||[]).filter(x=>x.state==='connected').map(x=>x.role===ST.here?'this '+(x.role==='phone'?'phone':labels[x.role]):x.label||x.name);
+   r.append(node('span','',failedStep?(held.length?'Still on '+held.join(' and '):'Not connected anywhere'):(res.text||MSG.errors[res.error_key]||MSG.errors.unreachable)));
+   const again=node('button','btn connect','Try again');again.type='button';again.onclick=()=>startSwitch(o.target);r.append(again);
+  }
+  box.append(r);
+ }
+}
+const CHIP={connected:['Connected','ok'],connecting:['Connecting…','pending'],releasing:['Releasing…','pending'],disconnecting:['Disconnecting…','pending'],free:['Free','idle'],unknown:['Unknown','idle'],disconnected:['Not connected','idle']};
+function chip(stateName,age){
+ const [word,tone]=CHIP[stateName]||CHIP.unknown;const c=node('span','chip '+tone);
+ c.append(node('span','led'+(tone==='ok'?'':tone==='pending'?' pending':' idle')));
+ const t=node('span','',word);c.append(t);
+ if(stateName==='unknown'&&age!=null){const a=node('span','age',' · '+agoText(age+since()));a.dataset.age=String(age);c.append(a);}
+ return c;
+}
+function renderStateCups(){
+ const cups=$('cups');cups.replaceChildren();cups.classList.add('st');
+ const slots=(ST.snap.slots||[]).slice(0,2);while(slots.length<2)slots.push({state:'free'});
+ slots.forEach((x,i)=>{
+  let st=x.state;
+  // a Disconnect / Connect from this page (POST /api/override) in flight, until the controller's state catches up
+  if(op?.action==='disconnect'&&op.address===x.address&&st==='connected')st='disconnecting';
+  let addr=x.address;
+  if(op?.action==='connect'&&st==='free'&&!slots.slice(0,i).some(y=>y.state==='free')&&!op.replace){st='connecting';addr=op.address;}
+  if(op?.action==='connect'&&op.replace===x.address){st='connecting';addr=op.address;}
+  const d=addr?{address:addr,name:addr===x.address?(x.name||x.label):nameOf(addr),role:addr===x.address?x.role:roleOf(addr)}:null;
+  const target=choosing&&st==='connected'&&d;
+  const cup=node(target?'button':'div','cup');
+  const head=node('div','state');head.append(chip(st,x.age),node('span','slot',`Slot ${i+1}`));
+  if(st==='unknown'&&x.age!=null){const a=node('span','slot-age',agoText(x.age+since()));a.dataset.age=String(x.age);a.dataset.prefix='';head.append(a);}
+  cup.append(head);
+  if(!d){
+   const unk=st==='unknown';cup.classList.add(unk?'unknown':'open');
+   const dev=node('div','dev');dev.append(icon('device'));
+   cup.append(dev,node('div','name',unk?'Not known':'Open slot'),node('div','tag',unk?'Headset not reachable':'Connect a saved device'),node('div','spacer'));
+   cups.append(cup);return;
+  }
+  const dev=node('div','dev');dev.append(icon(deviceIcon(d)));cup.append(dev,node('div','name',d.name||'Device'));
+  if(d.role&&d.role===ST.here){const tag=node('div','tag here');tag.append(node('i'),document.createTextNode('This '+(d.role==='phone'?'phone':labels[d.role])));cup.append(tag);}
+  else cup.append(node('div','tag',d.role?labels[d.role]||'':''));
+  if(st==='connecting'||st==='releasing'||st==='disconnecting'){
+   cup.classList.add('pending');if(st!=='connecting')cup.classList.add('leaving');
+   cup.append(pendingPill(CHIP[st][0]));
+  }else if(target){
+   cup.classList.add('target');cup.setAttribute('aria-label',`Replace ${d.name}`);cup.type='button';cup.dataset.live='true';
+   cup.onclick=()=>perform({action:'connect',address:choosing,replace:d.address});cup.append(node('span','pill','Replace'));
+  }else if(st==='connected'){
+   const b=node('button','btn ghost','Disconnect');b.type='button';b.dataset.live='true';b.setAttribute('aria-label',`Disconnect ${d.name}`);
+   b.onclick=()=>perform({action:'disconnect',address:d.address});cup.append(b);
+  }else{cup.classList.add('stale');cup.append(node('div','spacer'));}
+  cups.append(cup);
+ });
+}
+function renderStateDevices(){
+ const list=$('devices');list.replaceChildren();
+ const slots=ST.snap.slots||[],inSlot=new Set(slots.filter(x=>x.address).map(x=>x.address));
+ const rows=(ST.snap.devices||[]).filter(d=>d.address&&!inSlot.has(d.address)&&!(op?.action==='connect'&&op.address===d.address));
+ if(!rows.length){
+  const empty=node('div','empty');
+  if(!inSlot.size)empty.append(node('strong','',ST.snap.headset?.reachable?'No saved devices found':'Headset unavailable'),node('span','',ST.snap.headset?.reachable?'Pair your devices in the headset’s Bluetooth settings.':'Turn on the headset and keep it near one of your controllers.'));
+  else empty.append(node('strong','','Every saved device holds a slot'),node('span','','Disconnect one to free a slot.'));
+  list.append(empty);return;
+ }
+ for(const d of rows){
+  const row=node('div','device');row.dataset.address=d.address;row.append(icon(deviceIcon(d)));
+  const info=node('div','device-info'),role=roleIds.includes(d.role)?d.role:null,choosingHere=choosing===d.address;
+  const sub=node('div','s');
+  if(choosingHere){sub.textContent='Choose a slot above to replace';sub.classList.add('pend');}
+  else if(d.state==='connecting'){sub.textContent='Connecting…';sub.classList.add('pend');}
+  else if(d.state==='unknown'){sub.textContent='Unknown · '+agoText((d.age??0)+since());if(d.age!=null){sub.dataset.age=String(d.age);sub.dataset.prefix='Unknown · ';}}
+  else sub.textContent=`Saved · not connected${role?' · '+labels[role]:''}`;
+  info.append(node('div','n',d.name||d.label||'Device'),sub);row.append(info);
+  const b=node('button','btn connect');b.type='button';
+  if(role){
+   // A role device is a switch target: the controller releases a slot if needed (keeping the phone) and connects it.
+   b.textContent=role===ST.here?'Use here':'Move to '+(role==='phone'?'phone':labels[role]);b.dataset.switch='true';
+   b.setAttribute('aria-label',`Move the headphones to ${the(role)}`);b.onclick=()=>startSwitch(role);
+  }else if(choosingHere){b.className='btn connect pressed';b.textContent='Connect';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>cancelChoice(true);}
+  else{b.textContent='Connect';b.dataset.live='true';b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>connect(d.address);}
+  row.append(b);list.append(row);
+ }
+}
+// Per controller: whether it reads the headset now, or why not (state-machine.md §1 "unreachable": each controller's reason).
+function reasonWord(reason){
+ const e=String(reason||'');
+ if(/ConnectionRefused/.test(e))return 'app not running';
+ if(/Timeout|timed out/i.test(e))return 'no answer';
+ if(!e||/^Controller unavailable/.test(e))return 'offline';
+ return e;
+}
+function renderStateControllers(){
+ const box=$('controllers');box.replaceChildren();box.classList.remove('list');
+ const h=ST.snap.headset||{},list=(h.controllers||[]).filter(c=>roleIds.includes(c.id));if(!list.length)return;
+ const word=c=>c.state==='here'?'reads the headset':c.state==='available'?'available':reasonWord(c.reason);
+ if(h.reachable&&!list.some(c=>c.state==='offline'&&c.reason&&reasonWord(c.reason).length>16)){
+  box.append(document.createTextNode('Controllers: '));
+  list.forEach((c,i)=>{if(i)box.append(document.createTextNode(' · '));box.append(node('b','',labels[c.id]),document.createTextNode(' '+word(c)));});
+ }else{
+  box.classList.add('list');box.append(node('div','ctl-h',h.reachable?'Controllers':'No controller reaches the headset'));
+  const ul=node('ul');for(const c of list){const li=node('li');li.append(node('b','',labels[c.id]),node('span','',word(c)));ul.append(li);}
+  box.append(ul);
+ }
+}
+async function startSwitch(target,replace){
+ if(!target||(opRunning()&&!replace)||anc.inFlight||anc.queued||op)return;
+ choosing=null;ST.fail=null;message('');
+ ST.tap={target,phase:'reading',started_at:serverNow(),source:switchSource(),steps:[{name:'reading',label:STEP.reading,state:'active',since:serverNow()}],result:null};
+ render();
+ const body={source:switchSource(),request_id:rid(),target};if(replace)body.replace=replace;
+ const r=await postJSON('/api/switch',body);
+ ST.tap=null;
+ if(r&&r.operation){if(!ST.snap.operation||r.seq==null||r.seq>=ST.seq||ST.snap.operation.id!==r.operation.id)ST.snap={...ST.snap,operation:r.operation};}
+ else if(!r||r.accepted!==true){const text=r?.error||MSG.errors.unreachable;ST.fail={target,started_at:serverNow(),at:serverNow(),steps:[],result:{ok:false,text,seconds:0}};}
+ render();
+}
+async function cancelSwitch(){await postJSON('/api/switch/cancel',{source:switchSource()});}
+async function refreshState(){
+ // A fresh headset read: the controller folds it into the state the long-poll delivers.
+ if(refreshing||busy())return;refreshing=true;syncControls();
+ try{await api('/api/overview');}catch(e){message(e.message,true);}finally{refreshing=false;syncControls();}
+}
+function tick(){
+ if(!stateMode()||!ST.snap)return;
+ stateHeader();
+ document.querySelectorAll('[data-since]').forEach(el=>{el.textContent=secs(Math.max(0,serverNow()-Number(el.dataset.since)));});
+ document.querySelectorAll('[data-age]').forEach(el=>{const t=agoText(Number(el.dataset.age)+since());el.textContent=el.dataset.prefix!=null?el.dataset.prefix+t:' · '+t;});
+ const shown=!$('op').hidden,want=!!shownOp();if(shown!==want)render();
 }
 
 // ---- Ridge plot: outside sound let through ----
@@ -378,8 +637,8 @@ level.addEventListener('change',()=>{anc.dragging=false;const lvl=Number(level.v
 level.addEventListener('pointerup',()=>{if(anc.dragging){anc.dragging=false;}});
 $('noise-enabled').addEventListener('change',e=>{const cur=shownNoise();const lvl=cur?Number(cur.level):Number(level.value);requestNoise(lvl,e.target.checked);});
 $('refresh').onclick=refresh;
-setInterval(()=>{if(state&&live()&&!op)headerStatus($('slot-count').textContent.split(' connected')[0]);},30000);
-new ResizeObserver(()=>{if(state)headerStatus($('slot-count').textContent.split(' connected')[0]);}).observe(document.querySelector('.top'));
+setInterval(()=>{if(!stateMode()&&state&&live()&&!op)headerStatus($('slot-count').textContent.split(' connected')[0]);},30000);
+new ResizeObserver(()=>{if(stateMode())stateHeader();else if(state)headerStatus($('slot-count').textContent.split(' connected')[0]);}).observe(document.querySelector('.top'));
 
 $('settings').onclick=()=>{
  if(!state&&window.Android){Android.settings();return;}if(!state)return;
@@ -393,4 +652,9 @@ $('open-window').onclick=()=>{$('settings-dialog').close();window.webkit?.messag
 $('settings-dialog').addEventListener('close',()=>reportSize());
 
 ridges.set(null);syncControls();
-(async()=>{try{const cached=await api('/api/cached');if(cached&&cached.devices&&cached.devices.length){adopt(cached);render();}}catch(e){}await refresh();})();
+(async()=>{
+ try{const cached=await api('/api/cached');if(cached?.here)ST.here=cached.here;if(cached&&cached.devices&&cached.devices.length){adopt(cached);render();}}catch(e){}
+ // The shared state machine when the controller has it; the old overview polling only on a 404 (older controller) or Android's bridge.
+ if(!window.Android){try{const s=await fetchState(null,0);if(s){enterState(s);return;}}catch(e){}}
+ ST.mode='legacy';await refresh();
+})();

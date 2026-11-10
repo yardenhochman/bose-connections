@@ -399,6 +399,8 @@ class FakeAudio:
  def in_use(self):return True
  def restart_audio(self):pass
  def key_refused(self,since):return False
+ def transport(self):return 'active' if self.sink() else ''
+ def chime(self,sink):return None
 class SwitchTests(unittest.TestCase):
  def setUp(self):
   self.clock=Clock()

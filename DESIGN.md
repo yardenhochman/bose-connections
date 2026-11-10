@@ -274,6 +274,14 @@ Two cups side by side, always in a stable order: a connected device keeps the cu
 - **Unknown/cached-empty:** transparent, 1.5px dashed `hair`, compact; "Not known"/"Headset not reachable" or "Open slot"/"Refresh to check".
 - **Replace target:** while choosing, each connected cup becomes a button with a 1.5px dashed ochre border, `accent-wash` on hover, ochre outlined "Replace" pill.
 
+### Shared state (GET /api/state)
+Since 2026-11-10 the web page renders the controller's one state (`docs/state-machine.md` §3) through a `GET /api/state?after=<seq>&wait=25` long-poll; it falls back to the overview flow above only when `/api/state` answers 404 (older controller) or inside the Android bridge. The page infers no connection state of its own.
+- **Header:** `2 of 2 connected · Live via this PC · read 3 s ago` (ages tick each second); unreachable: `Not reachable · last read 2 min ago`; LED ochre while an operation runs.
+- **State chip** in each cup's state row: `Connected` (teal LED), `Connecting…` / `Releasing…` (ochre wash, breathing LED), `Free` (hollow), `Unknown · 2 min ago` (hollow). Phone-width cups (container ≤200px) drop "Slot N" and move the unknown age to the right of the chip so nothing truncates.
+- **Operation card** replaces Use here while `operation` is set (any source; "Started on the desk bar" when not this page): title `Moving to this PC` with a running time, the controller's step labels verbatim, each pending (hollow dot), active (breathing ochre dot, label 500 with `…`, running seconds in `accent-ink`), done (teal ✓ + seconds) or failed (red alert, seconds, the result text under it). Done adds `Playing on Bose 700 · 4.1 s`; failed adds what the state still shows (`Still on Phone and Mac`) and **Try again**. The choose phase shows `Both slots busy · choose one to replace` with `Replace <label>` per choice and Cancel. Running: 1.5px ochre border; finished: hairline. It clears with the controller's 8 s linger.
+- **Switch targets:** Use here and the saved rows of role devices (`Use here`, `Move to Mac`, `Move to phone`) post `/api/switch {source, request_id, target[, replace]}`; they stay enabled when the headset is unreachable (the controller reads it first) and disable while an operation runs. Devices without a role keep Connect (override).
+- **Controllers:** one line when all is well; a list with each controller's reason when one is offline with a long reason or the headset is unreachable.
+
 ### Buttons
 - **Connect:** outlined ochre (1.5px `accent`), `accent-ink` text, min width 104px; hover `accent-wash`; active/pressed (choosing a slot) filled ochre with `on-accent` text and `aria-pressed`.
 - **Ghost (Disconnect, Cancel):** 1px `line-strong` border, `ink` text, hover `hair`.

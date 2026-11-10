@@ -4,8 +4,9 @@ import argparse, concurrent.futures, contextlib, hmac, http.client, ipaddress, j
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request,urlopen
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from protocol import connection, mac_bytes, ProtocolError, ActionUnconfirmed, validate_noise
+from statemachine import Hub, Operation, STEPS, BluezWatcher, PactlWatcher, ReadScheduler
 ROOT=Path(__file__).resolve().parent
 TIMING=logging.getLogger('bose.timing')
 PRELUDE_TTL=5.0        # reuse an overview this young for connect/disconnect checks
@@ -22,6 +23,8 @@ MESSAGES={'pending':'Connecting…','replacing':'Replacing {label}…','ok':'Pla
     'unverified':'The headphones didn’t confirm the switch','keep_one':'Can’t replace that one: keep a phone, PC or Mac connected',
     'no_audio':'Connected, but no sound from the headphones','audio_not_moved':'Headphones connected, but PC audio didn’t switch','forgotten':'The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”'}}
 REQUEST_ID=re.compile(r'[A-Za-z0-9_-]{1,32}')
+TARGETS=('pc','mac','phone')
+AUTO_RELEASE=('desk','couch')  # ?wait=1 callers that keep the phone (contract expect_desk); the non-blocking API always does
 SWITCH_DEADLINE=150.0  # contract rules.deadline_seconds
 PAGE_WAIT=45.0;PAGE_GAP=3.0;SINK_WAIT=6.0  # Linux: page BlueZ every 3 s for up to 45 s; wait up to 6 s for the sink per recovery step
 RESEND_MIN=30.0  # start a resend only with this much of the deadline left (worst-case connect)
@@ -102,6 +105,17 @@ class Audio:
         try:return json.loads((Path(os.environ.get('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'))/'playback-state.json').read_text()).get('state')!='stopped'
         except (OSError,ValueError,AttributeError):return True
     def restart_audio(self):self.run(['systemctl','--user','restart','wireplumber'],15)
+    def transport(self):
+        """State of the headset's A2DP MediaTransport1 ('active' while audio flows, 'idle', 'pending'), '' without one."""
+        _,out,_=self.run(['busctl','tree','org.bluez','--list'])
+        states=[self.run(['busctl','get-property','org.bluez',p,'org.bluez.MediaTransport1','State'])[1].split('"')[1::2]
+                for p in out.split() if p.startswith(self.path+'/sep') and '/fd' in p]
+        flat=[x for st in states for x in st]
+        return 'active' if 'active' in flat else flat[0] if flat else ''
+    def chime(self,sink):
+        """A short quiet sound into the Bose sink, so an idle transport has something to carry."""
+        try:return subprocess.Popen(['pw-play','--target',sink,'--volume','0.3',CHIME],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        except OSError:return None
     def key_refused(self,since):
         """BlueZ logged an AVDTP refusal from the headset since `since` (epoch s). Only meaningful after this PC's page
         brought the link up: btmon 2026-11-09 showed the headset rejecting the stored key ('Pairing Not Allowed'), then
@@ -139,6 +153,17 @@ class Audio:
             scan.terminate()
             try:scan.wait(5)
             except subprocess.TimeoutExpired:scan.kill()
+CHIME='/usr/share/sounds/freedesktop/stereo/message.oga'
+FLOW_WAIT=3.0
+def ensure_flowing(audio,sink,end):
+    """Done means sound reaches the headphones: the A2DP transport goes 'active'. Something already playing counts;
+    otherwise play a short chime and require 'active' within FLOW_WAIT s. Added 2026-11-10 after 'connected but silent'."""
+    if audio.transport()=='active':return 'playing'
+    audio.chime(sink);stop=min(time.monotonic()+FLOW_WAIT,end)
+    while time.monotonic()<stop:
+        time.sleep(.2)
+        if audio.transport()=='active':return 'chime'
+    raise SwitchError('no_audio','A2DP transport stayed '+(audio.transport() or 'absent')+' with a chime playing')
 def page_until_linked(audio,end):
     """Page the headset from BlueZ every PAGE_GAP s for up to PAGE_WAIT s while this PC has no link."""
     stop=min(time.monotonic()+PAGE_WAIT,end);busy=False
@@ -150,13 +175,15 @@ def page_until_linked(audio,end):
         if time.monotonic()+PAGE_GAP>stop or end-time.monotonic()<PAGE_GAP+COST['page']:
             raise SwitchError('unreachable','BlueZ paging failed: '+('both slots busy' if busy else error or 'not linked'))
         time.sleep(PAGE_GAP)
-def await_sink(audio,end):
+def await_sink(audio,end,wake=None):
+    """Wait for the headset's A2DP sink. `wake(timeout)` returns early on a PipeWire event (Hub.wait_audio); without it, poll."""
     stop=min(time.monotonic()+SINK_WAIT,end)
     while True:
         sink=audio.sink()
         if sink or time.monotonic()>=stop:return sink
-        time.sleep(.5)
-def ensure_sink(audio,end):
+        if wake:wake(min(.5,max(.01,stop-time.monotonic())))
+        else:time.sleep(.5)
+def ensure_sink(audio,end,wake=None):
     """BlueZ can report Connected while the headset refused A2DP. Recover from the least disruptive step up:
     wait, select/ask for A2DP, reconnect this PC's link, and only when audio is stopped restart WirePlumber."""
     def relink():
@@ -167,7 +194,7 @@ def ensure_sink(audio,end):
         if step:
             if end-time.monotonic()<cost+1:break
             step()
-        sink=await_sink(audio,end)
+        sink=await_sink(audio,end,wake)
         if sink:return sink
     raise SwitchError('no_audio','Connected, but no audio sink appeared')
 
@@ -186,6 +213,8 @@ class Controller:
         self.switch_lock=threading.Lock()  # one switch or connection change at a time; a second one waits, then reads afresh
         self.repair_lock=threading.Lock();self.repairing=False
         self.audio=None  # Linux sink control for /api/switch: None = detect, False = none, or an Audio-like object (tests)
+        self.hub=Hub(config)  # the reconciled state behind GET /api/state (statemachine.py)
+        self.reads=None;self.watchers=[]
     def cached_overview(self):
         try:
             state=json.loads(Path(self.config_path).with_name('snapshot.json').read_text())
@@ -206,10 +235,12 @@ class Controller:
                     if not adapter.startswith('hci') or not adapter[3:].isdigit():raise ValueError('Invalid BlueZ adapter')
                     path='/org/bluez/'+adapter+'/dev_'+self.config['headset'].replace(':','_')
                     status=subprocess.run(['busctl','get-property','org.bluez',path,'org.bluez.Device1','Connected'],capture_output=True,text=True,timeout=2,check=True)
+                    self.observe_link(status.stdout.strip()=='b true')
                     if status.stdout.strip()!='b true':raise NotLinked('Headset is not connected to this PC')
                 if sys.platform=='darwin':
                     from IOBluetooth import IOBluetoothDevice
                     device=IOBluetoothDevice.deviceWithAddressString_(self.config['headset'])
+                    self.observe_link(bool(device and device.isConnected()))
                     if not device or not device.isConnected():raise NotLinked('Headset is not connected to this Mac')
                 with connection(self.config['headset'],self.channel) as client:state=client.status()
                 state.update(reachable=True,node=self.config['name'],controller=self.config['id'],observed=time.time())
@@ -298,7 +329,14 @@ class Controller:
             previous=self.cached_overview()
             devices=[dict(d,connected=False,current=False) if d.get('address') in unlinked else d for d in previous['devices']]
             result.update(devices=devices,observed=previous.get('observed'),cached=bool(devices),noise=previous.get('noise'),checked=time.time())
+        self.observe(result)
         return result
+    def observe(self,view):
+        try:self.hub.ingest(view)
+        except Exception as e:TIMING.warning('bose.state ingest failed: %s',MAC_TEXT.sub('device',str(e)))
+    def observe_link(self,value):
+        try:self.hub.set_link(value)
+        except Exception as e:TIMING.warning('bose.state link failed: %s',MAC_TEXT.sub('device',str(e)))
     @contextlib.contextmanager
     def open_headset(self):
         with contextlib.ExitStack() as stack:
@@ -340,7 +378,7 @@ class Controller:
         for d in read['devices']:
             if d.get('current'):roles[source]=d['address']
         result=dict(controllers=controllers,devices=read['devices'],roles=roles,reachable=True,battery=read.get('battery'),capacity=2,here=self.config['id'],known_roles=self.config.get('roles',{}),observed=observed,cached=False,noise=read.get('noise'))
-        self.store_snapshot(result)
+        self.store_snapshot(result);self.observe(result)
         # Keep the old timestamp: peer entries merged in here are no fresher than the overview they came from.
         self.last_overview=(last[0] if last else float('-inf'),result)
         return result
@@ -515,13 +553,55 @@ class Controller:
             info['target']=self.role_label(str(data.get('address','')).upper(),known)
             if data.get('replace'):info['replace']=self.role_label(str(data['replace']).upper(),known)
             with self.switch_lock:
-                try:result=self.override(data,info)
-                except Exception as e:result=self.refusal(e,None)
-                result=self.contract_result(result)
+                # The same one-at-a-time machine as /api/switch: GET /api/state shows releasing/connecting for it too.
+                op=self.override_operation(data,source,rid,known);result=None
+                try:
+                    try:result=self.override(data,info)
+                    except Exception as e:result=self.refusal(e,None)
+                    result=self.contract_result(result)
+                finally:self.settle(op,result,start)
             outcome='ok' if result.get('ok') else 'busy' if result.get('busy') else 'error:'+result['error_key']
             if not result.get('ok'):raise ReplyError(result)
             return result
         finally:self.log_switch(source,rid,info,outcome,start)
+    def role_of(self,address):
+        address=str(address or '').upper()
+        return next((r for r,a in self.config.get('roles',{}).items() if str(a).upper()==address and r in LABELS),None)
+    def device_label(self,address,devices=None):
+        """A label for step texts: the role label, else the name the headset gave the device."""
+        role=self.role_of(address)
+        if role:return LABELS[role]
+        return next((d.get('name') for d in devices or [] if str(d.get('address','')).upper()==str(address).upper() and d.get('name')),'device')
+    def connect_label(self,role,address=None,devices=None):
+        if role==self.config['id']:return STEPS['connecting_here'].format(label=LABELS.get(role,role))
+        return STEPS['connecting'].format(label=LABELS.get(role) or self.device_label(address,devices))
+    def op_id(self,rid):return rid if isinstance(rid,str) and rid!='-' and REQUEST_ID.fullmatch(rid) else None
+    def override_operation(self,data,source,rid,known):
+        address=str(data.get('address','')).upper();replace=str(data.get('replace') or '').upper();role=self.role_of(address)
+        op=self.hub.begin(Operation(source,role or 'other',action=data['action'],op_id=self.op_id(rid),deadline=SWITCH_DEADLINE))
+        op.label=self.device_label(address,known)
+        if data['action']=='connect':
+            op.step('connecting',self.connect_label(role,address,known),{address:'connecting',**({replace:'releasing'} if replace else {})})
+        else:op.step('releasing',STEPS['releasing'].format(label=op.label),{address:'releasing'})
+        return op
+    def settle(self,op,result,start):
+        """End an operation from its reply (contract shape) and log its one bose.timing line."""
+        try:
+            if isinstance(result,dict) and result.get('busy'):
+                if op.phase!='choose':op.choose(result.get('slots') or [])
+            elif isinstance(result,dict) and result.get('ok'):
+                text=MESSAGES['ok'] if op.action=='switch' else STEPS['connected' if op.action=='connect' else 'disconnected'].format(label=getattr(op,'label','Device'))
+                op.finish(True,text)
+            else:
+                result=result if isinstance(result,dict) else {}
+                key=result.get('error_key') if result.get('error_key') in MESSAGES['errors'] else 'unreachable'
+                text=MESSAGES['errors'][key]
+                if op.phase=='releasing' and op.action=='switch':text=STEPS['release_failed'].format(label=getattr(op,'release_label','device'))
+                op.finish(False,text,key,result.get('detail') or result.get('error'))
+        finally:
+            times=' '.join(f'{k}={v:.2f}s' for k,v in op.timings().items())
+            TIMING.info(MAC_TEXT.sub('device',f'bose.timing id={op.id} {times} total={time.monotonic()-start:.2f}s'.replace('  ',' ')))
+            if self.reads:self.reads.kick()
     def relay_action(self,data):
         """Mesh /api/action from a peer: runs here; a connection change logs one bose.switch line with the origin's id (via=local)."""
         data=clean_tags(data)
@@ -547,25 +627,62 @@ class Controller:
         raw=str((result or {}).get('error') or (result or {}).get('message') or 'Change not verified')
         key=error_key(raw) if not (result or {}).get('transport') else ('timeout' if 'timeout' in raw.lower() else 'unreachable')
         return self.refusal(SwitchError(key,raw),None) if key=='busy' else error_reply(key,raw)
-    def switch_request(self,data):
-        """POST /api/switch: move the headset to this controller's own device. Always one bose.switch line.
-        A second tap while one runs waits for it, then reads afresh (already here: no second connect)."""
-        start=time.monotonic();info=dict(via='local');outcome='error:invalid';source=rid='?'
+    def switch_tags(self,data,start):
+        """Validate a /api/switch body; returns (source, id, target role). A refused body logs one error:invalid line."""
+        source=rid='?'
         try:
-            source,rid=request_tags(data,{'source','request_id','replace'})
+            source,rid=request_tags(data,{'source','request_id','replace','target'})
             if 'source' not in data:raise ValueError('Missing source')
             if 'replace' in data and not isinstance(data['replace'],str):raise ValueError('Invalid replace address')
             if data.get('replace'):mac_bytes(data['replace'])
-            with self.switch_lock:
-                wall=time.time()
-                try:result=self.switch(data,info)
-                except Exception as e:
-                    key=error_key(e) if error_key(e)!='busy' else 'unverified'
-                    if info.get('paged_unreadable') and key=='unreachable' and self.key_forgotten(wall-1):result=self.recover_forgotten(data,info,wall)
-                    else:result=error_reply(key,e)
+            role=data.get('target',self.config['id'])
+            if role not in TARGETS or not self.config.get('roles',{}).get(role):raise ValueError('Unknown target')
+            return source,rid,role
+        except Exception:
+            self.log_switch(source,rid,dict(via='local',target=LABELS.get(data.get('target'),'-') if isinstance(data.get('target'),str) else '-'),'error:invalid',start);raise
+    def switch_request(self,data):
+        """POST /api/switch?wait=1 (and the old blocking callers): run one operation, reply in the old contract shapes.
+        A second tap while one runs waits for it, then reads afresh (already here: no second connect)."""
+        start=time.monotonic();source,rid,role=self.switch_tags(data,start)
+        with self.switch_lock:
+            op=self.hub.begin(Operation(source,role,op_id=self.op_id(rid),deadline=SWITCH_DEADLINE))
+            return self.run_operation(data,dict(via='local',op=op,auto=source in AUTO_RELEASE),op,start,source,rid)
+    def switch_start(self,data):
+        """POST /api/switch: start an operation and answer at once; the front end follows GET /api/state.
+        A tap while one runs is refused with the running operation."""
+        start=time.monotonic();source,rid,role=self.switch_tags(data,start)
+        if not self.switch_lock.acquire(blocking=False):
+            running=self.hub.operation
+            self.log_switch(source,rid,dict(via='local',target=LABELS.get(role,role)),'rejected',start)
+            return dict(accepted=False,operation=running.to_json() if running else None,seq=self.hub.seq)
+        try:op=self.hub.begin(Operation(source,role,op_id=self.op_id(rid),deadline=SWITCH_DEADLINE))
+        except Exception:self.switch_lock.release();raise
+        def work():
+            try:self.run_operation(data,dict(via='local',op=op,auto=True),op,start,source,rid)
+            except Exception as e:TIMING.warning('bose.switch worker failed: %s',MAC_TEXT.sub('device',str(e)))
+            finally:self.switch_lock.release()
+        threading.Thread(target=work,name='bose-switch-'+op.id,daemon=True).start()
+        return dict(accepted=True,operation=op.to_json(),seq=self.hub.seq)
+    def switch_cancel(self,data=None):
+        """POST /api/switch/cancel: end a choose phase (nothing else can be cancelled)."""
+        with self.hub.cond:
+            op=self.hub.operation
+            if op and op.phase=='choose':self.hub.clear();return dict(ok=True,seq=self.hub.seq)
+            return dict(ok=False,error='No choice to cancel',operation=op.to_json() if op else None,seq=self.hub.seq)
+    def run_operation(self,data,info,op,start,source,rid):
+        outcome='error:unreachable';result=None
+        try:
+            wall=time.time()
+            try:result=self.switch(data,info)
+            except Exception as e:
+                key=error_key(e) if error_key(e)!='busy' else 'unverified'
+                if info.get('paged_unreadable') and key=='unreachable' and self.key_forgotten(wall-1):result=self.recover_forgotten(data,info,wall)
+                else:result=error_reply(key,e)
             outcome='ok' if result.get('ok') else 'busy' if result.get('busy') else 'error:'+result['error_key']
             return result
-        finally:self.log_switch(source,rid,info,outcome,start)
+        finally:
+            self.log_switch(source,rid,info,outcome,start)
+            self.settle(op,result,start)
     def key_forgotten(self,since):
         audio=self.switch_audio()
         return bool(audio and getattr(audio,'key_refused',None) and audio.key_refused(since))
@@ -627,63 +744,133 @@ class Controller:
             role=self.label(d['address'],None);return LABELS.get(role) or d.get('name') or 'device'
         return dict(ok=False,busy=True,error_key='busy',error=MESSAGES['busy'],slots=[dict(address=d['address'],label=label(d)) for d in connected])
     def switch(self,data,info):
-        """Move the headset to roles[config id] with a true status (tests/switch-contract.json).
-        Never guesses a slot to drop; resends at most once, after a fresh read shows the target absent and a slot free."""
-        end=time.monotonic()+SWITCH_DEADLINE;here=self.config['id'];audio=self.switch_audio()
-        target=str(self.config.get('roles',{}).get(here,'')).upper()
-        info.update(target=LABELS.get(here,here),replace='-',via='local')
+        """Move the headset to roles[target] (default: this controller) with a true status (docs/state-machine.md §2,
+        tests/switch-contract.json): reading → [releasing] → connecting → [audio, own device on Linux only].
+        Both slots busy: with info['auto'] keep the phone and release the other slot; otherwise (or no single clear
+        choice) a busy reply / choose phase, never a guess. Resends a connect at most once, after a fresh read shows the
+        target absent and a slot free; never while a peer's reply may be outstanding."""
+        end=time.monotonic()+SWITCH_DEADLINE;here=self.config['id'];role=data.get('target') or here
+        target=str(self.config.get('roles',{}).get(role,'')).upper()
+        audio=self.switch_audio() if role==here else None
+        op=info.get('op') or Operation(data.get('source','unknown'),role)
+        info.update(target=LABELS.get(role,role),replace='-',via='local')
         def left():return end-time.monotonic()
         def check_time(what):
             if left()<=0:raise SwitchError('timeout',what+' passed the switch deadline')
         def connected(view):return target in {d['address'] for d in self.held(view or {})}
+        def connecting():op.step('connecting',self.connect_label(role,target),{target:'connecting'})
         if not target:raise SwitchError('unreachable','This controller has no device role')
+        op.step('reading')
+        if audio and self.hub.link_watched and self.hub.own_link:
+            # Already on this PC (BlueZ link, watched live): no headset read, only the sink check (spec: ≤ 0.5 s).
+            op.plan(['audio']);return self.switch_done(self.known_state(),end,op,audio)
         view=self.overview(budget=left());check_time('First read')
         if not view.get('reachable') and audio:
             # No controller reaches the headset: this PC pages it from BlueZ, then reads again.
-            page_until_linked(audio,end);view=self.overview(budget=left());check_time('Read after paging')
+            connecting();page_until_linked(audio,end);view=self.overview(budget=left());check_time('Read after paging')
             info['paged_unreadable']=not view.get('reachable')  # linked, yet the headset refuses even its control channel
         if not view.get('reachable'):raise SwitchError('unreachable','No controller can read the headset')
-        held={d['address'] for d in self.held(view)}
-        if target in held:return self.switch_done(view,end)
+        held=[d['address'] for d in self.held(view)]
+        if target in held:op.plan(['audio'] if audio else []);return self.switch_done(view,end,op,audio)
         if target not in {d.get('address') for d in view['devices']}:raise SwitchError('unreachable','This device is not saved on the headset')
         replace=str(data.get('replace') or '').upper() or None
         if replace and (len(held)<2 or replace not in held):replace=None  # honoured only while both slots are still busy and it still holds one
-        if len(held)>=2 and not replace:return self.busy_reply(view)
-        if replace:info['replace']=self.role_label(replace,view['devices'])
+        if len(held)>=2 and not replace and info.get('auto'):replace=self.release_choice(held,role)
+        if len(held)>=2 and not replace:
+            reply=self.busy_reply(view);op.choose(reply['slots']);return reply
         tags={k:data[k] for k in ('source','request_id') if k in data}
+        if replace:
+            info['replace']=self.role_label(replace,view['devices']);op.release_label=self.device_label(replace,view['devices'])
+            op.plan({'releasing':STEPS['releasing'].format(label=op.release_label),'connecting':self.connect_label(role,target),**({'audio':STEPS['audio']} if audio else {})})
+            op.step('releasing',STEPS['releasing'].format(label=op.release_label),{replace:'releasing'})
+            self.release(replace,tags,info,left)
+            held=[a for a in held if a!=replace];check_time('Release')
+        else:op.plan({'connecting':self.connect_label(role,target),**({'audio':STEPS['audio']} if audio else {})})
+        connecting()
+        if audio and len(held)<2 and left()>=COST['page']:
+            # A slot is free: this PC pages the headset itself first (one BlueZ page, seconds; QA 11-10).
+            audio.page()
+            if audio.linked():
+                fresh=self.overview(budget=max(1.0,left()))
+                if not fresh.get('reachable'):
+                    info['paged_unreadable']=True;raise SwitchError('unreachable','Linked, but no controller can read the headset')
+                return self.switch_done(fresh,end,op,audio)  # BlueZ is newer than a read that may still lack this PC
         for attempt in range(2):
             result=error=None
-            try:result=self.override(dict(tags,action='connect',address=target,**({'replace':replace} if replace else {})),info,left())
+            try:result=self.override(dict(tags,action='connect',address=target),info,left())
             except Exception as e:error=e
             # A verified connect counts even when it lands after the deadline.
             if isinstance(result,dict) and result.get('ok') and result.get('verified') and connected(result.get('state')):
-                return self.switch_done(result['state'],end)
+                return self.switch_done(result['state'],end,op,audio)
             # A transport failure means the peer's reply may still be outstanding: never send another connect.
             raw=str(error) if error else str((result or {}).get('detail') or (result or {}).get('error') or (result or {}).get('message') or 'Connect not confirmed')
             if isinstance(result,dict) and result.get('transport'):
                 raise SwitchError('timeout' if 'timeout' in raw.lower() else 'unreachable',raw)
             # Not confirmed: exactly one fresh read decides.
             fresh=self.overview(wait_all=False,budget=max(1.0,left()))
-            if connected(fresh):return self.switch_done(fresh,end)
+            if connected(fresh):return self.switch_done(fresh,end,op,audio)
             check_time('Connect')
             if not fresh.get('reachable'):raise SwitchError('unreachable',raw)
             key=error_key(error) if error else (result or {}).get('error_key') or error_key(raw)
-            if key=='busy':return self.busy_reply(fresh)
+            if key=='busy':
+                reply=self.busy_reply(fresh);op.choose(reply['slots']);return reply
             if key in ('keep_one','no_audio','audio_not_moved'):raise SwitchError(key,raw)
-            if attempt or len(self.held(fresh))>=2:raise SwitchError('unverified',raw)
+            if len(self.held(fresh))>=2:raise SwitchError('unverified',raw)
+            if attempt:
+                if audio:return self.page_after_connect(audio,end,op,raw)
+                raise SwitchError('unverified',raw)
             if left()<RESEND_MIN:raise SwitchError('timeout','Too little time left to resend: '+raw)
-            replace=None  # the slot is free now
         raise SwitchError('unverified','Connect not confirmed')
-    def switch_done(self,state,end):
-        """The headset shows this device connected. On a Linux PC, also make its A2DP sink the default; macOS routes audio itself."""
+    def page_after_connect(self,audio,end,op,raw):
+        """The connect stayed unconfirmed with a slot free: page from this PC every 3 s up to 45 s, failing as unverified."""
+        try:page_until_linked(audio,end)
+        except SwitchError as e:
+            raise SwitchError('timeout' if e.key=='timeout' else 'unverified',raw+'; '+str(e)) from e
+        fresh=self.overview(wait_all=False,budget=max(1.0,end-time.monotonic()))
+        return self.switch_done(fresh if fresh.get('reachable') else self.known_state(),end,op,audio)
+    def release_choice(self,held,role):
+        """Keep the phone: with the phone and exactly one other device in the slots, release that one. None otherwise
+        (target is the phone, or no phone holds a slot): the user chooses."""
+        phone=str(self.config.get('roles',{}).get('phone','')).upper()
+        others=[a for a in held if a!=phone]
+        return others[0] if role!='phone' and phone in held and len(others)==1 else None
+    def release(self,address,tags,info,left):
+        """Free one slot with a verified disconnect, sent once. This PC's own slot: drop its own BlueZ link."""
         audio=self.switch_audio()
+        if address==str(self.config.get('roles',{}).get(self.config['id'],'')).upper() and audio and audio.linked():
+            error=audio.drop();stop=time.monotonic()+DISCONNECT_WAIT
+            while audio.linked():
+                if time.monotonic()>stop:raise SwitchError('unverified','This PC did not release its link: '+(error or 'still linked'))
+                time.sleep(POLL_INTERVAL)
+            self.last_overview=None  # its reads came from this PC, which no longer reaches the headset
+            return
+        try:result=self.override(dict(tags,action='disconnect',address=address),info,max(1.0,left()))
+        except Exception as e:
+            key=error_key(e);raise SwitchError('unverified' if key=='busy' else key,str(e)) from e
+        if isinstance(result,dict) and result.get('ok') and result.get('verified'):return
+        result=result if isinstance(result,dict) else {}
+        raw=str(result.get('detail') or result.get('error') or 'Release not confirmed')
+        key=result.get('error_key') if result.get('error_key') in MESSAGES['errors'] else ('timeout' if result.get('transport') and 'timeout' in raw.lower() else error_key(raw))
+        raise SwitchError('unverified' if key=='busy' else key,raw)
+    def known_state(self):
+        last=self.last_overview;return last[1] if last else self.cached_overview()
+    def switch_done(self,state,end,op=None,audio=None):
+        """The target holds a slot. On a Linux PC moving to itself, also make its A2DP sink the default; macOS routes audio itself."""
         if audio:
+            if op:op.step('audio')
             if not audio.linked():page_until_linked(audio,end)
-            sink=ensure_sink(audio,end)
+            sink=ensure_sink(audio,end,self.hub.wait_audio if self.hub.audio_watched else None)
             if audio.default()!=sink:
                 audio.set_default(sink)
                 if audio.default()!=sink:raise SwitchError('audio_not_moved','Default sink read-back differs')
+            self.hub.set_audio(sink,True)
+            ensure_flowing(audio,sink,end)
         return dict(ok=True,verified=True,message=MESSAGES['ok'],state=state)
+    def start_background(self):
+        """Service only (main): headset read cadence, and on a Linux PC the BlueZ and PipeWire watchers."""
+        self.reads=ReadScheduler(self.hub,lambda:self.overview(wait_all=False)).start()
+        audio=self.switch_audio()
+        if audio:self.watchers=[BluezWatcher(self.hub,audio,audio.path).start(),PactlWatcher(self.hub,audio).start()]
 
 class Server(ThreadingHTTPServer):
     daemon_threads=True
@@ -704,10 +891,11 @@ class Handler(BaseHTTPRequestHandler):
             remote=ipaddress.ip_address(self.client_address[0])
             if remote not in ipaddress.ip_network('100.64.0.0/10'):return False
             return hmac.compare_digest(self.headers.get('Authorization',''),'Bearer '+self.server.controller.config['token'])
-        host=self.headers.get('Host','')
-        if host not in ('127.0.0.1:8847','localhost:8847'):return False
+        port=self.server.server_address[1]  # 8847 in service; tests and the smoke run bind a random loopback port
+        hosts=(f'127.0.0.1:{port}',f'localhost:{port}')
+        if self.headers.get('Host','') not in hosts:return False
         origin=self.headers.get('Origin')
-        return not origin or origin in ('http://127.0.0.1:8847','http://localhost:8847')
+        return not origin or origin in tuple('http://'+h for h in hosts)
     def do_GET(self):
         path=urlsplit(self.path).path
         if not self.allowed():return self.send(403,{'error':'Access denied'})
@@ -727,6 +915,14 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/status':return self.send(200,self.server.controller.local_status())
         if path=='/api/cached' and not self.server.mesh:return self.send(200,self.server.controller.cached_overview())
         if path=='/api/overview':return self.send(200,self.server.controller.overview())
+        if path=='/api/state':  # long-poll; the mesh port serves it to authenticated peers too
+            query=parse_qs(urlsplit(self.path).query)
+            try:
+                after=int(query['after'][0]) if 'after' in query else None
+                wait=float(query.get('wait',['0'])[0])
+                if wait!=wait:raise ValueError('wait')
+            except ValueError:return self.send(400,{'error':'Invalid after or wait'})
+            return self.send(200,self.server.controller.hub.state(after,wait))
         if self.server.mesh:return self.send(404,{'error':'Not found'})
         files={'/':('index.html','text/html; charset=utf-8'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css'),'/favicon.svg':('favicon.svg','image/svg+xml'),'/fonts/jost-latin.woff2':('fonts/jost-latin.woff2','font/woff2'),'/fonts/jost-latin-ext.woff2':('fonts/jost-latin-ext.woff2','font/woff2')}
         if path not in files:return self.send(404,{'error':'Not found'})
@@ -735,12 +931,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed():return self.send(403,{'error':'Access denied'})
         try:
             size=int(self.headers.get('Content-Length','0'))
-            if not 0<size<=4096:raise ValueError('Invalid request size')
-            data=json.loads(self.rfile.read(size))
+            path=urlsplit(self.path).path;query=parse_qs(urlsplit(self.path).query)
+            if size==0 and path=='/api/switch/cancel':data={}
+            else:
+                if not 0<size<=4096:raise ValueError('Invalid request size')
+                data=json.loads(self.rfile.read(size))
             if not isinstance(data,dict):raise ValueError('Invalid request')
-            path=urlsplit(self.path).path
             if path=='/api/override' and not self.server.mesh:result=self.server.controller.override_request(data)
-            elif path=='/api/switch' and not self.server.mesh:result=self.server.controller.switch_request(data)
+            elif path=='/api/switch' and not self.server.mesh:
+                # ?wait=1: the old blocking reply (contract tests, current Mac and Android builds); otherwise accepted at once.
+                blocking=query.get('wait',['0'])[0] in ('1','true')
+                result=(self.server.controller.switch_request if blocking else self.server.controller.switch_start)(data)
+            elif path=='/api/switch/cancel' and not self.server.mesh:result=self.server.controller.switch_cancel(data)
             elif path=='/api/prepare-connect':result=self.server.controller.prepare_connect(data)
             elif path=='/api/action' and self.server.mesh:result=self.server.controller.relay_action(data)
             elif path=='/api/roles' and not self.server.mesh:
@@ -773,6 +975,7 @@ def main():
             time.sleep(.5)
     if config.get('mesh_bind'):servers.append(Server((config['mesh_bind'],8848),ctl,True))
     for server in servers:threading.Thread(target=server.serve_forever,daemon=True).start()
+    if sys.platform.startswith('linux'):ctl.start_background()  # the PC hub: watchers and headset read cadence
     print('Bose controller GUI: http://127.0.0.1:8847',flush=True)
     try:
         while True:

@@ -30,6 +30,17 @@
       "forgotten": "The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”"
     }
   },
+  "steps": {
+    "reading": "Checking the headphones",
+    "choose": "Both slots busy · choose one to replace",
+    "releasing": "Releasing the {label}",
+    "connecting": "Connecting the {label}",
+    "connecting_here": "Connecting this {label}",
+    "audio": "Starting audio",
+    "release_failed": "The {label} didn’t let go of the headphones",
+    "connected": "{label} connected",
+    "disconnected": "{label} disconnected"
+  },
   "rules": {
     "pending_immediately": "messages.pending shows at once on tap, before any reply",
     "retry": "A connect that is not confirmed is retried (resent at most once after a fresh read shows the target absent and a slot free; on Linux the PC also pages BlueZ every 3 s for up to 45 s). Never resend through another peer while a reply is outstanding.",

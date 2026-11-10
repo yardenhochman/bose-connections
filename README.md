@@ -136,30 +136,70 @@ creating that machine's config; swap its ID, bind address and peer list. Keep al
 configs private. Do not put them in this repo. Settings can identify controller
 roles from the headset's saved-device list.
 
+### Connection state (`GET /api/state`)
+
+The PC controller owns the connection state; front ends render it and run no switch flow of their own
+([docs/state-machine.md](docs/state-machine.md); code in `statemachine.py`, the steps in `Controller.switch`).
+`GET /api/state?after=<seq>&wait=<s>` is a long-poll: it answers at once when `seq > after` (or without `after`),
+otherwise at the next change or after `wait` seconds (at most 25). The mesh port serves it to peers with the token.
+The reply holds `seq`, `now`, `headset` (reachable, `via`, `read_age`, battery, noise, product, and each
+controller as `here` (its read is the one shown), `available`, or `offline` with a `reason`), two `slots` (a free
+one is `{"state":"free"}`), the other saved `devices`, `audio` (`{sink, default}`, `null` off Linux), and
+`operation` (`null` when idle).
+
+Each device is `connected`, `disconnected`, `connecting`, `releasing` or `unknown` (with `age`, after 60 s with no
+headset read and no OS evidence). A device an operation is releasing or connecting shows that state first. Next,
+an OS "no link" for a controller's own device wins over the headset's list: this PC's BlueZ link, or a peer's
+`link:false`. Otherwise the newest headset read decides. A PC BlueZ link that came up after that read counts as
+connected. Inputs: overviews (every read), `local_status`, and two watchers started by the service on Linux. The
+BlueZ watcher runs `gdbus monitor --system` on the headset's `Device1` (`dbus-monitor` / `busctl monitor` as
+fallbacks) and re-reads `Connected` after each restart. The PipeWire watcher runs `pactl subscribe` and re-reads
+the sinks on each event. Both restart when their child exits. Headset reads run at start, after each operation,
+on a BlueZ link change, every 20 s while a client long-polled in the last 60 s (120 s otherwise), never during an
+operation.
+
+`operation`: `{id, source, target, action, phase, started_at, deadline, steps, result}`. `action` is `switch`, or
+`connect`/`disconnect` for an `/api/override`, which runs through the same one-at-a-time machine and shows one
+`connecting`/`releasing` step. Steps (`reading`, `choose`, `releasing`, `connecting`, `audio`) carry
+`state` (`pending`, `active` with `since`, `done`/`failed` with `seconds`) and a `label` from the contract's `steps`
+table. `result`: `{ok:true, text, seconds}` or `{ok:false, error_key, text, step, detail, seconds}`. A failed
+release reads "The Mac didn’t let go of the headphones" (`steps.release_failed`). A `choose` phase carries
+`choices: [{address, label}]`. A finished operation stays 8 s, or until the next tap. An unanswered `choose` ends
+at the 150 s deadline.
+
 ### Switch API (Use here)
 
-`POST /api/switch` on the loopback port moves the headset to this controller's own
-device (`roles[<config id>]`). Body: `{"source": …, "request_id": …, "replace": …}`.
+`POST /api/switch` on the loopback port moves the headset to `target` (`pc`, `mac` or `phone`; default: this
+controller's own device). Body: `{"source": …, "request_id": …, "target": …, "replace": …}`.
 `source` is required and is one of the sources in
 [`tests/switch-contract.json`](tests/switch-contract.json) (`web`, `mac-popover`,
 `omarchy`, `android-app`, …); `request_id` is an optional short id
-(`[A-Za-z0-9_-]{1,32}`); `replace` is the address of the slot to drop, sent only
-after a busy reply. Other keys are refused. The contract file holds the texts,
+(`[A-Za-z0-9_-]{1,32}`, also the operation `id`); `replace` is the address of the slot to drop, sent after a
+busy reply or a `choose` phase. Other keys are refused. The contract file holds the texts,
 reply shapes and scenarios every front end is tested against.
 
-1. A fresh read. Already connected here: success with no connect command.
-2. Both slots busy and no `replace`: `{ok:false, busy:true, error_key:"busy", error, slots:[{address,label}]}`.
-   The PC desk bar and couch (living-room-media) keep the phone instead: with the phone and one other device connected,
-   they release that device, then connect the PC (`rules.both_busy_desk`, `expect_desk` in the contract; since 2026-11-10).
-   A `replace` counts only while both slots are still busy and that device still holds one.
-3. Otherwise connect through the same path as `/api/override` (local or one peer).
+The reply comes at once: `{"accepted": true, "operation": {…}, "seq": n}`. Then follow `GET /api/state`. A tap while
+an operation runs gets `{"accepted": false, "operation": <the running one>}` and logs `outcome=rejected`.
+`POST /api/switch/cancel` (empty body allowed) ends a `choose` phase. `POST /api/switch?wait=1` keeps the old
+blocking reply shapes below for the current Mac and Android builds and the contract tests. A second blocking tap
+waits for the running one, then reads afresh.
+
+1. A fresh read (`reading`). On the PC, while the BlueZ watcher reports the link up, the read is skipped and only
+   the sink is checked (the target is ≤ 0.5 s). Already on the target: success with no connect command.
+2. Both slots busy and the target holds neither: keep the phone. With the phone and exactly one other device in the
+   slots, that device is released (`releasing`, a verified disconnect sent once; this PC's own slot drops its BlueZ
+   link). Any other pair, or the phone as target, is a `choose` phase that never guesses. With `?wait=1`, only
+   sources `desk` and `couch` release (`rules.both_busy_desk`, `expect_desk`); the others get
+   `{ok:false, busy:true, error_key:"busy", error, slots:[{address,label}]}`. A `replace` counts only while both
+   slots are still busy and that device still holds one.
+3. `connecting`. To this PC with a slot free, the PC first pages the headset itself (one `Device1.Connect`).
+   Otherwise, or when that does not link, it connects through the same path as `/api/override` (local or one peer).
    If the connect is not confirmed, one fresh read decides: connected → success; target
    absent and a slot free → resend once, and only with at least 30 s of the deadline left;
-   full slots → a busy reply; otherwise `unverified`. Nothing is resent while a peer's reply
+   full slots → a busy reply; otherwise `unverified` (on the PC after paging for up to 45 s). Nothing is resent while a peer's reply
    may still be outstanding: a relay that got no answer (`transport: true`, including one cut
    off at the time left) stops the switch. A verified connect counts even after the deadline.
-   One switch or connection change runs at a time per controller; a second tap waits, then
-   reads afresh (already here: no second connect).
+   One switch or connection change runs at a time per controller.
 4. On a Linux PC with `pactl`: when no controller reaches the headset, or BlueZ has no
    link after the slot is confirmed, the PC pages it (`Device1.Connect` every 3 s, up
    to 45 s). It then waits for the headset's A2DP sink, recovering step by step
@@ -199,6 +239,10 @@ reply shapes and scenarios every front end is tested against.
 and its connect/disconnect failures now carry `error_key` and the contract `error` text
 (raw reason in `detail`); full slots give the busy reply with `slots`. Request ids are cut to
 `[A-Za-z0-9_-]{1,32}` before relaying.
+
+**Timing line.** Each operation (switch or connect/disconnect override) also logs one
+`bose.timing id=k3f9a2 reading=0.50s releasing=0.90s connecting=2.50s audio=0.00s total=3.90s`, with only the
+steps that ran.
 
 **Log rule.** Every controller that receives a `/api/switch`, a connect/disconnect
 `/api/override`, or a relayed connect/disconnect `/api/action` logs exactly one `bose.switch`
@@ -308,7 +352,11 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 82 tests use simulated transports and have no hardware side effects. Seventeen run
+The 117 tests use simulated transports and have no hardware side effects.
+`tests/test_state_machine.py` drives the state machine through `tests/fakeworld.py`: a simulated headset, BlueZ link
+and PipeWire sink shared by three real controllers on a fake clock. It covers every transition, the long-poll, the
+watchers' parsing and restarts, and `?wait=1`. `python3 tests/smoke_switch.py` runs the real HTTP server on a random
+loopback port over that world and prints the step timings. Seventeen run
 `/api/switch` through every scenario in `tests/switch-contract.json`, with and without the
 Linux sink step and relayed through an Android-shaped phone, with a fake clock and a fake `Audio`. They check texts, connect
 counts, the final slots, the default sink and the single `bose.switch` log line.
@@ -330,7 +378,10 @@ For GUI checks, install Node dependencies (`npm install`) and Chromium, then run
 `CHROMIUM_PATH` if needed. The runner intercepts API responses with synthetic data and
 verifies mobile/desktop layouts, settings and the replacement dialog. It also runs Use here
 through every contract scenario: pending text before the reply, final texts, Replace offers,
-the replace payload, the Mac popover source and the Android `switchHere` bridge. It creates
+the replace payload, the Mac popover source and the Android `switchHere` bridge. A scripted `GET /api/state`
+long-poll then drives the shared-state page: chips, step timings, result, auto-clear, Try again, the choose phase
+and cancel, Move-to targets, unreachable reasons and the popover (its captures go to `artifacts/state/`); every
+other run answers `/api/state` with 404, which also covers the fallback to overview polling. It creates
 ignored screenshots under `artifacts/` (`BOSE_ARTIFACTS` overrides the folder); it sends no
 connection mutations. Set
 `SCREENSHOT_SCALE=2` for 2x captures, as used for the images above. The design

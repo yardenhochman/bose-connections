@@ -24,6 +24,8 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  const page=await browser.newPage({viewport:{width:1280,height:950}});
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
  let cur=null,overviewCalls=0,overrideHandler=null,switchHandler=null,switchReplied=0;const posts=[],switchPosts=[];
+ // GET /api/state: null = an older controller (404), so the page keeps its overview polling; else a scripted long-poll.
+ let states=null;const stateGets=[],cancels=[];
  // Every page gets the same fixture API; nothing reaches a live controller.
  const wire=async page=>{
   // Without BOSE_URL the page itself comes from this checkout's web/, so no running helper is needed.
@@ -32,6 +34,13 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await page.route('**/api/cached',r=>r.fulfill({json:{devices:[]}}));
   await page.route('**/api/overview',r=>{overviewCalls++;return r.fulfill({json:cur});});
   await page.route('**/api/override',async r=>{const body=r.request().postDataJSON();posts.push({body,at:Date.now()});const res=await overrideHandler(body);return r.fulfill({json:res});});
+  await page.route(u=>new URL(u).pathname==='/api/state',async r=>{
+   if(!states)return r.fulfill({status:404,body:'not found'});
+   const q=new URL(r.request().url()).searchParams;const after=q.has('after')?Number(q.get('after')):null;stateGets.push({after,wait:q.get('wait')});
+   if(after!=null&&states.snap.seq<=after)await states.next(Math.min(Number(q.get('wait'))||0,25)*1000);
+   try{await r.fulfill({json:{...states.snap,now:Date.now()/1000}});}catch(e){}
+  });
+  await page.route('**/api/switch/cancel',async r=>{cancels.push(r.request().postDataJSON());if(states?.onCancel)states.onCancel();return r.fulfill({json:{ok:true}});});
   await page.route('**/api/switch',async r=>{const body=r.request().postDataJSON();switchPosts.push({body,at:Date.now()});const res=await switchHandler(body);switchReplied=Date.now();return r.fulfill({json:res});});
  };
  await wire(page);
@@ -294,7 +303,138 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  check(bridged.length===1&&bridged[0].source==='android-app'&&!switchPosts.length,'Android bridge switchHere: '+JSON.stringify(bridged));
  await sw.close();
 
+ // ---- Shared state machine: GET /api/state long-poll (docs/state-machine.md §3), rendered as-is ----
+ {
+  const shots=path.join(artifacts,'state');fs.mkdirSync(shots,{recursive:true});
+  const steps=contract.steps||{};const lbl=(k,label)=>(steps[k]||k).replace('{label}',label);
+  const now=()=>Date.now()/1000;
+  const slot=(d,role,state,extra={})=>({address:d.address,role,label:contract.labels[role]||d.name,name:d.name,state,...extra});
+  const free={state:'free'};
+  const ctl=[{id:'pc',state:'here'},{id:'phone',state:'available'},{id:'mac',state:'offline',reason:'Headset is not connected to this Mac'}];
+  const snapshot=(o={})=>({seq:0,headset:{reachable:true,via:'pc',read_age:1.4,battery:62,noise:{level:7,enabled:true},product:'Bose 700',controllers:ctl,...o.headset},
+   slots:o.slots,devices:o.devices||[],audio:{sink:'bluez_output.AA_AA_AA_AA_AA_AA.1',default:true},operation:o.operation??null});
+  const waiters=[];
+  states={snap:null,onCancel:null,
+   next:ms=>new Promise(res=>{const t=setTimeout(res,ms);waiters.push(()=>{clearTimeout(t);res();});}),
+   set(snap){snap.seq=(this.snap?.seq||0)+1;this.snap=snap;waiters.splice(0).forEach(f=>f());}};
+  const step=(name,label,state,extra={})=>({name,label,state,...extra});
+  const op=(target,phase,list,extra={})=>({id:'k3f9a2',source:'web',target,action:'switch',phase,started_at:now()-3,deadline:150,steps:list,result:null,...extra});
+  const tv={address:DEV.tv.address,role:null,label:DEV.tv.name,name:DEV.tv.name,state:'disconnected'};
+  // Scenes: Mac → PC with the phone kept (spec §2 release rule), then a phone tap that has to ask.
+  const scenes={
+   idle:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.pc,'pc','connected')],devices:[slot(DEV.mac,'mac','disconnected'),tv]}),
+   macphone:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.mac,'mac','connected')],devices:[slot(DEV.pc,'pc','disconnected'),tv]}),
+   releasing:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.mac,'mac','releasing')],devices:[slot(DEV.pc,'pc','disconnected'),tv],
+    operation:op('pc','releasing',[step('reading',lbl('reading'),'done',{seconds:0.4}),step('releasing',lbl('releasing','Mac'),'active',{since:now()-1.1}),step('connecting',lbl('connecting_here','PC'),'pending'),step('audio',lbl('audio'),'pending')])}),
+   connecting:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.pc,'pc','connecting')],devices:[slot(DEV.mac,'mac','disconnected'),tv],
+    operation:op('pc','connecting',[step('reading',lbl('reading'),'done',{seconds:0.4}),step('releasing',lbl('releasing','Mac'),'done',{seconds:1.4}),step('connecting',lbl('connecting_here','PC'),'active',{since:now()-0.8}),step('audio',lbl('audio'),'pending')])}),
+   done:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.pc,'pc','connected')],devices:[slot(DEV.mac,'mac','disconnected'),tv],
+    operation:op('pc','done',[step('reading',lbl('reading'),'done',{seconds:0.4}),step('releasing',lbl('releasing','Mac'),'done',{seconds:1.4}),step('connecting',lbl('connecting_here','PC'),'done',{seconds:1.9}),step('audio',lbl('audio'),'done',{seconds:0.4})],
+     {started_at:now()-4.3,result:{ok:true,text:M.ok,seconds:4.1}})}),
+   failed:()=>snapshot({slots:[slot(DEV.phone,'phone','connected'),slot(DEV.mac,'mac','connected')],devices:[slot(DEV.pc,'pc','disconnected'),tv],
+    operation:op('pc','failed',[step('reading',lbl('reading'),'done',{seconds:0.4}),step('releasing',lbl('releasing','Mac'),'failed',{seconds:12.0})],
+     {started_at:now()-12.6,result:{ok:false,error_key:'unverified',text:lbl('release_failed','Mac'),step:'releasing',detail:'scripted',seconds:12.4}})}),
+   choose:()=>snapshot({slots:[slot(DEV.mac,'mac','connected'),slot(DEV.pc,'pc','connected')],devices:[slot(DEV.phone,'phone','disconnected'),tv],
+    operation:op('phone','choose',[step('reading',lbl('reading'),'done',{seconds:0.5}),step('choose',lbl('choose'),'active',{since:now()-0.6})],
+     {choices:[{address:DEV.mac.address,label:'Mac'},{address:DEV.pc.address,label:'PC'}]})}),
+   unreachable:()=>snapshot({headset:{reachable:false,via:null,read_age:140,battery:null,noise:null,
+     controllers:[{id:'pc',state:'offline',reason:'Headset is not connected to this PC'},{id:'phone',state:'offline',reason:'Controller unavailable: ConnectionRefusedError'},{id:'mac',state:'offline',reason:'Controller unavailable: TimeoutError'}]},
+    slots:[slot(DEV.phone,'phone','unknown',{age:140}),slot(DEV.pc,'pc','unknown',{age:140})],devices:[slot(DEV.mac,'mac','unknown',{age:140}),tv]}),
+  };
+  const st=await browser.newPage({viewport:{width:390,height:844}});st.on('pageerror',e=>errors.push(e.message));await wire(st);
+  const chips=()=>st.locator('.cup .chip').allTextContents();
+  const opText=()=>st.locator('#op').innerText();
+  cur=overview([DEV.pc.address,DEV.phone.address]);overviewCalls=0;
+  states.set(scenes.idle());await st.goto(base);await st.locator('.cup .chip',{hasText:'Connected'}).first().waitFor();await ready(st);
+  check(JSON.stringify(await chips())===JSON.stringify(['Connected','Connected']),'Idle chips: '+JSON.stringify(await chips()));
+  check(overviewCalls===0,'State mode must not poll /api/overview');
+  check(/^(Live )?via this PC · read /.test(await st.locator('#headset-status').textContent())&&await headerFits('state 390',st)===undefined,'Header via + read age: '+await st.locator('#headset-status').textContent());
+  check(await st.locator('#op').isHidden()&&await st.locator('#use-here').isVisible(),'Idle: Use here, no operation card');
+  await st.waitForFunction(()=>true);await sleep(300);
+  check(stateGets.some(g=>g.after===states.snap.seq&&g.wait==='25'),'Long-poll must send after=<seq>&wait=25: '+JSON.stringify(stateGets.slice(-3)));
+  check(await st.locator('.device',{hasText:'MacBook Pro'}).getByRole('button',{name:'Move the headphones to the Mac'}).isVisible(),'Mac row offers Move to Mac');
+  check(!(await st.locator('#devices').textContent()).includes('Android phone'),'A device holding a slot never shows as saved');
+
+  // Tap Move to Mac: one non-blocking POST with target, the first step shown before the reply
+  switchPosts.length=0;switchReplied=0;switchHandler=async b=>{await sleep(500);return {accepted:true,seq:states.snap.seq,operation:op('mac','reading',[step('reading',lbl('reading'),'active',{since:now()})],{started_at:now()})};};
+  await st.getByRole('button',{name:'Move the headphones to the Mac'}).click();
+  await st.locator('#op .step.active',{hasText:lbl('reading')}).waitFor({timeout:300});check(!switchReplied,'The first step must show before the controller answers');
+  await sleep(700);
+  const mb=switchPosts[0]?.body;check(switchPosts.length===1&&mb.target==='mac'&&mb.source==='web'&&/^[a-z0-9]{1,32}$/.test(mb.request_id)&&!('replace' in mb),'Move to Mac payload '+JSON.stringify(mb));
+  check((await opText()).includes('Moving to the Mac'),'Operation title for the Mac: '+await opText());
+  check(await st.locator('[data-switch="true"]:enabled').count()===0&&await st.locator('[data-live="true"]:enabled').count()===0,'One operation at a time: other actions disabled');
+
+  // Mac → PC: releasing, connecting, done; each pushed by the long-poll, never inferred by the page
+  states.set(scenes.macphone());await st.locator('#op').waitFor({state:'hidden'});
+  switchPosts.length=0;switchHandler=async()=>({accepted:true,seq:states.snap.seq,operation:scenes.releasing().operation});
+  await st.getByRole('button',{name:/^Use here/}).click();await sleep(200);
+  check(switchPosts[0]?.body.target==='pc','Use here sends target pc: '+JSON.stringify(switchPosts[0]?.body));
+  states.set(scenes.releasing());await st.locator('#op .step.active',{hasText:lbl('releasing','Mac')}).waitFor();
+  check(JSON.stringify(await chips())===JSON.stringify(['Connected','Releasing…']),'Releasing chips: '+JSON.stringify(await chips()));
+  check((await st.locator('#op .step.done').first().textContent()).includes('0.4 s'),'Done step shows its seconds');
+  check(await st.locator('#op .step.pending').count()===2,'Pending steps listed');
+  states.set(scenes.connecting());await st.locator('#op .step.active',{hasText:lbl('connecting_here','PC')}).waitFor();
+  check(JSON.stringify(await chips())===JSON.stringify(['Connected','Connecting…']),'Connecting chips: '+JSON.stringify(await chips()));
+  check(await st.locator('.device',{hasText:'Desktop PC'}).count()===0,'A connecting device leaves the saved list');
+  states.set(scenes.done());await st.locator('#op .op-r',{hasText:`${M.ok} · 4.1 s`}).waitFor();
+  check(await st.locator('#op .step.done').count()===4,'All four steps done');
+  check(await st.locator('#use-here').isHidden(),'Result shows in place of Use here');
+  // Auto-clear: the controller drops the finished operation
+  states.set(scenes.idle());await st.locator('#op').waitFor({state:'hidden'});check(await st.locator('#use-here').isVisible(),'Use here returns after the result clears');
+
+  // Failure: the failed step says why; Try again sends the same target
+  states.set(scenes.failed());await st.locator('#op .step.failed .why',{hasText:lbl('release_failed','Mac')}).waitFor();
+  check((await st.locator('#op .step.failed .ss').textContent())==='12.0 s','Failed step shows its seconds');
+  switchPosts.length=0;switchHandler=async()=>({accepted:true,seq:states.snap.seq,operation:scenes.releasing().operation});
+  await st.getByRole('button',{name:'Try again'}).click();await sleep(200);
+  check(switchPosts.length===1&&switchPosts[0].body.target==='pc','Try again resends the tap once: '+JSON.stringify(switchPosts.map(p=>p.body)));
+
+  // Choose: Replace Mac / Replace PC / Cancel; a choice is a new tap with replace, Cancel ends the phase
+  states.set(scenes.choose());await st.getByRole('button',{name:'Replace Mac',exact:true}).waitFor();
+  check(JSON.stringify(await st.locator('#op .op-choose button').allTextContents())==='["Replace Mac","Replace PC","Cancel"]','Choose buttons');
+  switchPosts.length=0;switchHandler=async()=>({accepted:true,seq:states.snap.seq,operation:scenes.choose().operation});
+  await st.getByRole('button',{name:'Replace Mac',exact:true}).click();await sleep(200);
+  check(switchPosts.length===1&&switchPosts[0].body.target==='phone'&&switchPosts[0].body.replace===DEV.mac.address,'Replace payload '+JSON.stringify(switchPosts[0]?.body));
+  states.set(scenes.choose());await st.getByRole('button',{name:'Cancel',exact:true}).waitFor();
+  cancels.length=0;await st.getByRole('button',{name:'Cancel',exact:true}).click();await sleep(200);
+  check(cancels.length===1,'Cancel posts /api/switch/cancel');
+
+  // Unreachable: unknown slots with their age, each controller's reason
+  states.set(scenes.unreachable());await st.locator('.cup .chip',{hasText:'Unknown'}).first().waitFor();
+  check(JSON.stringify(await chips())===JSON.stringify(['Unknown · 2 min ago','Unknown · 2 min ago']),'Unknown chips: '+JSON.stringify(await chips()));
+  const reasons=await st.locator('#controllers li').allTextContents();
+  check(JSON.stringify(reasons)===JSON.stringify(['PCHeadset is not connected to this PC','Phoneapp not running','Macno answer']),'Controller reasons: '+JSON.stringify(reasons));
+  check((await st.locator('#headset-status').textContent()).startsWith('Not reachable · last read 2 min ago'),'Unreachable header: '+await st.locator('#headset-status').textContent());
+  check(await st.locator('#use-here').isEnabled(),'Use here stays available: the controller reads the headset itself');
+  check(!await st.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'State mode horizontal overflow');
+
+  // Screenshots: every scene, light + dark, phone + desktop. Times are frozen-ish: the shots are taken right after set().
+  for(const [w,h,kind] of [[390,844,'phone'],[1280,900,'desktop']]){
+   await st.setViewportSize({width:w,height:h});
+   for(const colorScheme of ['light','dark']){
+    await st.emulateMedia({colorScheme});
+    for(const name of Object.keys(scenes)){
+     if(name==='macphone')continue;
+     states.set(scenes[name]());await st.mouse.move(1,1);await sleep(150);await ready(st);
+     check(await st.evaluate(()=>[...document.querySelectorAll('.cup .chip')].every(c=>[c,...c.children].every(e=>getComputedStyle(e).display==='none'||e.scrollWidth<=e.clientWidth+1)&&c.getBoundingClientRect().right<=c.closest('.cup').getBoundingClientRect().right-8)),`${name} ${kind}: a state chip is cut off`);
+     check(await st.evaluate(()=>{const t=[...document.querySelectorAll('.cup .chip')].map(c=>c.getBoundingClientRect().top+c.offsetHeight/2);for(const a of document.querySelectorAll('.cup .slot-age,.cup .slot'))if(getComputedStyle(a).display!=='none')t.push(a.getBoundingClientRect().top+a.offsetHeight/2);return t.every(v=>Math.abs(v-t[0])<=1.5);}),`${name} ${kind}: chips misaligned`);
+     if(kind==='phone')check(!await st.evaluate(()=>document.documentElement.scrollWidth>innerWidth),`${name} phone overflow`);
+     await shot(st,`state/${kind}-${colorScheme}-${name}.png`);
+    }
+   }
+  }
+  await st.close();
+  // The Mac popover in state mode: single column with the operation card, heights still reported
+  const pop=await browser.newPage({viewport:{width:380,height:800}});pop.on('pageerror',e=>errors.push(e.message));
+  await pop.addInitScript(()=>{window.__sizes=[];window.webkit={messageHandlers:{boseSize:{postMessage:m=>window.__sizes.push(m.height)}}};});
+  await wire(pop);states.set(scenes.connecting());await pop.goto(base+'/?view=popover');await pop.locator('#op .step.active').waitFor();await ready(pop);
+  check(!await pop.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'Popover state overflow');
+  check(await pop.evaluate(()=>window.__sizes.length>0),'Popover height reported in state mode');
+  await shot(pop,'state/popover-light-connecting.png');await pop.close();
+  states=null;
+ }
+
  check(!errors.length,errors.join('\n'));
- console.log(`GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window); Use here through ${contract.scenarios.length} contract scenarios + popover source, row contract text, Android bridge.`);
+ console.log(`GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window); Use here through ${contract.scenarios.length} contract scenarios + popover source, row contract text, Android bridge; /api/state long-poll: chips, steps, timings, result, auto-clear, retry, choose/cancel, Move-to targets, unreachable reasons, 404 fallback, popover.`);
  await browser.close();
 })().catch(e=>{console.error(e);process.exit(1);});

@@ -115,6 +115,62 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 .status.pend{color:var(--accent-ink);font-weight:500;align-items:center}
 .status.pend .led{width:7px;height:7px;margin:0 2px 0 4px}
 
+/* State chip: each slot cup says its state in a word, from the controller's GET /api/state */
+.chip{display:inline-flex;align-items:center;gap:7px;height:24px;padding:0 10px 0 9px;border-radius:12px;font-size:13px;font-weight:500;color:var(--ink);background:var(--ground);border:1px solid var(--cup-edge);white-space:nowrap;min-width:0;max-width:100%;overflow:hidden}
+.chip .led{width:7px;height:7px;box-shadow:0 0 0 2px var(--ok-halo)}
+.chip .led.idle{box-shadow:inset 0 0 0 1.5px var(--ink-3)}
+.chip .led.pending{box-shadow:0 0 0 2px var(--accent-wash)}
+.chip.pending{color:var(--accent-ink);background:var(--accent-wash);border-color:transparent}
+.chip.idle{color:var(--ink-2);font-weight:400}
+.chip .age{font-weight:400;margin-left:-4px;overflow:hidden;text-overflow:ellipsis}
+.cup.open .chip,.cup.unknown .chip{background:transparent}
+.cup .state .chip+.slot{margin-left:auto}
+/* Phone-width cups: the chip gets the whole row (the cup's place already says which slot) */
+.cups.st .cup{container-type:inline-size}
+.cup .state .slot-age{display:none;margin-left:auto;color:var(--ink-2);white-space:nowrap}
+@container (max-width:200px){.cup .state{column-gap:4px}.cup .state .slot{display:none}.chip{padding:0 8px 0 7px;gap:6px}.chip .age{display:none}.cup .state .slot-age{display:inline;font-size:12.5px}}
+.cup.stale .name,.cup.stale .dev{color:var(--ink-2)}
+/* Operation card: the one switch running anywhere, step by step (pending · active · done ✓ s · failed + reason) */
+.op{margin:2px 16px 12px;padding:14px 16px 14px;border-radius:26px;background:var(--surface);border:1px solid var(--cup-edge);position:relative;z-index:2}
+.op.run,.op.choosing{border:1.5px solid var(--accent)}
+.op-h{display:flex;align-items:baseline;gap:10px}
+.op-t{flex:1;min-width:0;font-size:16px;font-weight:500}
+.op-time{font-size:13px;color:var(--ink-2)}
+.op.run .op-time{color:var(--accent-ink)}
+.op-src{font-size:13px;color:var(--ink-2);margin-top:1px}
+.steps{list-style:none;margin:10px 0 0}
+.step{position:relative;display:grid;grid-template-columns:20px minmax(0,1fr) auto;column-gap:10px;align-items:start;padding:4px 0;font-size:14px;line-height:20px;color:var(--ink-2)}
+.step+.step::before{content:"";position:absolute;left:9.5px;top:-3px;height:5px;width:1px;background:var(--line-strong);opacity:.6}
+.step .mk{width:20px;height:20px;display:grid;place-items:center}
+.step .mk i{width:9px;height:9px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--ink-3)}
+.step .mk i.led{box-shadow:0 0 0 3px var(--accent-wash)}
+.step .mk svg{width:18px;height:18px;stroke-width:2}
+.step.done .mk svg{color:var(--ok)}
+.step.failed .mk svg{color:var(--bad)}
+.step.done .sl{color:var(--ink)}
+.step.active .sl{color:var(--ink);font-weight:500}
+.step.failed .sl{color:var(--bad);font-weight:500}
+.step .ss{font-size:13px;color:var(--ink-2)}
+.step.active .ss{color:var(--accent-ink)}
+.step.failed .ss{color:var(--bad)}
+.step .why{grid-column:2/-1;font-size:13px;line-height:1.35;color:var(--bad);margin-top:1px}
+.op-r{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--hair);font-size:14px;line-height:1.35;color:var(--ink);min-height:44px}
+.op-r svg{width:18px;height:18px;flex:none;color:var(--ok);stroke-width:2}
+.op-r>span{flex:1;min-width:0}
+.op-r.error{color:var(--ink-2)}
+.op-r.error svg{color:var(--bad)}
+.op-r .btn{flex:none;margin:-4px 0 -4px auto}
+.op-choose{margin-top:10px;padding-top:10px;border-top:1px solid var(--hair)}
+.op-choose p{font-size:14px;font-weight:500;color:var(--accent-ink);margin-bottom:10px}
+.op-choose .opts{display:flex;flex-wrap:wrap;gap:8px}
+.op-choose .opts .btn{flex:1 1 0;min-width:0;padding:0 12px;background:var(--ground)}
+.op-choose .opts .btn.ghost{flex:0 0 auto}
+.ctl.list .ctl-h{color:var(--ink-2);margin-bottom:4px}
+.ctl.list ul{list-style:none}
+.ctl.list li{display:flex;gap:8px;padding:3px 0;line-height:1.35}
+.ctl.list li b{flex:0 0 46px}
+.ctl.list li span{min-width:0}
+
 /* Noise cancellation */
 section{padding:0 20px;position:relative;z-index:1}
 .nc{margin-top:22px}
@@ -188,7 +244,7 @@ dialog .btn.quiet{margin-top:6px;color:var(--ink-2);font-weight:400}
  :root:not(.popover) .top h1{font-size:26px}
  :root:not(.popover) .plot{grid-column:1/-1;height:190px;margin:6px 0 14px}
  :root:not(.popover) .plot .cap{left:4px;right:4px}
- :root:not(.popover) .cups,:root:not(.popover) .choose,:root:not(.popover) .usehere{margin-left:0;margin-right:0}
+ :root:not(.popover) .cups,:root:not(.popover) .choose,:root:not(.popover) .usehere,:root:not(.popover) .op{margin-left:0;margin-right:0}
  :root:not(.popover) .cups{padding:0;margin-top:0}
  :root:not(.popover) .nc,:root:not(.popover) .col-side section,:root:not(.popover) .foot{padding:0 4px}
  :root:not(.popover) .nc{margin-top:28px}
@@ -204,7 +260,7 @@ dialog .btn.quiet{margin-top:6px;color:var(--ink-2);font-weight:400}
 :root.popover .cups{gap:10px;padding:0 12px;margin-top:6px}
 :root.popover .cup{min-height:164px;padding:14px 11px 12px;border-radius:26px}
 :root.popover .cup .state{column-gap:6px;font-size:12.5px}
-:root.popover .choose,:root.popover .usehere{margin:2px 12px 10px}
+:root.popover .choose,:root.popover .usehere,:root.popover .op{margin:2px 12px 10px}
 :root.popover section{padding:0 14px}
 :root.popover .nc{margin-top:16px}
 :root.popover .saved{margin-top:20px}
