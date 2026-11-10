@@ -50,7 +50,11 @@ any step ──error/timeout──▶ failed(step, error_key, text)      done/fa
 - `connecting(mac|phone)`: BMAP connect through a controller that reaches the headset (the target device
   pages itself where its controller supports it).
 - `audio` (target pc only): wait for the A2DP sink (event-driven, not polling), select A2DP / relink /
-  restart WirePlumber only when stopped (existing ladder), set default sink, read back.
+  restart WirePlumber only when stopped (existing ladder), set default sink, read back. Then **audio must
+  flow**: the BlueZ `MediaTransport1.State` of the headset goes `active`. Already active (something plays):
+  done. Idle: play a short quiet chime to the Bose sink (`pw-play`) and require `active` within 3 s; not
+  active → `failed(audio, no_audio, "Connected, but no sound from the headphones")`. Added 2026-11-10 after
+  "connected but silent" at 17:3x (sink SUSPENDED, nothing playing; the player was paused).
 - Each step has its own timeout and the whole operation one 150 s deadline. A command whose reply may still
   be outstanding is never resent (existing rule).
 - Each transition records `started_at` and, on leaving, `seconds`. `done`/`failed` keep the step list.
