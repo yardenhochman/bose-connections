@@ -351,4 +351,9 @@ class WatcherTests(unittest.TestCase):
             self.assertEqual(len(reads),2)
         finally:s.stop()
 
+class SlotTests(unittest.TestCase):
+    def test_open_slots_are_unknown_until_a_fresh_read(self):
+        hub=Hub(dict(id='pc',roles=dict(ROLES),peers=[]))
+        self.assertEqual([x['state'] for x in hub.snapshot()['slots']],['unknown','unknown'])
+
 if __name__=='__main__':unittest.main()

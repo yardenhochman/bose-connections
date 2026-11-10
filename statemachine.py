@@ -181,8 +181,9 @@ class Hub:
             held=[e for e,c in entries if e['state'] in ('connected','releasing') or e['state']=='unknown' and c]
             held+=[e for e,_ in entries if e['state']=='connecting']
             slots=held[:2];others=[e for e,_ in entries if e not in slots]
-            slots+=[dict(state='free')]*(2-len(slots))
             read_reachable=self.reachable and age is not None and age<=READ_FRESH
+            # An open slot is `free` only on a fresh read; with no read (or a stale one) nobody knows what holds it.
+            slots+=[dict(state='free') if read_reachable or age is not None and age<=READ_FRESH else dict(state='unknown',age=age)]*(2-len(slots))
             ids=[self.config['id']]+[p['id'] for p in self.config.get('peers',[])]
             seen={c.get('controller'):c for c in self.controllers}
             controllers=[]
