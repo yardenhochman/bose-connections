@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 sys.path.insert(0,str(Path(__file__).resolve().parent));sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import controller, statemachine
-from statemachine import Hub, Operation, BluezWatcher, PactlWatcher, ReadScheduler, STEPS
+from statemachine import Hub, Operation, BluezWatcher, PactlWatcher, ReadScheduler, STEPS, Phase, TRANSITIONS, IllegalTransition
 from fakeworld import World, PC, PHONE, MAC, TV, SINK, ROLES
 
 CONTRACT=json.loads((Path(__file__).with_name('switch-contract.json')).read_text())
@@ -350,6 +350,81 @@ class WatcherTests(unittest.TestCase):
             while len(reads)<2 and time.perf_counter()<end:time.sleep(.01)
             self.assertEqual(len(reads),2)
         finally:s.stop()
+
+class PhaseTableTests(unittest.TestCase):
+    """The operation phase machine (docs/state-machines.md, machine 1): the table is the only way phase changes."""
+    EXPECTED={  # from -> the phases it may enter; finishing is legal from every non-final phase
+        'reading':{'reading','releasing','connecting','audio','choose','done','failed'},
+        'releasing':{'reading','releasing','connecting','choose','done','failed'},
+        'connecting':{'reading','releasing','connecting','audio','choose','done','failed'},
+        'audio':{'reading','audio','done','failed'},
+        'choose':{'done','failed'},'done':set(),'failed':set()}
+    def at(self,phase):
+        op=Operation('web','pc')
+        if phase in ('releasing','connecting'):op.step(phase)
+        elif phase=='audio':op.step('connecting');op.step('audio')
+        elif phase=='choose':op.choose([])
+        elif phase in ('done','failed'):op.finish(phase=='done','x','unreachable')
+        self.assertEqual(op.phase,phase);return op
+    def go(self,op,to):
+        if to=='choose':op.choose([])
+        elif to in ('done','failed'):op.finish(to=='done','x','unreachable')
+        else:op.step(to)
+    def test_table_is_exactly_the_documented_one(self):
+        self.assertEqual({str(k):{str(x) for x in v} for k,v in TRANSITIONS.items()},self.EXPECTED)
+    def test_every_pair_follows_the_table(self):
+        for src in self.EXPECTED:
+            for to in self.EXPECTED:
+                with self.subTest(f'{src}->{to}'):
+                    op=self.at(src)
+                    if to in self.EXPECTED[src]:self.go(op,to);self.assertEqual(op.phase,to)
+                    else:
+                        before=(op.phase,json.dumps(op.to_json(),sort_keys=True))
+                        with self.assertRaises(IllegalTransition):self.go(op,to)
+                        self.assertEqual((op.phase,json.dumps(op.to_json(),sort_keys=True)),before,'a refused change changes nothing')
+    def test_born_in_its_first_step_never_without_a_phase(self):
+        op=Operation('web','pc');j=op.to_json()
+        self.assertEqual(j['phase'],'reading');self.assertEqual([(s['name'],s['state']) for s in j['steps']],[('reading','active')])
+        op=Operation('web','phone',action='disconnect',first='releasing',label='Releasing the Phone',marks={PHONE:'releasing'})
+        self.assertEqual((op.phase,op.steps[0]['label'],op.marks),('releasing','Releasing the Phone',{PHONE:'releasing'}))
+        for bad in ('choose','done','failed'):
+            with self.assertRaises(IllegalTransition):Operation('web','pc',first=bad)
+    def test_reentering_the_active_step_keeps_its_timer(self):
+        op=Operation('web','pc');op.step('connecting',marks={PC:'connecting'});since=op.steps[-1]['since']
+        op.step('connecting','Connecting this PC',{PC:'connecting'})
+        self.assertEqual(op.steps[-1]['since'],since);self.assertEqual(op.steps[-1]['label'],'Connecting this PC')
+        self.assertEqual([s['name'] for s in op.steps],['reading','connecting'])
+    def test_phase_is_a_plain_string_in_json(self):
+        op=Operation('web','pc');op.finish(True,'ok')
+        self.assertEqual(json.loads(json.dumps(op.to_json()))['phase'],'done');self.assertIsInstance(op.phase,str)
+    def test_illegal_step_inside_a_switch_fails_the_operation_instead_of_sticking(self):
+        w=World([PHONE,MAC])
+        orig=w.pc.switch
+        def broken(data,info):info['op'].choose([]);info['op'].step('connecting')  # choose -> connecting is illegal
+        w.pc.switch=broken
+        with w.running(),self.assertLogs('bose.timing',level='INFO'):
+            w.pc.switch_start({'source':'web'});state=w.wait_done()
+        op=state['operation'];self.assertEqual(op['phase'],'failed',op)  # ended, not stuck in a running phase
+        self.assertIn('choose -> connecting',op['result']['detail'])
+        w.pc.switch=orig
+    def test_accepted_reply_already_shows_the_reading_step(self):
+        w=World([PHONE]);w.audio.gate=threading.Event()
+        with w.running(),self.assertLogs('bose.timing',level='INFO'):
+            reply=w.pc.switch_start({'source':'web','request_id':'r1'})
+            self.assertEqual(reply['operation']['phase'],'reading');self.assertEqual(reply['operation']['steps'][0]['name'],'reading')
+            w.audio.gate.set();w.wait_done()
+    def test_a_tap_right_after_a_finish_is_accepted_not_rejected(self):
+        # The worker settles the operation, then releases the switch lock: a tap in between used to get accepted:false.
+        w=World([PC,PHONE]);w.audio.current=SINK;w.emit()
+        with w.running(),self.assertLogs('bose.timing',level='INFO'):
+            w.pc.switch_start({'source':'desk','request_id':'one'});w.wait_done()
+            for _ in range(200):
+                if not w.pc.switch_lock.locked():break
+                REAL_SLEEP(.01)
+            w.pc.switch_lock.acquire()
+            threading.Timer(.2,w.pc.switch_lock.release).start()
+            reply=w.pc.switch_start({'source':'web','request_id':'two'})
+            self.assertTrue(reply['accepted'],reply);self.assertEqual(reply['operation']['id'],'two');w.wait_done()
 
 class SlotTests(unittest.TestCase):
     def test_open_slots_are_unknown_until_a_fresh_read(self):

@@ -140,6 +140,7 @@ roles from the headset's saved-device list.
 
 The PC controller owns the connection state; front ends render it and run no switch flow of their own
 ([docs/state-machine.md](docs/state-machine.md); code in `statemachine.py`, the steps in `Controller.switch`).
+Every state machine in the app, its transition table and the open backlog: [docs/state-machines.md](docs/state-machines.md).
 `GET /api/state?after=<seq>&wait=<s>` is a long-poll: it answers at once when `seq > after` (or without `after`),
 otherwise at the next change or after `wait` seconds (at most 25). The mesh port serves it to peers with the token.
 The reply holds `seq`, `now`, `headset` (reachable, `via`, `read_age`, battery, noise, product, and each
@@ -352,7 +353,7 @@ addresses). The in-app web page reaches it as `/api/switch` through the same
 python3 -m unittest discover -s tests -v
 ```
 
-The 117 tests use simulated transports and have no hardware side effects.
+The 130 tests use simulated transports and have no hardware side effects.
 `tests/test_state_machine.py` drives the state machine through `tests/fakeworld.py`: a simulated headset, BlueZ link
 and PipeWire sink shared by three real controllers on a fake clock. It covers every transition, the long-poll, the
 watchers' parsing and restarts, and `?wait=1`. `python3 tests/smoke_switch.py` runs the real HTTP server on a random
@@ -367,6 +368,8 @@ protocol/controller tests cover packet fragmentation, rejected commands, slot/an
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
 
+`tests/web_machines.cjs` (run by `tests/test_web_machines.py`, skipped without node) checks the transition tables of the
+dashboard's machines block in `web/app.js` ([docs/state-machines.md](docs/state-machines.md)).
 `tests/test_android_contract.py` compiles `android/Switcher.java` with a test-only
 `org.json` stand-in and runs every scenario of `tests/switch-contract.json` against a fake
 overview and override (skipped without a JDK); `tests/test_mac_contract.py` statically checks that

@@ -95,6 +95,19 @@ Item {
     probe.connectDevice(probe.deviceFor(devs.mac))
     check(probe.notice && probe.notice.text === contract.messages.errors.timeout, "row connect timeout shows the contract text")
     probe.destroy()
+    // An overview requested before a Use here and answered after it must not undo the switch (state-machines.md 6).
+    var held = null, sw = null
+    const late = modelComponent.createObject(harness, {transport: function(method, path, body, done) {
+      if (path === "/api/switch") sw = done; else if (path === "/api/overview" && late.loaded) held = done; else done(null, overview([devs.phone, devs.mac]))
+    }}) as BoseModel
+    late.refresh(); late.refresh()
+    check(held !== null && late.canUseHere, "late refresh: an overview is in flight and Use here stays available")
+    late.switchHere()
+    sw(null, {ok: true, verified: true, message: contract.messages.ok, state: overview([devs.phone, devs.pc])})
+    held(null, overview([devs.phone, devs.mac]))
+    check(late.devices.filter(function(d) { return d.connected }).map(function(d) { return d.address }).sort().join() === [devs.pc, devs.phone].sort().join(),
+          "late refresh: the older overview does not bring back the old slots")
+    late.destroy()
     contract.scenarios.forEach(runScenario)
     console.log((failures ? "FAIL" : "PASS") + " omarchy contract: " + contract.scenarios.length + " scenarios, " + checks + " checks, " + failures + " failures")
     Qt.exit(failures ? 1 : 0)

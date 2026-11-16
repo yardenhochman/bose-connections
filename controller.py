@@ -578,12 +578,11 @@ class Controller:
     def op_id(self,rid):return rid if isinstance(rid,str) and rid!='-' and REQUEST_ID.fullmatch(rid) else None
     def override_operation(self,data,source,rid,known):
         address=str(data.get('address','')).upper();replace=str(data.get('replace') or '').upper();role=self.role_of(address)
-        op=self.hub.begin(Operation(source,role or 'other',action=data['action'],op_id=self.op_id(rid),deadline=SWITCH_DEADLINE))
-        op.label=self.device_label(address,known)
-        if data['action']=='connect':
-            op.step('connecting',self.connect_label(role,address,known),{address:'connecting',**({replace:'releasing'} if replace else {})})
-        else:op.step('releasing',STEPS['releasing'].format(label=op.label),{address:'releasing'})
-        return op
+        label=self.device_label(address,known)
+        if data['action']=='connect':first,text,marks='connecting',self.connect_label(role,address,known),{address:'connecting',**({replace:'releasing'} if replace else {})}
+        else:first,text,marks='releasing',STEPS['releasing'].format(label=label),{address:'releasing'}
+        op=Operation(source,role or 'other',action=data['action'],op_id=self.op_id(rid),deadline=SWITCH_DEADLINE,first=first,label=text,marks=marks)
+        op.label=label;return self.hub.begin(op)
     def settle(self,op,result,start):
         """End an operation from its reply (contract shape) and log its one bose.timing line."""
         try:
@@ -651,7 +650,13 @@ class Controller:
         """POST /api/switch: start an operation and answer at once; the front end follows GET /api/state.
         A tap while one runs is refused with the running operation."""
         start=time.monotonic();source,rid,role=self.switch_tags(data,start)
-        if not self.switch_lock.acquire(blocking=False):
+        def free():
+            # Held while an operation runs. With none running the holder is a worker between settle and release (or an
+            # override about to begin its operation): wait briefly instead of refusing with a finished operation.
+            if self.switch_lock.acquire(blocking=False):return True
+            current=self.hub.operation
+            return not (current and current.running) and self.switch_lock.acquire(timeout=2.0)
+        if not free():
             running=self.hub.operation
             self.log_switch(source,rid,dict(via='local',target=LABELS.get(role,role)),'rejected',start)
             return dict(accepted=False,operation=running.to_json() if running else None,seq=self.hub.seq)

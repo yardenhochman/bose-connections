@@ -19,6 +19,7 @@ QtObject {
   property bool loading: false
   property bool savingRoles: false
   property var pending: null       // {action, address, replace, name, replaceName}
+  property int changes: 0          // started connection changes: an overview or cache read sent before the latest one is stale
   property var replacing: null     // saved device waiting for a slot choice
   property var busySlots: null     // Use here: [{address, label}] offered after a busy reply
   property var notice: null        // {text, tone: "ok" | "error" | "pending"}
@@ -200,8 +201,10 @@ QtObject {
     snapshot = next
   }
   function loadCached(thenRefresh) {
+    var gen = changes
     request("GET", "/api/cached", null, function(err, json) {
       if (err) { if (err.network) { m.helperDown = true; m.loaded = true } }
+      else if (gen !== m.changes) {}
       else if (!m.loaded || m.snapshot.cached || (json.observed || 0) > (m.snapshot.observed || 0)) m.applySnapshot(json)
       if (thenRefresh) m.refresh()
     })
@@ -209,6 +212,7 @@ QtObject {
   function refresh() {
     if (loading || pending) return
     loading = true
+    var gen = changes
     request("GET", "/api/overview", null, function(err, json) {
       m.loading = false
       if (err) {
@@ -217,7 +221,7 @@ QtObject {
         m.notice = {tone: "error", text: err.message + (err.network ? " Start the Bose Connections helper, then refresh." : "")}
         return
       }
-      m.applySnapshot(json)
+      if (gen === m.changes) m.applySnapshot(json)
     })
   }
   function opened() {
@@ -269,6 +273,7 @@ QtObject {
     busySlots = null
     replacing = null
     var here = hereAddress
+    changes++
     pending = {action: "connect", address: here, name: nameOf(deviceFor(here)) || "This PC", replace: replace || "", replaceName: label, here: true}
     notice = {tone: "pending", text: replace ? messages.replacing.replace("{label}", label || "device") : messages.pending}
     var body = {source: "omarchy", request_id: Math.random().toString(36).slice(2, 10)}
@@ -290,6 +295,7 @@ QtObject {
     }, 160000)
   }
   function mutate(body, p) {
+    changes++
     pending = p
     request("POST", "/api/override", body, function(err, json) {
       if (err || !json || json.ok === false) {

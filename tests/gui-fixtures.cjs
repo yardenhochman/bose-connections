@@ -155,6 +155,17 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  await page.getByText('MacBook Pro connected').waitFor();
  check((await page.locator('.cup').nth(1).textContent()).includes('MacBook Pro'),'MacBook Pro should take slot 2');
 
+ // A refresh sent before a change and answered after it must not undo the change (overview mode; state-machines.md 2)
+ {const before=cur;let release;const gate=new Promise(r=>release=r);
+  await page.unroute('**/api/overview');await page.route('**/api/overview',async r=>{overviewCalls++;const snap=cur;await gate;return r.fulfill({json:snap});});
+  await page.locator('#refresh').click();
+  overrideHandler=async()=>{cur=overview([DEV.pc.address],cur.noise);return {ok:true,verified:true,message:'MacBook Pro disconnected',state:cur};};
+  await page.getByRole('button',{name:'Disconnect MacBook Pro'}).click();await page.getByText('MacBook Pro disconnected').waitFor();
+  release();await page.waitForFunction(()=>!document.querySelector('#refresh').disabled);await sleep(100);
+  check(await page.locator('.cup',{hasText:'MacBook Pro'}).count()===0,'A refresh answered after a change must not bring back the old slots');
+  await page.unroute('**/api/overview');await page.route('**/api/overview',r=>{overviewCalls++;return r.fulfill({json:cur});});
+  cur=before;await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect MacBook Pro'}).waitFor();}
+
  // Failure reverts to the last confirmed state; a response without state falls back to one overview read
  overrideHandler=async()=>{await sleep(200);return {ok:false,verified:false,message:'The headset didn’t confirm the disconnect.'};};
  await page.getByRole('button',{name:'Disconnect MacBook Pro'}).click();
