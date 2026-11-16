@@ -4,7 +4,7 @@
 The switch algorithm itself (which step runs when) lives in controller.Controller.switch; this module only records and
 renders. Times: `time.monotonic()` (looked up at call time, so tests can patch it) for ages, step seconds and expiry;
 `time.time()` for the wall-clock `now`, `started_at` and `since` fields; long-poll waits use the real clock."""
-import contextlib, functools, json, re, secrets, shutil, subprocess, threading, time
+import contextlib, enum, functools, json, re, secrets, shutil, subprocess, threading, time
 from time import monotonic as _real_monotonic
 
 # Step labels and the operation's own result texts (tests/switch-contract.json "steps"; a test keeps them equal).
@@ -29,16 +29,42 @@ def _locked(method):
         with (self.hub.cond if self.hub else contextlib.nullcontext()):return method(self,*args,**kwargs)
     return wrapper
 
+class Phase(enum.StrEnum):
+    """An operation's phase (`operation.phase` in GET /api/state; a str, so JSON and string compares keep working)."""
+    READING='reading';RELEASING='releasing';CONNECTING='connecting';AUDIO='audio';CHOOSE='choose';DONE='done';FAILED='failed'
+STEP_PHASES=(Phase.READING,Phase.RELEASING,Phase.CONNECTING,Phase.AUDIO)
+FINAL=frozenset((Phase.DONE,Phase.FAILED))
+# The only legal phase changes (docs/state-machines.md). Any running step may go back to `reading`: a same-tap re-pair
+# runs the switch again on the same operation. `choose` and the step phases may always finish; a final phase is final.
+TRANSITIONS={
+    Phase.READING:{Phase.READING,Phase.RELEASING,Phase.CONNECTING,Phase.AUDIO,Phase.CHOOSE},
+    Phase.RELEASING:{Phase.READING,Phase.RELEASING,Phase.CONNECTING,Phase.CHOOSE},
+    Phase.CONNECTING:{Phase.READING,Phase.RELEASING,Phase.CONNECTING,Phase.AUDIO,Phase.CHOOSE},  # paging first, then a release
+    Phase.AUDIO:{Phase.READING,Phase.AUDIO},
+    Phase.CHOOSE:set(),Phase.DONE:set(),Phase.FAILED:set()}
+for _p in TRANSITIONS:
+    if _p not in FINAL:TRANSITIONS[_p]|=FINAL
+class IllegalTransition(ValueError):
+    """A phase change the table does not allow; inside a switch it ends the operation as failed, never stuck."""
+
 class Operation:
-    """One switch or connection change: phase, ordered steps with timing, device marks and the final result."""
-    def __init__(self,source,target,action='switch',op_id=None,deadline=150.0,hub=None):
+    """One switch or connection change: phase, ordered steps with timing, device marks and the final result.
+    It is born in its first step (`first`, default `reading`), so no reader ever sees an operation without a phase.
+    `_go` is the only writer of `phase`; it checks TRANSITIONS."""
+    def __init__(self,source,target,action='switch',op_id=None,deadline=150.0,hub=None,first=Phase.READING,label=None,marks=None):
         self.id=op_id or secrets.token_hex(3);self.source=source;self.target=target;self.action=action
-        self.deadline=deadline;self.hub=hub;self.started_at=time.time();self.t0=_mono()
-        self.steps=[];self.phase=None;self.result=None;self.choices=None;self.marks={};self.finished_at=None
+        self.deadline=deadline;self.hub=None;self.started_at=time.time();self.t0=_mono()
+        self.steps=[];self.phase=Phase(first);self.result=None;self.choices=None;self.marks={};self.finished_at=None
+        if self.phase not in STEP_PHASES:raise IllegalTransition(f'an operation starts in a step, not {first}')
+        self._enter(self.phase,label,marks);self.hub=hub
     @property
-    def running(self):return self.phase not in ('done','failed','choose')
+    def running(self):return self.phase in STEP_PHASES
     @property
-    def finished(self):return self.phase in ('done','failed')
+    def finished(self):return self.phase in FINAL
+    def _go(self,to):
+        to=Phase(to)
+        if to not in TRANSITIONS[self.phase]:raise IllegalTransition(f'{self.phase} -> {to}')
+        self.phase=to
     def _changed(self):
         if self.hub:self.hub.touch()
     def _find(self,name):return next((s for s in self.steps if s['name']==name),None)
@@ -61,29 +87,40 @@ class Operation:
             if not self._find(name):self._insert(name,label)
             elif self._find(name)['state']=='pending':self._find(name)['label']=label
         self._changed()
+    def _enter(self,name,label,marks):
+        name=str(name);s=self._find(name) or self._insert(name,label or STEPS.get(name,name))
+        if label:s['label']=label
+        s['state']='active';s['since']=time.time();s['_t']=_mono();self.marks=dict(marks or {})
     @_locked
     def step(self,name,label=None,marks=None):
-        """Leave the active step (done, seconds recorded) and enter `name`; marks map addresses to releasing/connecting."""
-        self._close_active()
-        s=self._find(name) or self._insert(name,label or STEPS.get(name,name))
-        if label:s['label']=label
-        s['state']='active';s['since']=time.time();s['_t']=_mono()
-        self.phase=name;self.marks=dict(marks or {});self._changed()
+        """Leave the active step (done, seconds recorded) and enter `name`; marks map addresses to releasing/connecting.
+        Entering the step already active keeps its timer and only updates its label and marks."""
+        name=Phase(name)
+        if name not in STEP_PHASES:raise IllegalTransition(f'{name} is not a step')
+        self._go(name)
+        active=self._find(name)
+        if active and active['state']=='active':
+            if label:active['label']=label
+            self.marks=dict(marks or {})
+        else:self._close_active();self._enter(name,label,marks)
+        self._changed()
     @_locked
     def choose(self,choices):
+        self._go(Phase.CHOOSE)
         self._close_active();self.steps=[s for s in self.steps if s['state']!='pending']
         if not self._find('choose'):self._insert('choose',STEPS['choose'])
         c=self._find('choose');c['state']='active';c['since']=time.time();c['_t']=_mono()
-        self.phase='choose';self.choices=[dict(address=x['address'],label=x['label']) for x in choices];self.marks={};self._changed()
+        self.choices=[dict(address=x['address'],label=x['label']) for x in choices];self.marks={};self._changed()
     @_locked
     def finish(self,ok,text,error_key=None,detail=None):
-        active=next((s['name'] for s in self.steps if s['state']=='active'),self.phase)
+        active=next((s['name'] for s in self.steps if s['state']=='active'),str(self.phase))
+        self._go(Phase.DONE if ok else Phase.FAILED)  # checked before any change: a second finish changes nothing
         self._close_active('done' if ok else 'failed')
         self.steps=[s for s in self.steps if s['state']!='pending']
         seconds=round(_mono()-self.t0,2)
         if ok:self.result=dict(ok=True,text=text,seconds=seconds)
         else:self.result=dict(ok=False,error_key=error_key,text=text,step=active,detail=MAC_TEXT.sub('device',str(detail or '')),seconds=seconds)
-        self.phase='done' if ok else 'failed';self.marks={};self.choices=None;self.finished_at=_mono();self._changed()
+        self.marks={};self.choices=None;self.finished_at=_mono();self._changed()
     def timings(self):return {s['name']:s['seconds'] for s in self.steps if 'seconds' in s and s['name']!='choose'}
     @_locked
     def to_json(self):
