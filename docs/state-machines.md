@@ -1,6 +1,6 @@
 # State machines: inventory and decisions
 
-Audit of 2026-11-16. Every place where the app's behaviour depends on a phase. For each one: where it lives, its
+Audit of 2026-11-16, extended 2026-11-17 (instant input: machines 5, 6 and 6b). Every place where the app's behaviour depends on a phase. For each one: where it lives, its
 states and transitions, what was wrong, and whether it was made explicit. [state-machine.md](state-machine.md) is the
 spec of the PC hub's connection model and switch flow. This file covers the code that implements that spec, plus the
 front ends.
@@ -22,8 +22,9 @@ Line numbers are those on the branch that made the change.
 | 2 | Dashboard interaction (connect, replace choice, Use here offer) | `web/app.js:8-19`, `71-75` | explicit | done |
 | 3 | Dashboard Use-here tap on shared state | `web/app.js:21-38`, `394`, `620-632` | explicit | done |
 | 4 | Dashboard link to `/api/state` | `web/app.js:40-49`, `416-424` | explicit | done |
-| 5 | Dashboard noise (ANC) writer | `web/app.js:51-60`, `286-300` | explicit | done |
-| 6 | Omarchy popup model (`BoseModel.qml`) | `linux/BoseModel.qml:19-30`, `202-360` | stale-read race fixed; conversion in backlog | partial: backlog |
+| 5 | Noise (ANC) writer, dashboard and popup | `web/app.js:49-66`, `357-394`; `linux/BoseModel.qml:247-259`, `452-480` | explicit; held state added | done |
+| 6b | Intent queue and scheduler, dashboard and popup | `web/app.js:67-103`, `390-420`; `linux/BoseModel.qml:261-345` | explicit (new) | done |
+| 6 | Omarchy popup model (`BoseModel.qml`) | `linux/BoseModel.qml:19-40`, `200-480` | noise and intents explicit; the interaction flags in backlog | partial: backlog |
 | 7 | Android tile and panel (`BoseTileService`) | `android/BoseTileService.java:25-240` | backlog | not changed |
 | 8 | Android core and switcher | `android/Core.java`, `android/Switcher.java` | backlog | not changed |
 | 9 | Mac menu (`Launcher.m`) | `mac/Launcher.m:60-260` | backlog | not changed |
@@ -98,6 +99,9 @@ which is out of scope.
 `—` means the state stays the same. `drop-choice` is sent by a refresh or a switch tap. Before the change, both of
 these cleared only `choosing`.
 
+`mutating` is the one change in flight. A tap during it no longer meets a disabled control: it goes to the intent
+queue (6b), and the cups draw both layers with `overlaySlots`.
+
 Found before the change: **a Use here offer and a slot choice at once.** After a busy Use here reply (`busySlots` set),
 pressing Connect on a saved device also set `choosing`. The page then showed the Replace-per-slot box and the
 replace-target cups together.
@@ -130,20 +134,107 @@ Known and not fixed: after the controller restarts, `seq` starts again from 0. T
 `after` then waits out its full 25 s before the page catches up. Fixing this needs a boot id in the snapshot; see the
 backlog.
 
-## 5. Noise writer (`noiser`)
+## 5. Noise writer (`noiser`, popup `noiseNext`)
 
-- **State:** `anc.m`, which is `idle`, `waiting{queued}` or `sending{sent, queued}`. It replaces
-  `anc.desired/queued/inFlight`.
-- **Shown value:** `noiseShown(m)`, the newest input, or `null` when idle.
+- **State:** `anc.m` (dashboard) and `anc` (popup): `idle`, `waiting{queued}`, `held{queued}` or `sending{sent, queued}`.
+  The popup's `ancInFlight` and `ancQueued` pair is gone.
+- **Shown value:** `noiseShown(m)`, the newest input, or `null` when idle (then the verified headset value shows).
 - **Transitions:**
-  - `input` from `idle` or `waiting` goes to `waiting{v}`.
-  - `input` while `sending` sets `queued=v`.
+  - `input` from `idle` or `waiting` goes to `waiting{v}`, from `held` to `held{v}`; while `sending` it sets `queued=v`.
+  - `hold` from `waiting` goes to `held`: a connection change or switch is running.
+  - `resume` from `held` goes to `waiting`: the change ended and the headset is reachable.
+  - `drop` from `held` goes to `idle`: the change ended with the headset out of reach. The display reverts and the
+    status line says "Noise change not sent: the headphones aren’t reachable now".
   - `send` from `waiting` goes to `sending`.
   - `ok` while `sending` goes to `waiting{queued}` if a value is queued, otherwise to `idle`.
   - `fail` goes to `idle`: the display reverts to the verified headset value and the error is shown.
 - **Throttle:** 250 ms between sends. A burst sends its first value and then its last.
+- **Cue:** a held value shows at once, with a hollow ochre ring and "Level 4 · applies when the switch ends" ("… when the
+  change ends" for a Connect or Disconnect). A value being sent shows a filled pulsing light and "Setting level 4…".
+- **Popup only:** a write whose value already equals the verified one is skipped (`send`, then `ok`, no request).
 
-No bug was found here. The conversion is for DX and AX.
+Before 2026-11-17 the slider and switch were disabled during a connection change, and the popup's `setNoise` dropped
+input while `!canNoise` with no notice.
+
+Tests: the shared table `noiser` in `tests/machine-tables.json`. `tests/web_machines.cjs` runs it against `noiser`, and
+`tests/bose_model.qml` against `noiseNext`.
+
+## 6b. Intent queue and scheduler (`intents`, `schedule`, `overlaySlots`)
+
+The backend runs one operation at a time, and the front ends keep it so: at most one `/api/override` or `/api/switch`
+request is open. The queueing happens in the front-end machines; the backend is unchanged.
+
+- **State:** `iq` (dashboard) and `queue` (popup): `idle` or `queued{intent}`. An intent is
+  `{action: connect | disconnect | here | switch, address, replace, target}`.
+- **Only writer:** `queueSend`, through `intents` (popup: `intentNext`).
+- **Transitions:**
+  - `hold(i)` from `idle` goes to `queued{i}`. From `queued{j}` it goes to `queued{i}`: the latest wins.
+  - `hold(i)` from `queued{i}` goes to `idle`: tapping the same pending control again cancels it. "Same" is the same
+    `intentKey` (action, address, replace, target).
+  - `cancel` and `release` go to `idle`.
+- **Entry:** every connection input goes through `act`. With nothing running it runs at once; otherwise it becomes the
+  queued intent.
+- **Scheduler:** `schedule({change, noise, intent, live})` is the one decision. `pump` (popup: `drain`) calls it whenever
+  work ends or input arrives.
+
+| change running | noise | intent | decision |
+|---|---|---|---|
+| yes | `waiting` | any | `hold-noise` |
+| yes | other | any | `wait` |
+| no | `sending` | any | `wait` |
+| no | not `sending` | `queued` | `intent`: release it and run it |
+| no | `held` | `idle` | `resume-noise` if live, else `drop-noise` |
+| no | `waiting` | `idle` | `noise` (after the throttle gap) |
+
+- **Change running:** this page's connection change in flight, or, for the dashboard on `/api/state`, a switch running
+  anywhere. A queued intent goes before a noise value, and that value is then held behind it, so a slider drag cannot
+  starve a tap.
+- **Release check:** a released intent is checked against the verified state first.
+  - A disconnect of a device that is no longer connected, or a connect of one that already is, says so and sends
+    nothing.
+  - A connect that finds both slots full asks which slot to replace. It never guesses.
+  - With the headset out of reach, it says so and sends nothing.
+- **Drawing:** `overlaySlots(slots, flight, queued)` is pure. It draws the change in flight and the queued intent over
+  the verified slots and never writes them, so a late reply can only update the layer underneath.
+  - A queued connect takes the free slot, or the slot that a disconnect in flight frees.
+  - A queued switch target is not drawn in a cup, because the controller picks the slot. Its row and Use here say
+    "Queued".
+- **Looks:** dashboard `style.css`; popup `SlotCup.qml` and `PillButton.qml`. Light and dark.
+  - Verified: surface fill, green light, solid text.
+  - In flight: no fill, solid ochre outline, faded device, a turning arc, and "Connecting…", "Disconnecting…" or
+    "Moving here…".
+  - Queued: no fill, dotted ochre outline, fainter device, a hollow ring, "Connects next", "Disconnects next" or
+    "Moves here next", and a "Queued · cancel" control.
+- **Deadlines:** every request has one, so a hung request cannot hold the queue.
+  - Dashboard: connection changes 160 s, because they may wait out a 150 s switch on the controller. Noise 20 s, reads
+    and `/api/roles` 30 s, the accepting `POST /api/switch` 15 s, the long-poll its `wait` plus 10 s.
+  - Popup: 160 s for changes and Use here, 20 s for noise, 30 s for reads.
+  - A timed-out change says "Controller timed out" or "Took too long to switch". If it was only slow, the controller
+    still serializes it behind the switch lock.
+- **Failure:** a released intent fails like any change. It reverts to the verified state and shows the error. While a
+  released intent runs, the status line keeps the result of the work before it.
+
+Tests:
+- `tests/machine-tables.json`: the `intents` and `schedule` tables, run against both front ends.
+- `tests/web_machines.cjs`:
+  - latest wins and cancel;
+  - ANC held behind a switch, then sent with its newest value;
+  - a held value dropped when the headset is unreachable;
+  - an intent before a waiting noise value;
+  - a late `ok` for an older noise value;
+  - `overlaySlots` cases, including a stale read underneath a queued intent.
+- `tests/gui-fixtures.cjs`, overview mode:
+  - a queue during a Disconnect, latest wins and a held slider;
+  - the order of the requests (`disconnect`, `connect`, `noise`) and at most one request open;
+  - cancel, and a failed queued disconnect reverting;
+  - a held value dropped when the change ends unreachable;
+  - Use here queued behind a noise write.
+- `tests/gui-fixtures.cjs`, `/api/state` mode:
+  - a Disconnect queued and cancelled during a switch;
+  - the held value sent only once the switch ends;
+  - a Move-to queued behind a noise write.
+- `tests/bose_model.qml` `runInstant`: the same cases for the popup, plus a stale overview landing after a queued tap.
+- `tests/render_popup.qml` renders the popup's in-flight and queued looks offscreen (light and dark) for review.
 
 ## 6. Omarchy popup model (`linux/BoseModel.qml`)
 
@@ -159,8 +250,12 @@ It talks to the old `/api/overview` and `/api/switch` endpoints, not `/api/state
   could therefore land after it and restore the old slots, and so could the 30 s `loadCached` poll in `Panel.qml`. A
   `changes` counter now drops reads that were sent before the latest change. The offscreen harness
   (`tests/bose_model.qml`) covers this case, and the check fails without the guard.
-- **Backlog: convert to one state value.** Use the same states as the dashboard's `interact`, or follow `/api/state`
-  as the dashboard does. The offscreen harness is the test bed.
+- **Done 2026-11-17:** the noise writer and the intent queue are the dashboard's machines (5, 6b), and the harness
+  runs the shared tables against them. `canMutate` and `canNoise` no longer depend on work in progress; only its own
+  Use here in flight disables Use here.
+- **Backlog: the rest of the interaction state as one value.** `pending`, `replacing` and `busySlots` are still three
+  properties. Use the dashboard's `interact`, or follow `/api/state` as the dashboard does. The offscreen harness is
+  the test bed.
 
 ## 7–9. Android and Mac (backlog)
 
@@ -216,24 +311,40 @@ a failure reverts and says so.
 
 | Where | Violation | Status |
 |---|---|---|
-| Dashboard and QML: ANC controls during a connection change | disabled until the change ends | kept; see the note below |
-| Dashboard: Connect, Disconnect and Use here during an ANC write | disabled for the write (0.3–1 s) | kept: one control channel |
-| Dashboard: Use here and Connect during a running switch | disabled (one operation at a time) | kept: the backend allows one operation; the card shows it |
+| Dashboard and QML: ANC controls during a connection change or switch | disabled until the change ended | **fixed** 2026-11-17: held, sent when it ends (5) |
+| Dashboard: Connect, Disconnect and Use here during an ANC write | disabled for the write (0.3–1 s) | **fixed**: queued (6b) |
+| Dashboard: Use here, Move to and Connect during a running switch | disabled (one operation at a time) | **fixed**: queued; the backend still runs one at a time (6b) |
+| QML: Connect, Disconnect and Use here during a change or ANC write | disabled | **fixed**: queued (6b) |
 | Dashboard and QML: a refresh landing after a change | undid the shown result | **fixed** |
-| QML: `setNoise` while `!canNoise` | input dropped with no notice | backlog (6) |
+| QML: `setNoise` while `!canNoise` | input dropped with no notice | **fixed**: held during a change; unreachable says so (5) |
 | QML: slider while pressed | sends on release only | matches the rule: the final value is sent |
+| Dashboard and QML: a request with no deadline | a hung fetch could hold the queue | **fixed**: a deadline on every request (6b) |
+| Dashboard and QML: Refresh during work in progress | disabled | kept: a read sent during a change is dropped anyway (17) |
+| QML: Save in controller settings during work | disabled | kept: a settings form, not a headset control |
 | Android: tile tap while busy, `requestNoise` while `mutating` | input dropped | backlog (7) |
 | Android: one `work` executor | refresh and ANC wait behind a switch of up to 150 s | backlog (7) |
 | Mac: all items while `changing`, noise presets | disabled; no queue | backlog (9) |
 
-Note on the ANC row: queueing a noise change behind a switch of up to 150 s needs a product decision about what the
-slider shows in the meantime. The GUI suite also asserts "one mutation at a time".
+GUI assertions that encoded the disabled UI, changed on 2026-11-17 in `tests/gui-fixtures.cjs`:
+- "Other mutations must be disabled while one runs" (Connect into the open slot). It now checks that Disconnect and the
+  slider stay enabled and that one cup spins.
+- "One operation at a time: other actions disabled" (`/api/state`, Move to Mac). It now checks that a tap queues and
+  that nothing reaches the controller during the switch.
+- "One mutation at a time" moved to the backend boundary: the fixture counts open `/api/override` and `/api/switch`
+  requests and fails above one.
+
+What the native front ends still lack. Neither could be built here (no JDK, no macOS):
+- **Android** (`BoseTileService`, `ConnectionsActivity`): no queued intent, no held noise value, no pending or queued
+  looks; a busy tap is dropped. The in-app web page is `web/app.js` and has all of it.
+- **Mac** (`Launcher.m` menu): items are disabled while `changing`, and noise presets are not queued. The popover and
+  window are `web/app.js` and have all of it.
 
 ## Backlog, by user impact
 
-1. Android tile and panel (7): one state value, a queued ANC final value, feedback on a busy tap, and a separate
-   executor for reads. Needs a JDK to compile, plus the emulator for a check.
-2. QML model (6): one state value, or follow `/api/state` as the dashboard does.
-3. Mac menu (9): queue the last noise preset, and clear stale `menuMessage`. Needs macOS.
+1. Android tile and panel (7): one state value, the intent queue and held noise of 5 and 6b (the shared tables in
+   `tests/machine-tables.json` are the spec), pending and queued looks, and a separate executor for reads. Needs a JDK
+   to compile, plus the emulator for a check.
+2. QML model (6): `pending`, `replacing` and `busySlots` as one value, or follow `/api/state` as the dashboard does.
+3. Mac menu (9): queue the last noise preset and a tap during `changing`, and clear stale `menuMessage`. Needs macOS.
 4. A boot id in `/api/state`, so a restarted controller does not stall the long-poll for 25 s (4).
 5. `LineWatcher.stop` race (10): only if the service ever starts stopping its watchers.

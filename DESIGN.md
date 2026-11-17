@@ -101,7 +101,11 @@ components:
     padding: "16px 14px 14px"
     height: "180px"
   slot-cup-pending:
-    backgroundColor: "{colors.surface}"
+    backgroundColor: "transparent"
+    textColor: "{colors.accent-ink}"
+    rounded: "{rounded.cup}"
+  slot-cup-queued:
+    backgroundColor: "transparent"
     textColor: "{colors.accent-ink}"
     rounded: "{rounded.cup}"
   slot-cup-open:
@@ -176,7 +180,7 @@ Every visible state is a confirmed state or an explicitly pending one. Ochre mea
 Cool slate neutrals on a solid ground, one ochre accent, one teal status colour, one muted red for errors.
 
 ### Primary
-- **Sleeve Ochre** (`accent` / `accent-dark`): Connect outline, pending cup border, pending LED, replace-target dashed border, pressed Connect and pending pill fill, the This-device dash. Light accent is #ad8037 on every surface (3.55:1 on white, passes 3:1 for UI strokes); `accent-wash` is the same hue at 12%.
+- **Sleeve Ochre** (`accent` / `accent-dark`): Connect outline, pending cup border (solid in flight, dotted queued), pending LED (filled in flight, hollow ring queued), replace-target dashed border, pressed Connect fill, the This-device dash. Light accent is #ad8037 on every surface (3.55:1 on white, passes 3:1 for UI strokes); `accent-wash` is the same hue at 12%.
 - **Ochre Ink** (`accent-ink` / `accent-ink-dark`): ochre text. 6.82:1 on white, 6.18:1 on `surface`; dark 9.3:1 on `ground-dark`.
 - **On Ochre** (`on-accent`): text on filled ochre (5.15:1 light, 8.21:1 dark).
 
@@ -244,7 +248,7 @@ Flat. Depth comes only from the cup fill against the ground and the ridge band's
 - Buttons and pills: fully round ends (44px tall, 22px radius).
 - Replace prompt: 28px radius, dashed ochre 1.5px border.
 - Select fields: 14px radius. Settings dialog: 30px radius.
-- Lines: 1px hairlines for dividers; 1.5px for state borders (pending solid ochre, target dashed ochre, open/unknown dashed neutral).
+- Lines: 1px hairlines for dividers; 1.5px for state borders (in flight solid ochre, queued dotted ochre, target dashed ochre, open/unknown dashed neutral).
 - Icons: 24-unit line icons, 1.4 stroke, round caps and joins, `currentColor`, drawn at 22px.
 
 ## Components
@@ -261,7 +265,8 @@ Outside sound let through, as 15 stacked smooth ridges from a fixed seeded field
 
 ### Use here (one tap)
 The primary action: a full-width outlined ochre pill "Use here" directly under the ridge band, above the cups (popup: same place, under the band). It shows whenever this device's role is known, even from cached state, because the controller reads the headset itself first. Texts and flow come from `tests/switch-contract.json`.
-- **Tap:** the pill fills ochre and reads `Connecting…` at once. This device's cup turns pending when a slot is free. The status line shows `Connecting…` in `accent-ink` with a breathing ochre LED. Every other mutation disables.
+- **Tap:** the pill fills ochre and reads `Connecting…` at once. This device's cup turns pending ("Moving here…") when a slot is free. The status line shows `Connecting…` in `accent-ink` with a breathing ochre LED. Other controls stay enabled; a tap on them is queued.
+- **Tap during other work:** the pill gets a dotted ochre outline and reads `Use here queued · tap to cancel`; this device's cup shows "Moves here next" in the queued look. Tapping again cancels it.
 - **Both slots busy:** the replace prompt shows `Both slots busy · choose one to replace` with one outlined `Replace <label>` button per slot plus Cancel. The prompt wraps to a second row of equal-width buttons. A tap sends the chosen slot and reads `Replacing <label>…`.
 - **Success:** `Playing on Bose 700` with the teal check. **Failure:** the contract error text plus ` · tap to retry` in error red; the pill is immediately tappable again.
 
@@ -269,7 +274,8 @@ The primary action: a full-width outlined ochre pill "Use here" directly under t
 Two cups side by side, always in a stable order: a connected device keeps the cup it already holds. Each cup: state row (LED, state word, "Slot N" right), device icon, name, tag line, action at the bottom.
 - **Connected:** `surface` fill, 1px `cup-edge`, teal LED, ghost Disconnect.
 - **This device:** tag line in `accent-ink` 500 with a 12×2px ochre dash: "This PC" / "This phone" / "This Mac".
-- **Pending (connecting/disconnecting):** 1.5px solid ochre border, state row `accent-ink` 500, breathing ochre LED, bottom filled ochre pill "Connecting…" / "Disconnecting…" (`aria-busy`). Disconnecting dims name and icon to 60%. A connecting device leaves the saved list and appears in its target cup with "Replacing <name>" when replacing.
+- **In flight (connecting/disconnecting, sent):** an intended result, never drawn like a verified one. No fill, 1.5px solid ochre border, state row `accent-ink` 500, breathing ochre LED, name and icon at 62%, bottom pill in `accent-wash` with a turning 14px ochre arc and "Connecting…" / "Disconnecting…" / "Moving here…" (`aria-busy`). A connecting device leaves the saved list and appears in its target cup with "Replacing <name>" when replacing.
+- **Queued (not sent; waits for the running work):** no fill, 1.5px dotted ochre border, hollow ochre ring, "Connects next" / "Disconnects next" / "Moves here next", name, icon and tag at 50%, and a dotted "Queued · cancel" pill that cancels it. One queued intent at a time; the newest tap replaces it.
 - **Open (live, empty):** transparent, 1.5px dashed `line-strong`, "Open slot", "Connect a saved device".
 - **Unknown/cached-empty:** transparent, 1.5px dashed `hair`, compact; "Not known"/"Headset not reachable" or "Open slot"/"Refresh to check".
 - **Replace target:** while choosing, each connected cup becomes a button with a 1.5px dashed ochre border, `accent-wash` on hover, ochre outlined "Replace" pill.
@@ -277,9 +283,9 @@ Two cups side by side, always in a stable order: a connected device keeps the cu
 ### Shared state (GET /api/state)
 Since 2026-11-10 the web page renders the controller's one state (`docs/state-machine.md` §3) through a `GET /api/state?after=<seq>&wait=25` long-poll; it falls back to the overview flow above only when `/api/state` answers 404 (older controller) or inside the Android bridge. The page infers no connection state of its own.
 - **Header:** `2 of 2 connected · Live via this PC · read 3 s ago` (ages tick each second); unreachable: `Not reachable · last read 2 min ago`; LED ochre while an operation runs.
-- **State chip** in each cup's state row: `Connected` (teal LED), `Connecting…` / `Releasing…` (ochre wash, breathing LED), `Free` (hollow), `Unknown · 2 min ago` (hollow). Phone-width cups (container ≤200px) drop "Slot N" and move the unknown age to the right of the chip so nothing truncates.
+- **State chip** in each cup's state row: `Connected` (teal LED), `Connecting…` / `Releasing…` / `Disconnecting…` (ochre wash, breathing LED), `Connects next` / `Disconnects next` (dotted ochre outline, hollow ring), `Free` (hollow), `Unknown · 2 min ago` (hollow). Phone-width cups (container ≤200px) drop "Slot N" and move the unknown age to the right of the chip so nothing truncates.
 - **Operation card** replaces Use here while `operation` is set (any source; "Started on the desk bar" when not this page): title `Moving to this PC` with a running time, the controller's step labels verbatim, each pending (hollow dot), active (breathing ochre dot, label 500 with `…`, running seconds in `accent-ink`), done (teal ✓ + seconds) or failed (red alert, seconds, the result text under it). Done adds `Playing on Bose 700 · 4.1 s`; failed adds what the state still shows (`Still on Phone and Mac`) and **Try again**. The choose phase shows `Both slots busy · choose one to replace` with `Replace <label>` per choice and Cancel. Running: 1.5px ochre border; finished: hairline. It clears with the controller's 8 s linger.
-- **Switch targets:** Use here and the saved rows of role devices (`Use here`, `Move to Mac`, `Move to phone`) post `/api/switch {source, request_id, target[, replace]}`; they stay enabled when the headset is unreachable (the controller reads it first) and disable while an operation runs. Devices without a role keep Connect (override).
+- **Switch targets:** Use here and the saved rows of role devices (`Use here`, `Move to Mac`, `Move to phone`) post `/api/switch {source, request_id, target[, replace]}`; they stay enabled when the headset is unreachable (the controller reads it first). While an operation or a noise write runs, a tap queues: the row reads `Queued · goes next` with a dotted `Queued · cancel` button, and tapping it again cancels. A tap on the target of the running switch does nothing. Devices without a role keep Connect (override).
 - **Controllers:** one line when all is well; a list with each controller's reason when one is offline with a long reason or the headset is unreachable.
 
 ### Buttons
@@ -293,7 +299,7 @@ Since 2026-11-10 the web page renders the controller's one state (`docs/state-ma
 Appears above the cups when both slots are full and a Connect is tapped: dashed ochre pill strip, `accent-wash` fill, "Both slots are in use. Choose which connection <name> replaces." and a Cancel ghost button. Focus moves to the first target cup; Escape cancels and returns focus to the row.
 
 ### Noise cancellation
-Row: "Noise cancellation" (title) + sub-line (`On · level 7 of 10` / `Off · all through`; pending `Setting level 7…` / `Turning off…` in `accent-ink` with a pending LED). Switch: 52×32 slate track/fill. Slider 0–10 with 11 ticks and Aware/Max ends; dimmed to 40% and disabled when ANC is off.
+Row: "Noise cancellation" (title) + sub-line (`On · level 7 of 10` / `Off · all through`; pending `Setting level 7…` / `Turning off…` in `accent-ink` with a pending LED; held behind a change or switch `Level 7 · applies when the switch ends` with a hollow ochre ring). The controls stay enabled during a change or switch. Switch: 52×32 slate track/fill. Slider 0–10 with 11 ticks and Aware/Max ends; dimmed to 40% and disabled when ANC is off.
 - **Release-apply:** dragging only previews (ridges and labels); the level is written on release.
 - **Coalescing:** at most one write in flight; while one is in flight only the latest requested value is queued, and the next write starts no sooner than 250ms after the previous one started. Failure clears the queue and reverts to the confirmed value.
 
