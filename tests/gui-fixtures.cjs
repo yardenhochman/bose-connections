@@ -256,6 +256,29 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await page.getByText('Noise change not sent: the headphones aren’t reachable now').waitFor({timeout:4000});
   check(posts.length===1&&await page.locator('#noise-enabled').isChecked(),'Dropped noise: never sent, the switch shows the verified On again');
   cur=overview([pc,ph],{level:4,enabled:true});await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect Android phone'}).waitFor();await page.getByText('Live · just now').waitFor();
+  // Refresh during a change (formerly disabled): shown at once as queued, read once the change ends, never undoing it.
+  overrideHandler=async b=>{await sleep(1500);return apply(b);};posts.length=0;
+  await page.getByRole('button',{name:'Disconnect Android phone'}).click();await page.locator('.cup.pending',{hasText:'Disconnecting…'}).waitFor({timeout:200});
+  const reads=overviewCalls;
+  check(await page.locator('#refresh').isEnabled(),'Refresh stays enabled while a change runs');
+  await page.locator('#refresh').click();await page.locator('#refresh').click();
+  check(await page.locator('#refresh.queued').count()===1&&overviewCalls===reads,'Refresh during a change: drawn queued, nothing read yet ('+(overviewCalls-reads)+' reads)');
+  await page.getByText('Android phone disconnected').waitFor({timeout:6000});await sleep(400);
+  check(overviewCalls===reads+1&&await page.locator('#refresh.queued').count()===0,'Refresh during a change: exactly one read once it ends, got '+(overviewCalls-reads));
+  check(await page.locator('.cup',{hasText:'Android phone'}).count()===0,'The deferred read keeps the verified result');
+  // Connect with both slots full while a change runs (formerly dropped with no notice): queued, and it asks for the
+  // slot once it is released, since the slots may change meanwhile. It never guesses.
+  cur=overview([pc,ph],cur.noise);await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect Android phone'}).waitFor();
+  posts.length=0;
+  await page.getByRole('button',{name:'Connect MacBook Pro'}).click();await page.getByRole('button',{name:'Replace Android phone'}).click();
+  await page.locator('.cup.pending').waitFor({timeout:300});
+  await page.getByRole('button',{name:'Connect Living room TV'}).click();
+  await page.locator('.btn.connect.queued').waitFor({timeout:300}).catch(()=>{});
+  check(await page.locator('.device',{hasText:'Living room TV'}).locator('.queued').count()===1&&posts.length===1,'Connect into full slots during a change is queued: '+JSON.stringify(posts.map(p=>p.body)));
+  await page.getByRole('button',{name:'Replace MacBook Pro'}).waitFor({timeout:6000});
+  check(posts.length===1&&await page.getByRole('button',{name:/^Replace /}).count()===2,'Released into full slots it asks which to replace, sending nothing');
+  await page.getByRole('button',{name:'Cancel',exact:true}).click();
+  cur=overview([pc,ph],cur.noise);await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect Android phone'}).waitFor();
  }
 
  // Settings dialog
