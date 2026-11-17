@@ -1,6 +1,8 @@
 # State machines: inventory and decisions
 
-Audit of 2026-11-16, extended 2026-11-17 (instant input: machines 5, 6 and 6b). Every place where the app's behaviour depends on a phase. For each one: where it lives, its
+Audit of 2026-11-16, extended 2026-11-17 (instant input: machines 5, 6 and 6b), then the whole backlog closed on
+2026-11-17 (branch `backlog-fixes`: Android, Mac, popup interaction, boot id, watcher race, Refresh and Save).
+Every place where the app's behaviour depends on a phase. For each one: where it lives, its
 states and transitions, what was wrong, and whether it was made explicit. [state-machine.md](state-machine.md) is the
 spec of the PC hub's connection model and switch flow. This file covers the code that implements that spec, plus the
 front ends.
@@ -19,23 +21,23 @@ Line numbers are those on the branch that made the change.
 |---|---|---|---|---|
 | 1 | Operation phase (switch / override) | `statemachine.py:32-120`, `controller.py:579-690` | explicit | done |
 | 1b | Operation slot: switch lock ↔ hub operation | `controller.py:649-676` | race fixed; left as lock + phase | done |
-| 2 | Dashboard interaction (connect, replace choice, Use here offer) | `web/app.js:8-19`, `71-75` | explicit | done |
+| 2 | Dashboard interaction (connect, replace choice, Use here offer) | `web/app.js:8-19`, `71-75` | explicit; table shared (popup, Android) | done |
 | 3 | Dashboard Use-here tap on shared state | `web/app.js:21-38`, `394`, `620-632` | explicit | done |
-| 4 | Dashboard link to `/api/state` | `web/app.js:40-49`, `416-424` | explicit | done |
+| 4 | Dashboard link to `/api/state` | `web/app.js:40-49`, `416-424` | explicit; boot id (eb5eb54) | done |
 | 5 | Noise (ANC) writer, dashboard and popup | `web/app.js:49-66`, `357-394`; `linux/BoseModel.qml:247-259`, `452-480` | explicit; held state added | done |
 | 6b | Intent queue and scheduler, dashboard and popup | `web/app.js:67-103`, `390-420`; `linux/BoseModel.qml:261-345` | explicit (new) | done |
-| 6 | Omarchy popup model (`BoseModel.qml`) | `linux/BoseModel.qml:19-40`, `200-480` | noise and intents explicit; the interaction flags in backlog | partial: backlog |
-| 7 | Android tile and panel (`BoseTileService`) | `android/BoseTileService.java:25-240` | backlog | not changed |
-| 8 | Android core and switcher | `android/Core.java`, `android/Switcher.java` | backlog | not changed |
-| 9 | Mac menu (`Launcher.m`) | `mac/Launcher.m:60-260` | backlog | not changed |
-| 10 | Watcher child lifecycle | `statemachine.py:273-303` | leave | — |
+| 6 | Omarchy popup model (`BoseModel.qml`) | `linux/BoseModel.qml` | explicit: one `ui` value (74a2079) | done |
+| 7 | Android tile and panel | `android/TileModel.java`, `android/Machines.java`, `android/BoseTileService.java` | explicit (d40beaf, 6589a35) | done |
+| 8 | Android core and switcher | `android/Core.java`, `android/Switcher.java` | `LOCAL_OK` fixed (9920bdf); switch loop left (procedural) | done |
+| 9 | Mac menu (`Launcher.m`) | `mac/Machines.h`, `mac/Launcher.m` | intents and noise explicit (2a665d5) | done |
+| 10 | Watcher child lifecycle | `statemachine.py:281-320` | stop race fixed (eb5eb54) | done |
 | 11 | Headset read scheduler | `statemachine.py:361-383` | leave | — |
 | 12 | Hub inputs: own link, audio, read age | `statemachine.py:140-260` | leave | — |
 | 13 | Switch algorithm steps | `controller.py:751-835` | leave (procedural) | — |
 | 14 | Forgotten-key re-pair job | `controller.py:700-740` | leave | — |
 | 15 | Discovery window | `controller.py:274-296` | leave | — |
 | 16 | Probe futures, prelude cache, `ident_ok` | `controller.py:211-212`, `297-333`, `492-495` | leave | — |
-| 17 | Dashboard overview refresh | `web/app.js:77`, `382-388` | leave; race fixed | done |
+| 17 | Dashboard overview refresh | `web/app.js` `refresh`, `pump` | leave; race fixed; deferred during work (6104bd2) | done |
 | 18 | Android relay service | `android/RelayService.java` | leave | — |
 
 ## 1. Operation phase (backend)
@@ -102,6 +104,14 @@ these cleared only `choosing`.
 `mutating` is the one change in flight. A tap during it no longer meets a disabled control: it goes to the intent
 queue (6b), and the cups draw both layers with `overlaySlots`.
 
+The table is `interact` in `tests/machine-tables.json` since 2026-11-17; it runs against the dashboard, the popup
+(`interactNext`) and Android (`Machines.interact`).
+
+**Fixed 2026-11-17 (6104bd2):** a Connect with both slots full while a change ran sent `pick`, which `mutating`
+refuses, so the tap did nothing and said nothing. It now queues (6b); its row shows "Connects next · asks which slot
+to replace" and "Queued · cancel", and on release it asks for the slot. GUI check "Connect into full slots during a
+change is queued".
+
 Found before the change: **a Use here offer and a slot choice at once.** After a busy Use here reply (`busySlots` set),
 pressing Connect on a saved device also set `choosing`. The page then showed the Replace-per-slot box and the
 replace-target cups together.
@@ -130,9 +140,12 @@ still order its operations.
   and a 404 goes to `legacy`.
 - **`legacy`** is final.
 
-Known and not fixed: after the controller restarts, `seq` starts again from 0. The first long-poll with the old
-`after` then waits out its full 25 s before the page catches up. Fixing this needs a boot id in the snapshot; see the
-backlog.
+**Fixed 2026-11-17 (eb5eb54): a restarted controller stalled the long-poll.** `seq` starts again from 0, so the first
+poll with the old `after` waited out its full 25 s. The snapshot now carries `boot` (`Hub.boot`, a random id per
+process). The page sends `&boot=` with `after` and takes `seq` and `boot` from every snapshot; the controller answers a
+poll that names another boot at once. Tests: `test_a_restarted_controller_answers_an_old_after_at_once`
+(`tests/test_state_machine.py`) and the GUI check "After a controller restart the page must catch up at once"; both
+failed before the change.
 
 ## 5. Noise writer (`noiser`, popup `noiseNext`)
 
@@ -238,11 +251,10 @@ Tests:
 
 ## 6. Omarchy popup model (`linux/BoseModel.qml`)
 
-The model's phase is spread across several properties:
-- `pending`, which holds a connect, disconnect or here action;
-- `replacing`, `busySlots`, `loading` and `savingRoles`;
-- `ancInFlight`, `ancQueued` and `notice`;
-- the derived `busy`, `canMutate`, `canUseHere` and `canNoise`.
+Before 2026-11-17 the model's phase was spread across several properties: `pending`, `replacing`, `busySlots`,
+`loading`, `savingRoles`, `ancInFlight`, `ancQueued` and `notice`, with the derived `busy`, `canMutate`, `canUseHere`
+and `canNoise`. Now three machine values hold it: `ui` (2), `anc` (5) and `queue` (6b); `loading`, `savingRoles`,
+`refreshWanted` and `rolesWanted` are request flags with one writer each.
 
 It talks to the old `/api/overview` and `/api/switch` endpoints, not `/api/state`.
 
@@ -253,39 +265,87 @@ It talks to the old `/api/overview` and `/api/switch` endpoints, not `/api/state
 - **Done 2026-11-17:** the noise writer and the intent queue are the dashboard's machines (5, 6b), and the harness
   runs the shared tables against them. `canMutate` and `canNoise` no longer depend on work in progress; only its own
   Use here in flight disables Use here.
-- **Backlog: the rest of the interaction state as one value.** `pending`, `replacing` and `busySlots` are still three
-  properties. Use the dashboard's `interact`, or follow `/api/state` as the dashboard does. The offscreen harness is
-  the test bed.
+- **Done 2026-11-17 (74a2079): the interaction state as one value.** `ui` (`interactNext`, the dashboard's
+  `interact`) is written only by `uiSend`; `pending`, `replacing` and `busySlots` are now read-only views of it, so the
+  views did not change. The old flags allowed a Use here offer and a slot choice at once, like the dashboard before
+  machine 2; the harness check "picking a device closes the Use here offer" covers it. A connect into full slots during
+  a change queues and asks on release, as on the dashboard.
+- **Done 2026-11-17: Refresh and Save during work.** Both were disabled while work ran. Refresh now sets
+  `refreshWanted` (button drawn dotted, as a queued control) and reads once `drain` reaches idle; the settings Save
+  keeps `rolesWanted` ("Saves after the change", dotted) and sends `/api/roles` once the change ends, never alongside
+  it. The `changes` counter also moves when a change ends, so a read sent during a change is dropped.
+  `tests/render_popup.qml` renders both looks (scenes `refresh` and `save`).
+- The popup still reads `/api/overview`, not `/api/state`: it is the PC's own controller on loopback and gets each
+  change's verified state in the reply. Following `/api/state` would be a separate rewrite with no gap left to close.
 
-## 7–9. Android and Mac (backlog)
+## 7. Android tile and panel (`TileModel`, `Machines`, `BoseTileService`)
 
-Neither front end could be built or run here: there is no JDK on this machine and no macOS. Changing their state code
-blind is riskier than leaving it, so the following findings come from a read-only sweep and are not fixed.
+Done 2026-11-17 (d40beaf, 6589a35). Before, the phase was spread over `mutating`, `switching`, `ancInFlight`,
+`reading`, `replacing`, `pendingAction` and `tileNote`; a busy tile tap was ignored with no feedback; `requestNoise`
+checked `mutating` but not `switching`, so an ANC write could run during a switch; each tile note posted an
+`updateTile` that was never cancelled; and one executor queued every read and ANC write behind a switch of up to 150 s.
 
-- **Android `BoseTileService`.**
-  - Its phase is spread over `mutating`, `switching`, `ancInFlight`, `reading`, `replacing`, `pendingAction` and
-    `tileNote`.
-  - `busy()` covers `mutating || ancInFlight || switching`.
-  - `requestNoise` checks `mutating` but not `switching`, so an ANC write can run during a switch.
-  - A tile tap while busy is ignored with no feedback.
-  - Each `setTileNote` posts an `updateTile` that is never cancelled.
-  - The single-thread `work` executor queues every refresh and ANC write behind a switch of up to 150 s.
-- **Android `Core` and `Switcher`.**
-  - The switch loop's attempt state is implicit: up to 3 passes, and a resend only with at least 30 s left.
-  - `LOCAL_OK` is never cleared once set.
-  - These mirror the Python rules and are tested by `tests/test_android_contract.py` when a JDK is present.
-- **Mac `Launcher.m`.**
-  - Its phase is spread over `refreshing`, `changing`, `pending`, `busySlots` and `menuMessage`.
-  - Every menu item is disabled while `changing`.
-  - Noise presets are not queued.
-  - `menuMessage` stays until the next refresh succeeds.
-  - The popover and window are `web/app.js` and get machines 2–5.
+- **State:** `TileModel` (no Android types) holds the snapshot and three machines from `android/Machines.java`, the
+  dashboard's `interact`, `noiser` and `intents`, plus `schedule` and `overlaySlots`. `drain` is the one scheduler.
+  `BoseTileService` only draws the model and runs its requests.
+- **Tile tap:** during other work it becomes the queued Use here; the subtitle says "Queued here" at once and a second
+  tap cancels it. During its own switch it changes nothing (the subtitle already says "Connecting…").
+- **Noise:** held behind a connection change or switch ("Level 3 · applies when the change ends"), written 250 ms apart
+  with the newest value, dropped with "Noise change not sent: the headphones aren’t reachable now" when the change
+  ends unreachable.
+- **Refresh:** during work it reads once the work ends; a read answered after a change started or ended is dropped.
+- **Threads:** writes (`work`) and reads (`reads`) have their own executors. The model keeps one write open at a time.
+- **Tile notes:** a newer note cancels the older note's pending refresh (`Host.cancel` → `removeCallbacks`).
+- **Looks:** in flight: no fill, solid ochre outline, faded device, pulsing light, "Connecting…" or "Disconnecting…"
+  in a washed button. Queued: dotted ochre outline, hollow light, fainter device, "Connects next" (with "Replacing
+  <device>" when it takes a slot being freed) and "Queued · cancel". A queued connect into full slots shows in its row.
+  A busy switch opens the panel with "Both slots busy · choose one to replace" and Replace on each cup.
+- **Tests:** `tests/android/MachinesTest.java` runs `interact`, `noiser`, `intents` and `schedule` of
+  `tests/machine-tables.json` plus overlay cases; `tests/android/TileModelTest.java` drives the model through a fake
+  host (latest wins, held noise, busy tap feedback and cancel, offer and Replace, full slots, failure revert and
+  re-read, deferred refresh, stale read, note cancellation, noise burst, one request open). Both run under
+  `tests/test_android_contract.py` with the JDK. The old behaviour cannot run in the JVM (Android types); mutating the
+  model back to it (tap ignored while busy, noise not held, refresh not deferred) fails 8 checks.
+- **Checked on an emulator** (preview build, headless, never the phone): offer, in flight with a held value, queued,
+  and the queued tile, light and dark.
+
+## 8. Android core and switcher
+
+- **Fixed (9920bdf): `LOCAL_OK` outlived the link.** It was set by a good read and cleared only by a failed overview
+  probe. After the link dropped, every noise write still tried Bluetooth first, and `fullState` marked the phone as a
+  reachable controller in a peer's reply. `open()` now clears it with `IDENT_OK`. `tests/android/CoreTest.java` runs
+  `Core` in the JVM with stub Android types (`tests/android/shim/android`) and failed before the fix.
+- **Left: the switch loop's attempt state** (up to 3 passes, a resend only with at least 30 s left) is a loop counter
+  with one writer, the mirror of the Python switch algorithm (13). `SwitcherTest` covers every contract scenario plus
+  14 cases; a table would add risk without changing anything a front end sees.
+
+## 9. Mac menu (`mac/Machines.h`, `Launcher.m`)
+
+Done 2026-11-17 (2a665d5). Before, every item was disabled while `changing`, noise presets were not queued, Refresh was
+skipped while changing, and `menuMessage` stayed until the next refresh succeeded.
+
+- **Machines:** `mac/Machines.h` holds `BoseNoiser`, `BoseNoiseShown`, `BoseIntents`, `BoseIntentKey`, `BoseSchedule`
+  and `BoseReleaseCheck` (Foundation only). `pump` is the one scheduler; at most one `/api/override` or `/api/switch`
+  request is open.
+- **Items stay enabled during work.** A click then is the one queued intent (latest wins; the same row again, or
+  "Queued · cancel", cancels it), drawn with a mixed-state mark and "Connects next", "Disconnects next" or "Moves here
+  next". On release it is checked against the verified snapshot (already connected or disconnected, both slots full
+  without a replace, headset unreachable: it says so and sends nothing).
+- **Noise:** held behind a change ("Level n · applies when the change ends"), then sent 250 ms apart, newest value
+  last; a value equal to the verified one is skipped; failure reverts and says so.
+- **Refresh during work** shows "Refreshing after the change…" and reads once the scheduler is idle; `changes` moves
+  when a change starts and ends, so a read sent during it is dropped.
+- **Result line:** any new input clears it; it expires after 8 s (success) or 30 s (error).
+- **Tests:** `tests/mac/MachinesTest.m` runs the shared tables and release-check cases (117 checks) on macOS;
+  `tests/test_mac_contract.py` compiles and runs it there and keeps the static checks on Linux. The menu glue
+  (timers, drawing) is covered by the compile only: the installed app was not replaced or run.
 
 ## 10–18. Left as they are
 
-- **10. `LineWatcher`:** a supervisor loop with one thread as its writer. A `stop()` that lands between the loop check
-  and `popen` can leave a child running until its next output line. Only tests call `stop()`; the service never stops
-  its watchers.
+- **10. `LineWatcher`:** a supervisor loop with one thread as its writer. **Fixed (eb5eb54):** a `stop()` that landed
+  between the loop check and `popen` left a child running until its next output line. `stop()` and the child's start
+  now share a lock (`spawn`): a stop either sees the child and terminates it, or prevents it from starting. Test:
+  `test_stop_between_the_loop_check_and_popen_leaves_no_child`, which failed before.
 - **11. `ReadScheduler`:** one thread with `last` and `kicked`. Its only rule, skipping reads during an operation,
   reads `hub.running()`, which is now table-backed.
 - **12. Hub inputs:** these are observations, not phases. The precedence rules for `own_link`, the read age and
@@ -298,7 +358,8 @@ blind is riskier than leaving it, so the following findings come from a read-onl
   `discovery_lock`, and a timer restores the setting.
 - **16. Caches:** `probes` are in-flight futures that are reused, `last_overview` is a TTL cache and `ident_ok` is a
   handshake cache. None of these is a phase.
-- **17. Dashboard refresh:** a two-state `refreshing` toggle. **Fixed race:** in overview mode (the Android in-app page
+- **17. Dashboard refresh:** a two-state `refreshing` toggle, plus `refreshWanted` since 2026-11-17 (a press during
+  work reads once it ends and keeps the work's result line). **Fixed race:** in overview mode (the Android in-app page
   and older controllers), a refresh sent before a Connect or Disconnect could land afterwards and undo the verified
   result. The `mutations` counter now drops such replies. The GUI check "A refresh answered after a change" fails on
   the old code.
@@ -319,11 +380,14 @@ a failure reverts and says so.
 | QML: `setNoise` while `!canNoise` | input dropped with no notice | **fixed**: held during a change; unreachable says so (5) |
 | QML: slider while pressed | sends on release only | matches the rule: the final value is sent |
 | Dashboard and QML: a request with no deadline | a hung fetch could hold the queue | **fixed**: a deadline on every request (6b) |
-| Dashboard and QML: Refresh during work in progress | disabled | kept: a read sent during a change is dropped anyway (17) |
-| QML: Save in controller settings during work | disabled | kept: a settings form, not a headset control |
-| Android: tile tap while busy, `requestNoise` while `mutating` | input dropped | backlog (7) |
-| Android: one `work` executor | refresh and ANC wait behind a switch of up to 150 s | backlog (7) |
-| Mac: all items while `changing`, noise presets | disabled; no queue | backlog (9) |
+| Dashboard and QML: Refresh during work in progress | disabled | **fixed** 2026-11-17: drawn queued, reads once the work ends (6, 17) |
+| QML: Save in controller settings during work | disabled | **fixed**: kept and sent once the change ends, never alongside it (6) |
+| Dashboard and QML: Connect with both slots full during a change | tap ignored with no notice (dashboard) | **fixed**: queued, asks for the slot on release (2) |
+| Android: tile tap while busy, `requestNoise` while switching | input dropped / written during a switch | **fixed**: queued with feedback; noise held (7) |
+| Android: one `work` executor | refresh and ANC wait behind a switch of up to 150 s | **fixed**: reads on their own executor; work queued by the model (7) |
+| Android: tile notes | each posted an `updateTile` never cancelled | **fixed**: a newer note cancels it (7) |
+| Mac: all items while `changing`, noise presets, stale result line | disabled; no queue; message kept | **fixed** (9) |
+| Dashboard: a restarted controller | long-poll stalled 25 s | **fixed**: boot id (4) |
 
 GUI assertions that encoded the disabled UI, changed on 2026-11-17 in `tests/gui-fixtures.cjs`:
 - "Other mutations must be disabled while one runs" (Connect into the open slot). It now checks that Disconnect and the
@@ -333,18 +397,15 @@ GUI assertions that encoded the disabled UI, changed on 2026-11-17 in `tests/gui
 - "One mutation at a time" moved to the backend boundary: the fixture counts open `/api/override` and `/api/switch`
   requests and fails above one.
 
-What the native front ends still lack. Neither could be built here (no JDK, no macOS):
-- **Android** (`BoseTileService`, `ConnectionsActivity`): no queued intent, no held noise value, no pending or queued
-  looks; a busy tap is dropped. The in-app web page is `web/app.js` and has all of it.
-- **Mac** (`Launcher.m` menu): items are disabled while `changing`, and noise presets are not queued. The popover and
-  window are `web/app.js` and have all of it.
+Every front end now has the queued intent and the held noise value: dashboard, popup, Android tile and panel, Mac
+menu. The Android in-app page and the Mac popover and window are `web/app.js`.
 
-## Backlog, by user impact
+## Backlog
 
-1. Android tile and panel (7): one state value, the intent queue and held noise of 5 and 6b (the shared tables in
-   `tests/machine-tables.json` are the spec), pending and queued looks, and a separate executor for reads. Needs a JDK
-   to compile, plus the emulator for a check.
-2. QML model (6): `pending`, `replacing` and `busySlots` as one value, or follow `/api/state` as the dashboard does.
-3. Mac menu (9): queue the last noise preset and a tap during `changing`, and clear stale `menuMessage`. Needs macOS.
-4. A boot id in `/api/state`, so a restarted controller does not stall the long-poll for 25 s (4).
-5. `LineWatcher.stop` race (10): only if the service ever starts stopping its watchers.
+Empty since 2026-11-17. Left on purpose, with the reason:
+- **1b:** the switch lock and the operation phase stay two values (blocking `?wait=1` callers need the lock).
+- **8:** the Android switch loop's attempt counter (procedural, mirrors 13).
+- **Popup on `/api/overview`:** see 6.
+- **Mac menu interaction flags:** `changing`, `pending` and `busySlots` stay as fields. The menu is rebuilt from them
+  on every open and has no slot-choice screen that could clash with the busy offer; the queue and noise, where input
+  was lost, are explicit.

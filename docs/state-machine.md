@@ -61,12 +61,15 @@ any step ──error/timeout──▶ failed(step, error_key, text)      done/fa
 
 ## 3. API (loopback :8847; mesh :8848 serves the same `GET` to peers with the token)
 
-`GET /api/state?after=<seq>&wait=<s>` — long-poll. Returns at once when `seq > after`, else waits up to
-`wait` (max 25) seconds for the next change, then returns the current state. No `after`: returns at once.
+`GET /api/state?after=<seq>&wait=<s>&boot=<id>` — long-poll. Returns at once when `seq > after`, else waits up to
+`wait` (max 25) seconds for the next change, then returns the current state. No `after`: returns at once. `boot` is
+the snapshot's `boot` that `after` came from: a restarted controller counts `seq` from 0 under a new `boot`, so a
+poll naming another boot is answered at once.
 
 ```json
 {
   "seq": 412,
+  "boot": "3f9a0c1d2e4b5a69",
   "now": 1794325000.12,
   "headset": {"reachable": true, "via": "pc", "read_age": 1.4, "battery": 40,
               "noise": {"level": 10, "enabled": true}, "product": "Bose 700",
