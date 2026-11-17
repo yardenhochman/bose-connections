@@ -191,7 +191,8 @@ public class Core {
   long deadline=startNs+TimeUnit.MILLISECONDS.toNanos(waitMs);
   while(true){JSONObject s=client.status(false,false);if(connected(s).contains(target)==wantConnected)return s;long left=TimeUnit.NANOSECONDS.toMillis(deadline-System.nanoTime());if(left<=0)return null;Thread.sleep(Math.min(POLL_MS,left));}
  }
- static Client open(Context c)throws Exception{try{return new Client(c);}catch(Exception e){IDENT_OK=false;throw new Unreachable(e);}}
+ /** The headset link is gone when it cannot be opened: LOCAL_OK (this phone reads the headset) ends with it, as in status(). */
+ static Client open(Context c)throws Exception{try{return new Client(c);}catch(Exception e){IDENT_OK=false;LOCAL_OK=false;throw new Unreachable(e);}}
  static JSONObject action(Context c,JSONObject data)throws Exception{return action(c,data,-1,null);}
  static boolean pairingTarget(Context c,String address)throws Exception{JSONObject roles=config(c).optJSONObject("roles");if(roles==null)return false;for(Iterator<String> it=roles.keys();it.hasNext();)if(roles.getString(it.next()).equalsIgnoreCase(address))return true;return false;}
  static JSONObject action(Context c,JSONObject data,long preludeMs,String mode)throws Exception{
