@@ -55,6 +55,7 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 #settings{margin-left:4px}
 .batt[hidden]+#settings{margin-left:auto}
 #refresh.spinning svg{animation:spin 1s linear infinite}
+#refresh.queued{box-shadow:inset 0 0 0 1.5px transparent;outline:1.5px dotted var(--accent);outline-offset:-4px;color:var(--accent-ink)} /* pressed during a change: reads once it ends */
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* Ridge band */

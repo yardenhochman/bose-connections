@@ -62,6 +62,31 @@ class AndroidRelay(unittest.TestCase):
    run=subprocess.run([JAVA,'-cp',tmp,'local.bose.connections.TailnetTest'],capture_output=True,text=True)
    self.assertEqual(run.returncode,0,run.stdout+run.stderr);self.assertNotIn('FAIL',run.stdout)
 
+@unittest.skipUnless(JAVAC and JAVA,'JDK (javac/java) not available')
+class AndroidTileMachines(unittest.TestCase):
+ """The tile and panel (docs/state-machines.md 7, 8): the shared tables against android/Machines.java, TileModel driven
+ through a fake host, and Core's LOCAL_OK with stub Android types. Each test program prints PASS/FAIL lines."""
+ @classmethod
+ def setUpClass(cls):
+  cls.tmp=tempfile.TemporaryDirectory(prefix='bose-android-tile-');out=Path(cls.tmp.name)
+  sources=[*sorted((ROOT/'tests/android/shim').rglob('*.java')),*(ROOT/'android'/n for n in ('Machines.java','TileModel.java','Switcher.java','Core.java','Tailnet.java')),
+           *(ROOT/'tests/android'/n for n in ('MachinesTest.java','TileModelTest.java','CoreTest.java'))]
+  build=subprocess.run([JAVAC,'-encoding','UTF-8','-d',str(out),*map(str,sources)],capture_output=True,text=True)
+  if build.returncode:raise AssertionError('javac failed:\n'+build.stderr)
+  cls.out=out
+ @classmethod
+ def tearDownClass(cls):cls.tmp.cleanup()
+ def run_java(self,main,*args):
+  run=subprocess.run([JAVA,'-Dfile.encoding=UTF-8','-cp',str(self.out),'local.bose.connections.'+main,*args],capture_output=True,text=True,encoding='utf-8',timeout=120)
+  text=run.stdout+run.stderr
+  self.assertEqual(run.returncode,0,text);self.assertNotIn('\nFAIL',text);return text
+ def test_shared_tables_run_against_the_android_machines(self):
+  self.assertIn('PASS android machines',self.run_java('MachinesTest',str(ROOT/'tests/machine-tables.json')))
+ def test_tile_model_queues_holds_and_keeps_one_request_open(self):
+  self.assertIn('PASS android tile model',self.run_java('TileModelTest'))
+ def test_core_clears_local_ok_when_the_headset_cannot_be_opened(self):
+  self.assertIn('PASS android core',self.run_java('CoreTest'))
+
 class AndroidSource(unittest.TestCase):
  core=(ROOT/'android/Core.java').read_text()
  def test_pairing_action_refuses_unknown_targets_before_bluetooth(self):
@@ -74,6 +99,13 @@ class AndroidSource(unittest.TestCase):
  def test_fast_refusal_is_redialled(self):
   # QA 2026-11-09: a redial 30 ms after a close was refused in 3 ms; only quick refusals retry, within the 10 s expiry.
   self.assertIn('REDIALS=3',self.core);self.assertIn('TimeUnit.MILLISECONDS.toNanos(500)',self.core);self.assertIn('expiry.isDone()',self.core)
+ def test_tile_draws_the_model_and_reads_apart_from_writes(self):
+  tile=(ROOT/'android/BoseTileService.java').read_text()
+  self.assertIn('reads=Executors.newSingleThreadExecutor()',tile)
+  self.assertIn('path.equals("/api/overview")?reads:work',tile)
+  self.assertIn('model.tileTap()',tile)
+  for gone in ('boolean mutating','ancInFlight','shownLevel','boolean switching','busy()'):self.assertNotIn(gone,tile)
+  self.assertIn('main.removeCallbacks',tile)  # a newer tile note cancels the older one's refresh
  def test_relay_starts_on_boot_update_and_tile(self):
   manifest=(ROOT/'android/AndroidManifest.xml').read_text()
   for needed in ('RECEIVE_BOOT_COMPLETED','android.intent.action.BOOT_COMPLETED','android.intent.action.MY_PACKAGE_REPLACED','.RelayStarter'):self.assertIn(needed,manifest)

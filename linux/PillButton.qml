@@ -57,9 +57,10 @@ Item {
   Row {
     anchors.centerIn: parent
     spacing: b.theme.sp(6)
-    // In flight: a turning three-quarter arc. Queued: a hollow ring.
+    // In flight: a turning three-quarter arc. Queued: a hollow ring. An icon-only button turns its icon instead and
+    // shows queued by its dotted outline alone.
     Item {
-      visible: b.spinning || b.dotted
+      visible: (b.spinning || b.dotted) && b.text !== ""
       width: b.theme.sp(11); height: width
       anchors.verticalCenter: parent.verticalCenter
       Shape {
@@ -91,6 +92,7 @@ Item {
       size: b.theme.sp(15)
       color: label.color
       anchors.verticalCenter: parent.verticalCenter
+      RotationAnimator on rotation { running: b.spinning && b.text === "" && b.animate; from: 0; to: 360; duration: 900; loops: Animation.Infinite }
     }
     Text {
       id: label

@@ -1,9 +1,12 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #import <CoreBluetooth/CoreBluetooth.h>
+#import "Machines.h"
 static NSString *const BoseURL=@"http://127.0.0.1:8847/",*const BosePopoverURL=@"http://127.0.0.1:8847/?view=popover";
 // Texts of tests/switch-contract.json (checked verbatim by tests/test_mac_contract.py).
 static NSString *const BosePending=@"Connecting…",*const BoseReplacing=@"Replacing {label}…",*const BoseOk=@"Playing on Bose 700",*const BoseBusy=@"Both slots busy · choose one to replace",*const BoseReplace=@"Replace {label}",*const BoseRetryHint=@" · tap to retry";
+// Texts of the input rule shared with web/app.js (docs/state-machines.md 5, 6b).
+static NSString *const BoseNoiseDropped=@"Noise change not sent: the headphones aren’t reachable now";
 static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*const BoseErrTimeout=@"Took too long to switch",*const BoseErrUnverified=@"The headphones didn’t confirm the switch",*const BoseErrKeepOne=@"Can’t replace that one: keep a phone, PC or Mac connected",*const BoseErrNoAudio=@"Connected, but no sound from the headphones",*const BoseErrAudioNotMoved=@"Headphones connected, but PC audio didn’t switch",*const BoseErrForgotten=@"The headphones forgot this PC · hold their Bluetooth button until “Ready to connect”";
 @interface WeakScript : NSObject <WKScriptMessageHandler>
 @property (weak) id<WKScriptMessageHandler> target;
@@ -21,6 +24,11 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
 @property NSMenu *deviceMenu;
 @property NSDictionary *snapshot;
 @property NSString *menuMessage;
+@property NSDate *menuMessageUntil;
+@property NSDictionary *noiseM,*intentM;
+@property NSInteger changes,noiseTimer;
+@property NSDate *noiseStart;
+@property BOOL refreshWanted;
 @property BOOL refreshing;
 @property BOOL changing;
 @property NSDictionary *pending;
@@ -37,6 +45,7 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
 @implementation App
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
  NSDictionary *info=[[NSBundle mainBundle] infoDictionary];
+ self.noiseM=BoseIdle();self.intentM=BoseIdle();
  self.bluetooth=[[CBCentralManager alloc] initWithDelegate:self queue:nil options:@{CBCentralManagerOptionShowPowerAlertKey:@NO}];
  self.server=[[NSTask alloc] init];self.server.executableURL=[NSURL fileURLWithPath:info[@"BosePython"]];self.server.arguments=@[info[@"BoseController"],@"--config",info[@"BoseConfig"]];
  NSMutableDictionary *environment=[[[NSProcessInfo processInfo] environment] mutableCopy];environment[@"BOSE_PARENT_PID"]=[NSString stringWithFormat:@"%d",getpid()];self.server.environment=environment;
@@ -57,7 +66,7 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  if(!self.background)[self showWindow];
 }
 - (NSMenuItem *)item:(NSString *)title selector:(SEL)selector data:(id)data {
- NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:selector keyEquivalent:@""];item.target=self;item.representedObject=data;item.enabled=selector!=NULL && !self.changing;return item;
+ NSMenuItem *item=[[NSMenuItem alloc] initWithTitle:title action:selector keyEquivalent:@""];item.target=self;item.representedObject=data;item.enabled=selector!=NULL;return item;
 }
 - (NSMenuItem *)sectionHeader:(NSString *)title {
  if(@available(macOS 14.0,*))return [NSMenuItem sectionHeaderWithTitle:title];
@@ -69,7 +78,19 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  return device[@"name"]?:device[@"address"];
 }
 - (BOOL)isReachable {return [self.snapshot[@"reachable"] boolValue];}
-- (BOOL)canChange {return [self isReachable]&&![self.snapshot[@"cached"] boolValue]&&!self.changing;}
+- (BOOL)isLive {return [self isReachable]&&![self.snapshot[@"cached"] boolValue];}
+// Items stay clickable while work runs: a click then becomes the queued intent or the held noise value.
+- (BOOL)canChange {return [self isLive]||self.changing||![self.noiseM[@"kind"] isEqual:@"idle"];}
+- (BOOL)workRunning {return self.changing||[self.noiseM[@"kind"] isEqual:@"sending"];}
+// A result line lives 8 s (success) or 30 s (error), the lifetimes of the Android tile's notes; any new input clears it.
+- (void)say:(NSString *)text error:(BOOL)error {self.menuMessage=text.length?text:nil;self.menuMessageUntil=text.length?[NSDate dateWithTimeIntervalSinceNow:error?30:8]:nil;}
+- (NSDictionary *)queuedIntent {return [self.intentM[@"kind"] isEqual:@"queued"]?self.intentM[@"intent"]:nil;}
+// The noise value on screen: the newest input while one is pending, else the verified headset value.
+- (NSDictionary *)shownNoise {
+ NSDictionary *shown=BoseNoiseShown(self.noiseM);if(shown)return shown;
+ NSDictionary *noise=self.snapshot[@"noise"];if(![noise isKindOfClass:[NSDictionary class]])return nil;
+ return @{@"level":noise[@"level"]?:@0,@"enabled":@([noise[@"enabled"] boolValue])};
+}
 - (NSString *)clock:(id)epoch {
  if(![epoch isKindOfClass:[NSNumber class]])return nil;
  NSDateFormatter *f=[NSDateFormatter new];f.timeStyle=NSDateFormatterShortStyle;f.dateStyle=NSDateFormatterNoStyle;return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:[epoch doubleValue]]];
@@ -77,12 +98,14 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
 - (NSString *)headerTitle {
  NSMutableArray *parts=[NSMutableArray arrayWithObject:@"Bose 700"];
  id battery=self.snapshot[@"battery"];if([battery isKindOfClass:[NSNumber class]])[parts addObject:[NSString stringWithFormat:@"%d%%",[battery intValue]]];
- NSDictionary *noise=self.snapshot[@"noise"];if([noise isKindOfClass:[NSDictionary class]]&&[noise[@"enabled"] boolValue]&&noise[@"level"])[parts addObject:[NSString stringWithFormat:@"ANC %d",[noise[@"level"] intValue]]];
+ NSDictionary *noise=[self shownNoise];if(noise&&[noise[@"enabled"] boolValue])[parts addObject:[NSString stringWithFormat:@"ANC %d",[noise[@"level"] intValue]]];
  return [parts componentsJoinedByString:@" · "];
 }
 - (NSString *)stateLine {
- if(self.menuMessage)return self.menuMessage;
- if(!self.snapshot)return self.refreshing?@"Refreshing…":@"Unavailable";
+ if(self.menuMessage&&[self.menuMessageUntil timeIntervalSinceNow]>0)return self.menuMessage;
+ if(self.refreshWanted)return @"Refreshing after the change…";
+ if(self.refreshing)return @"Refreshing…";
+ if(!self.snapshot)return @"Unavailable";
  if([self.snapshot[@"cached"] boolValue]){NSString *t=[self clock:self.snapshot[@"observed"]];return t?[@"Last known · " stringByAppendingString:t]:@"Last known";}
  if(![self isReachable])return @"Unavailable";
  NSUInteger n=0;for(NSDictionary *d in self.snapshot[@"devices"]?:@[])if([d[@"connected"] boolValue])n++;
@@ -92,18 +115,24 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  NSString *address=device[@"address"];
  if([self.pending[@"address"] isEqual:address])return [self.pending[@"action"] isEqual:@"disconnect"]?@"Disconnecting…":BosePending;
  if(self.pending[@"replace"]&&[self.pending[@"replace"] isEqual:address])return @"Disconnecting…";
+ NSDictionary *q=[self queuedIntent];
+ if([q[@"address"] isEqual:address]||[q[@"replace"] isEqual:address])return [q[@"action"] isEqual:@"disconnect"]||[q[@"replace"] isEqual:address]?@"Disconnects next":@"Connects next";
  return plain;
 }
+- (BOOL)isQueued:(NSString *)address {NSDictionary *q=[self queuedIntent];return q&&([q[@"address"] isEqual:address]||[q[@"replace"] isEqual:address]);}
 - (void)rebuildMenu {
  [self.deviceMenu removeAllItems];
  self.statusItem.button.appearsDisabled=![self isReachable];self.statusItem.button.alphaValue=[self isReachable]?1.0:0.55;
  [self.deviceMenu addItem:[self item:[self headerTitle] selector:NULL data:nil]];
  [self.deviceMenu addItem:[self item:[self stateLine] selector:NULL data:nil]];
  BOOL can=[self canChange];
+ NSDictionary *queued=[self queuedIntent];BOOL queuedHere=[queued[@"action"] isEqual:@"here"];
+ if(queued)[self.deviceMenu addItem:[self item:@"Queued · cancel" selector:@selector(cancelQueued:) data:nil]];
  [self.deviceMenu addItem:[NSMenuItem separatorItem]];
- NSMenuItem *use=[self item:self.switchText?:@"Use on this Mac" selector:@selector(useHereClicked:) data:nil];use.enabled=!self.changing;[self.deviceMenu addItem:use];
+ NSMenuItem *use=[self item:self.switchText?:(queuedHere&&!queued[@"replace"]?@"Moves here next":@"Use on this Mac") selector:@selector(useHereClicked:) data:nil];if(queuedHere&&!queued[@"replace"])use.state=NSControlStateValueMixed;[self.deviceMenu addItem:use];
  for(NSDictionary *slot in self.busySlots){
-  NSMenuItem *row=[self item:[BoseReplace stringByReplacingOccurrencesOfString:@"{label}" withString:slot[@"label"]?:@"device"] selector:@selector(replaceClicked:) data:slot[@"address"]];row.enabled=!self.changing;[self.deviceMenu addItem:row];
+  BOOL mine=queuedHere&&[queued[@"replace"] isEqual:slot[@"address"]];
+  NSMenuItem *row=[self item:mine?@"Moves here next":[BoseReplace stringByReplacingOccurrencesOfString:@"{label}" withString:slot[@"label"]?:@"device"] selector:@selector(replaceClicked:) data:slot[@"address"]];if(mine)row.state=NSControlStateValueMixed;[self.deviceMenu addItem:row];
  }
  NSString *hereRole=self.snapshot[@"here"];NSDictionary *roleMap=self.snapshot[@"roles"];NSString *hereAddress=([hereRole isKindOfClass:[NSString class]]&&[roleMap isKindOfClass:[NSDictionary class]])?roleMap[hereRole]:nil;
  NSArray *devices=self.snapshot[@"devices"]?:@[];
@@ -114,14 +143,14 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
   for(NSDictionary *d in connected){
    NSString *name=[self label:d];if(hereAddress&&[hereAddress isEqual:d[@"address"]])name=[name stringByAppendingString:@" — this Mac"];
    NSMenuItem *row=[self item:[self titleFor:d plain:name] selector:@selector(deviceClicked:) data:@{@"action":@"disconnect",@"address":d[@"address"]}];
-   row.state=NSControlStateValueOn;row.enabled=can;[self.deviceMenu addItem:row];
+   row.state=[self isQueued:d[@"address"]]?NSControlStateValueMixed:NSControlStateValueOn;row.enabled=can;[self.deviceMenu addItem:row];
   }
  }
  if(saved.count){
   [self.deviceMenu addItem:[NSMenuItem separatorItem]];[self.deviceMenu addItem:[self sectionHeader:@"Saved"]];
   for(NSDictionary *d in saved){
    NSDictionary *action=@{@"action":@"connect",@"address":d[@"address"]};
-   NSMenuItem *row=[self item:[self titleFor:d plain:[self label:d]] selector:@selector(deviceClicked:) data:action];row.enabled=can;
+   NSMenuItem *row=[self item:[self titleFor:d plain:[self label:d]] selector:@selector(deviceClicked:) data:action];row.enabled=can;if([self isQueued:d[@"address"]])row.state=NSControlStateValueMixed;
    if(connected.count>=2){
     row.action=NULL;NSMenu *replace=[NSMenu new];replace.autoenablesItems=NO;
     for(NSDictionary *old in connected){NSMutableDictionary *a=[action mutableCopy];a[@"replace"]=old[@"address"];NSMenuItem *r=[self item:[BoseReplace stringByReplacingOccurrencesOfString:@"{label}" withString:[self label:old]] selector:@selector(deviceClicked:) data:a];r.enabled=can;[replace addItem:r];}
@@ -132,9 +161,12 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  }
  NSDictionary *noise=self.snapshot[@"noise"];
  if([noise isKindOfClass:[NSDictionary class]]){
-  BOOL on=[noise[@"enabled"] boolValue];NSNumber *level=noise[@"level"]?:@0;
+  NSDictionary *shown=[self shownNoise];BOOL on=[shown[@"enabled"] boolValue];NSNumber *level=shown[@"level"]?:@0;
   [self.deviceMenu addItem:[NSMenuItem separatorItem]];
-  NSMenuItem *section=[self item:[self.pending[@"action"] isEqual:@"noise"]?@"Setting noise…":@"Noise cancellation" selector:NULL data:nil];section.enabled=can||[self.pending[@"action"] isEqual:@"noise"];
+  NSString *kind=self.noiseM[@"kind"],*sectionTitle=@"Noise cancellation";
+  if([kind isEqual:@"held"])sectionTitle=[NSString stringWithFormat:@"%@ · applies when the %@ ends",on?[NSString stringWithFormat:@"Level %d",[level intValue]]:@"Off",self.switchText?@"switch":@"change"];
+  else if(![kind isEqual:@"idle"])sectionTitle=on?[NSString stringWithFormat:@"Setting level %d…",[level intValue]]:@"Turning off…";
+  NSMenuItem *section=[self item:sectionTitle selector:NULL data:nil];section.enabled=can;
   NSMenu *levels=[NSMenu new];levels.autoenablesItems=NO;
   NSMenuItem *toggle=[self item:@"On" selector:@selector(deviceClicked:) data:@{@"action":@"noise",@"level":level,@"enabled":@(!on)}];toggle.state=on?NSControlStateValueOn:NSControlStateValueOff;toggle.enabled=can;[levels addItem:toggle];
   [levels addItem:[NSMenuItem separatorItem]];
@@ -160,17 +192,21 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  }] resume];
 }
 - (void)refreshMenu {
- if(self.refreshing||self.changing)return;self.refreshing=YES;
+ // Deferred while work runs: the read goes out when the scheduler reaches idle, so it cannot answer around a change.
+ if([self workRunning]){self.refreshWanted=YES;[self rebuildMenu];return;}
+ if(self.refreshing)return;self.refreshing=YES;NSInteger gen=self.changes;[self rebuildMenu];
  __block BOOL settled=NO;
+ // A reply is dropped when a change started after the read was sent or work is still running: it could undo a verified result.
  [self request:@"/api/cached" data:nil completion:^(NSDictionary *json,NSString *error){
-  if(!settled&&!self.changing&&!error&&json[@"devices"]){self.snapshot=json;[self rebuildMenu];}
+  if(!settled&&gen==self.changes&&![self workRunning]&&!error&&json[@"devices"]){self.snapshot=json;[self rebuildMenu];}
  }];
  [self request:@"/api/overview" data:nil completion:^(NSDictionary *json,NSString *error){
-  settled=YES;self.refreshing=NO;if(self.changing)return;
+  settled=YES;self.refreshing=NO;
+  if(gen!=self.changes||[self workRunning]){[self rebuildMenu];return;}
   if(error||!json){
    if(self.snapshot){NSMutableDictionary *old=[self.snapshot mutableCopy];old[@"cached"]=@YES;self.snapshot=old;}
-   self.menuMessage=self.snapshot?nil:error;
-  }else{self.snapshot=json;self.menuMessage=nil;NSUInteger n=0;for(NSDictionary *d in json[@"devices"]?:@[])if([d[@"connected"] boolValue])n++;if(n<2)self.busySlots=nil;}
+   if(!self.snapshot)[self say:error error:YES];
+  }else{self.snapshot=json;NSUInteger n=0;for(NSDictionary *d in json[@"devices"]?:@[])if([d[@"connected"] boolValue])n++;if(n<2)self.busySlots=nil;}
   [self rebuildMenu];
  }];
 }
@@ -216,7 +252,7 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  [NSApp activateIgnoringOtherApps:YES];[self.popover showRelativeToRect:button.bounds ofView:button preferredEdge:NSRectEdgeMinY];
  [self.popWeb.window makeFirstResponder:self.popWeb];
 }
-- (void)refreshClicked:(id)sender {[self refreshMenu];}
+- (void)refreshClicked:(id)sender {[self say:nil error:NO];[self rebuildMenu];[self refreshMenu];}
 - (void)openDashboard:(id)sender {[self.popover performClose:nil];[self showWindow];}
 - (NSString *)failureText:(NSDictionary *)json error:(NSString *)error {
  NSDictionary *texts=@{@"unreachable":BoseErrUnreachable,@"timeout":BoseErrTimeout,@"unverified":BoseErrUnverified,@"keep_one":BoseErrKeepOne,@"no_audio":BoseErrNoAudio,@"audio_not_moved":BoseErrAudioNotMoved,@"forgotten":BoseErrForgotten};
@@ -225,35 +261,99 @@ static NSString *const BoseErrUnreachable=@"Couldn’t reach the headphones",*co
  if(!text)text=[error containsString:@"timed out"]?BoseErrTimeout:BoseErrUnreachable;
  return [text stringByAppendingString:BoseRetryHint];
 }
-- (void)switchHere:(NSString *)replace {
- if(self.changing)return;
- NSString *label=nil;for(NSDictionary *slot in self.busySlots)if(replace&&[slot[@"address"] isEqual:replace])label=slot[@"label"];
- NSMutableDictionary *body=[@{@"source":@"mac-menu",@"request_id":[[[NSUUID UUID].UUIDString substringToIndex:8] lowercaseString]} mutableCopy];if(replace)body[@"replace"]=replace;
- self.changing=YES;self.menuMessage=nil;self.busySlots=nil;self.switchText=label?[BoseReplacing stringByReplacingOccurrencesOfString:@"{label}" withString:label]:BosePending;[self rebuildMenu];
- [self request:@"/api/switch" data:body completion:^(NSDictionary *json,NSString *error){
-  self.changing=NO;self.switchText=nil;
+// Every connection input goes through act: it runs at once when nothing else does, else it becomes the one queued intent
+// (latest wins, the same click again cancels it) until the running work ends and pump releases it.
+- (void)act:(NSDictionary *)intent {
+ [self say:nil error:NO];
+ if([self workRunning]){self.intentM=BoseIntents(self.intentM,@{@"type":@"hold",@"intent":intent});[self rebuildMenu];return;}
+ self.intentM=BoseIntents(self.intentM,@{@"type":@"cancel"});
+ [self runIntent:intent];
+}
+- (void)cancelQueued:(id)sender {[self say:nil error:NO];self.intentM=BoseIntents(self.intentM,@{@"type":@"cancel"});[self rebuildMenu];}
+// The intent is checked against the verified snapshot first: it may be stale by the time it runs.
+- (void)runIntent:(NSDictionary *)intent {
+ NSDictionary *check=BoseReleaseCheck(intent,self.snapshot,[self isLive]);NSString *decision=check[@"decision"];
+ if([decision isEqual:@"run"]){if([intent[@"action"] isEqual:@"here"])[self switchHere:intent[@"replace"]];else [self performNow:check[@"body"]];return;}
+ NSString *name=intent[@"address"];for(NSDictionary *d in self.snapshot[@"devices"])if([d[@"address"] isEqual:intent[@"address"]])name=[self label:d];
+ if([decision isEqual:@"already-disconnected"])[self say:[name stringByAppendingString:@" is already disconnected."] error:NO];
+ else if([decision isEqual:@"already-connected"])[self say:[name stringByAppendingString:@" is already connected."] error:NO];
+ else if([decision isEqual:@"busy"])[self say:BoseBusy error:YES];
+ else [self say:[NSString stringWithFormat:@"%@ not sent: the headphones aren’t reachable now",[intent[@"action"] isEqual:@"connect"]?@"Connect":@"Disconnect"] error:YES];
+ [self rebuildMenu];
+}
+// The one scheduler: called whenever work ends or input arrives (machines: BoseSchedule, BoseIntents, BoseNoiser).
+- (void)pump {
+ for(int n=0;n<4;n++){
+  NSString *d=BoseSchedule(self.changing,self.noiseM,self.intentM,[self isLive]);
+  if([d isEqual:@"hold-noise"]){self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"hold"});self.noiseTimer++;[self rebuildMenu];return;}
+  if([d isEqual:@"resume-noise"]){self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"resume"});continue;}
+  if([d isEqual:@"drop-noise"]){self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"drop"});[self say:BoseNoiseDropped error:YES];[self rebuildMenu];return;}
+  if([d isEqual:@"intent"]){NSDictionary *i=[self queuedIntent];self.intentM=BoseIntents(self.intentM,@{@"type":@"release"});[self runIntent:i];if([self workRunning])return;continue;}
+  if([d isEqual:@"noise"])[self pumpNoise];
+  if([d isEqual:@"idle"]&&self.refreshWanted){self.refreshWanted=NO;[self refreshMenu];}
+  return;
+ }
+}
+- (void)noiseInput:(NSDictionary *)value {
+ if(![self isLive]&&!self.changing){[self say:BoseNoiseDropped error:YES];[self rebuildMenu];return;}
+ self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"input",@"value":value});[self say:nil error:NO];[self pump];[self rebuildMenu];
+}
+// One noise write at a time, 250 ms between starts, the newest value always the one sent.
+- (void)pumpNoise {
+ if(![self.noiseM[@"kind"] isEqual:@"waiting"]||self.changing)return;
+ NSTimeInterval wait=self.noiseStart?0.25+[self.noiseStart timeIntervalSinceNow]:0;
+ if(wait>0){NSInteger token=++self.noiseTimer;dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(wait*NSEC_PER_SEC)),dispatch_get_main_queue(),^{if(token==self.noiseTimer)[self pump];});return;}
+ NSDictionary *value=self.noiseM[@"queued"],*verified=self.snapshot[@"noise"];
+ self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"send"});
+ BOOL same=[verified isKindOfClass:[NSDictionary class]]&&[verified[@"enabled"] boolValue]==[value[@"enabled"] boolValue]&&(![value[@"enabled"] boolValue]||[verified[@"level"] isEqual:value[@"level"]]);
+ if(same){self.noiseM=BoseNoiser(self.noiseM,@{@"type":@"ok"});[self rebuildMenu];[self pump];return;}
+ self.noiseStart=[NSDate date];self.changes++;[self rebuildMenu];
+ [self request:@"/api/override" data:@{@"action":@"noise",@"level":value[@"level"],@"enabled":value[@"enabled"]} completion:^(NSDictionary *json,NSString *error){
   NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
-  if(state)self.snapshot=state;
-  if([json[@"ok"] boolValue]&&[json[@"verified"] boolValue])self.menuMessage=BoseOk;
-  else if([json[@"busy"] boolValue]){self.menuMessage=BoseBusy;self.busySlots=[json[@"slots"] isKindOfClass:[NSArray class]]?json[@"slots"]:nil;}
-  else self.menuMessage=[self failureText:json error:error];
+  if(state&&self.snapshot&&![state[@"devices"] count]){NSMutableDictionary *merged=[self.snapshot mutableCopy];if(state[@"noise"])merged[@"noise"]=state[@"noise"];if(state[@"battery"]&&state[@"battery"]!=[NSNull null])merged[@"battery"]=state[@"battery"];self.snapshot=merged;}
+  else if(state)self.snapshot=state;
+  self.changes++;BOOL ok=!error&&[json[@"ok"] boolValue]&&[json[@"verified"] boolValue];
+  if(!ok)[self say:[self failureText:json error:error] error:YES];
+  else if(!BoseValue(self.noiseM,@"queued"))[self say:@"Noise cancellation updated" error:NO];
+  self.noiseM=BoseNoiser(self.noiseM,@{@"type":ok?@"ok":@"fail"});
   [self rebuildMenu];
-  if(!state&&![json[@"busy"] boolValue])[self refreshMenu];
+  [self pump];
+  if(!state&&!error&&![self workRunning])[self refreshMenu];
  }];
 }
-- (void)useHereClicked:(NSMenuItem *)sender {[self switchHere:nil];}
-- (void)replaceClicked:(NSMenuItem *)sender {[self switchHere:sender.representedObject];}
-- (void)deviceClicked:(NSMenuItem *)sender {
- if(self.changing)return;NSDictionary *data=[sender.representedObject copy];self.changing=YES;self.pending=data;self.menuMessage=nil;[self rebuildMenu];
- [self request:@"/api/override" data:data completion:^(NSDictionary *json,NSString *error){
-  self.changing=NO;self.pending=nil;
+- (void)switchHere:(NSString *)replace {
+ NSString *label=nil;for(NSDictionary *slot in self.busySlots)if(replace&&[slot[@"address"] isEqual:replace])label=slot[@"label"];
+ NSMutableDictionary *body=[@{@"source":@"mac-menu",@"request_id":[[[NSUUID UUID].UUIDString substringToIndex:8] lowercaseString]} mutableCopy];if(replace)body[@"replace"]=replace;
+ self.changing=YES;self.changes++;self.busySlots=nil;self.switchText=label?[BoseReplacing stringByReplacingOccurrencesOfString:@"{label}" withString:label]:BosePending;[self rebuildMenu];[self pump];
+ [self request:@"/api/switch" data:body completion:^(NSDictionary *json,NSString *error){
+  self.changing=NO;self.changes++;self.switchText=nil;
   NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
-  if(state&&[data[@"action"] isEqual:@"noise"]&&self.snapshot&&![state[@"devices"] count]){NSMutableDictionary *merged=[self.snapshot mutableCopy];if(state[@"noise"])merged[@"noise"]=state[@"noise"];if(state[@"battery"]&&state[@"battery"]!=[NSNull null])merged[@"battery"]=state[@"battery"];self.snapshot=merged;}
-  else if(state)self.snapshot=state;
-  if(error||![json[@"ok"] boolValue]||![json[@"verified"] boolValue])self.menuMessage=[self failureText:json error:error];
-  else self.menuMessage=nil;
+  if(state)self.snapshot=state;
+  if([json[@"ok"] boolValue]&&[json[@"verified"] boolValue])[self say:BoseOk error:NO];
+  else if([json[@"busy"] boolValue]){[self say:BoseBusy error:YES];self.busySlots=[json[@"slots"] isKindOfClass:[NSArray class]]?json[@"slots"]:nil;}
+  else [self say:[self failureText:json error:error] error:YES];
   [self rebuildMenu];
-  if(!state&&!error)[self refreshMenu];
+  [self pump];
+  if(!state&&![json[@"busy"] boolValue]&&![self workRunning])[self refreshMenu];
+ }];
+}
+- (void)useHereClicked:(NSMenuItem *)sender {[self act:@{@"action":@"here"}];}
+- (void)replaceClicked:(NSMenuItem *)sender {[self act:@{@"action":@"here",@"replace":sender.representedObject}];}
+- (void)deviceClicked:(NSMenuItem *)sender {
+ NSDictionary *data=[sender.representedObject copy];
+ if([data[@"action"] isEqual:@"noise"])[self noiseInput:@{@"level":data[@"level"],@"enabled":data[@"enabled"]}];
+ else [self act:data];
+}
+- (void)performNow:(NSDictionary *)data {
+ self.changing=YES;self.changes++;self.pending=data;[self rebuildMenu];[self pump];
+ [self request:@"/api/override" data:data completion:^(NSDictionary *json,NSString *error){
+  self.changing=NO;self.changes++;self.pending=nil;
+  NSDictionary *state=[json[@"state"] isKindOfClass:[NSDictionary class]]?json[@"state"]:nil;
+  if(state)self.snapshot=state;
+  if(error||![json[@"ok"] boolValue]||![json[@"verified"] boolValue])[self say:[self failureText:json error:error] error:YES];
+  [self rebuildMenu];
+  [self pump];
+  if(!state&&!error&&![self workRunning])[self refreshMenu];
  }];
 }
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {}

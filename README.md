@@ -146,9 +146,10 @@ roles from the headset's saved-device list.
 The PC controller owns the connection state; front ends render it and run no switch flow of their own
 ([docs/state-machine.md](docs/state-machine.md); code in `statemachine.py`, the steps in `Controller.switch`).
 Every state machine in the app, its transition table and the open backlog: [docs/state-machines.md](docs/state-machines.md).
-`GET /api/state?after=<seq>&wait=<s>` is a long-poll: it answers at once when `seq > after` (or without `after`),
-otherwise at the next change or after `wait` seconds (at most 25). The mesh port serves it to peers with the token.
-The reply holds `seq`, `now`, `headset` (reachable, `via`, `read_age`, battery, noise, product, and each
+`GET /api/state?after=<seq>&wait=<s>&boot=<id>` is a long-poll: it answers at once when `seq > after` (or without
+`after`), otherwise at the next change or after `wait` seconds (at most 25). `boot` names the controller run that
+`after` belongs to; a restarted controller (new `boot`, `seq` from 0) answers such a poll at once. The mesh port
+serves it to peers with the token. The reply holds `seq`, `boot`, `now`, `headset` (reachable, `via`, `read_age`, battery, noise, product, and each
 controller as `here` (its read is the one shown), `available`, or `offline` with a `reason`), two `slots` (a free
 one is `{"state":"free"}`), the other saved `devices`, `audio` (`{sink, default}`, `null` off Linux), and
 `operation` (`null` when idle).

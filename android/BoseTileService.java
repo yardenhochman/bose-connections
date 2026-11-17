@@ -19,19 +19,29 @@ import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-/** Quick Settings tile and its compact native panel ("pulse" design, Mist sleeve tokens). */
+/** Quick Settings tile and its compact native panel ("pulse" design, Mist sleeve tokens). The state and its machines are
+ TileModel (no Android types, tested in the JVM); this class draws it and runs its requests. */
 public class BoseTileService extends TileService {
  final Handler main=new Handler(Looper.getMainLooper());
- final ExecutorService work=Executors.newSingleThreadExecutor();
- JSONObject snapshot=new JSONObject();
- Dialog dialog;Panel panel;int generation=0;long lastRead=0;boolean reading=false;
- // Connection mutation (one in flight per client).
- boolean mutating=false;String pendingAction,pendingAddress,pendingReplace;JSONObject replacing;
- // Noise writes: one in flight + the latest queued value, >=250 ms between write starts.
- boolean ancInFlight=false;int[] ancQueued;long ancLastStart=0;Integer shownLevel;Boolean shownEnabled;
- String notice="";boolean noticeError=false;
- // One-tap switch: the tile subtitle shows the contract text (pending, then ok or the error) until tileNoteUntil.
- boolean switching=false;String tileNote="";long tileNoteUntil=0;
+ // Writes (connection changes, the one-tap switch, noise) and reads run on separate threads: a refresh never waits
+ // behind a switch of up to 150 s. TileModel keeps one write open at a time.
+ final ExecutorService work=Executors.newSingleThreadExecutor(),reads=Executors.newSingleThreadExecutor();
+ final TileModel model=new TileModel(new TileModel.Host(){
+  public void request(String path,JSONObject body,TileModel.Reply reply){
+   (path.equals("/api/overview")?reads:work).submit(()->{
+    JSONObject json=null;String error=null;
+    try{json=call(path,body);}catch(Exception e){error=e.getMessage()==null?"Controller unavailable":e.getMessage();}
+    final JSONObject answer=json;final String problem=error;
+    main.post(()->reply.done(answer,problem));
+   });
+  }
+  public Object later(Runnable r,long ms){main.postDelayed(r,ms);return r;}
+  public void cancel(Object handle){main.removeCallbacks((Runnable)handle);}
+  public long now(){return SystemClock.elapsedRealtime();}
+  public void changed(){if(panel!=null)panel.render();updateTile();}
+  public void openPanel(){BoseTileService.this.openPanel();}
+ });
+ Dialog dialog;Panel panel;int generation=0;
 
  int dp(float n){return Math.round(n*getResources().getDisplayMetrics().density);}
  int color(int id){return getColor(id);}
@@ -40,71 +50,30 @@ public class BoseTileService extends TileService {
  public void onStartListening(){
   super.onStartListening();
   RelayStarter.start(this); // the panel is open: a good moment to revive a relay the system stopped
-  boolean fresh=live()&&SystemClock.elapsedRealtime()-lastRead<30000;
-  if(dialog==null&&!busy()&&!fresh)try{snapshot=Core.dispatch(this,"/api/cached",null,false);}catch(Exception e){snapshot=new JSONObject();}
+  boolean fresh=model.live()&&SystemClock.elapsedRealtime()-model.lastRead<30000,idle=!model.workRunning()&&model.queued()==null;
+  if(dialog==null&&idle&&!fresh)try{model.snapshot=Core.dispatch(this,"/api/cached",null,false);}catch(Exception e){model.snapshot=new JSONObject();}
   updateTile();
-  if(dialog==null&&!busy()&&!reading&&SystemClock.elapsedRealtime()-lastRead>30000)refresh();
+  if(dialog==null&&idle&&!model.reading&&SystemClock.elapsedRealtime()-model.lastRead>30000)model.refresh();
  }
- public void onClick(){super.onClick();if(isLocked())unlockAndRun(this::switchHere);else switchHere();}
+ // Tap moves the headset to this phone (tests/switch-contract.json); during other work it queues and the subtitle says so.
+ public void onClick(){super.onClick();if(isLocked())unlockAndRun(model::tileTap);else model.tileTap();}
  void updateTile(){
   Tile tile=getQsTile();if(tile==null)return;
-  tile.setLabel("Bose");tile.setState(live()&&connectedCount()>=1?Tile.STATE_ACTIVE:Tile.STATE_INACTIVE);
-  if(Build.VERSION.SDK_INT>=29)tile.setSubtitle(tileSubtitle());
+  tile.setLabel("Bose");tile.setState(model.live()&&model.connectedCount()>=1?Tile.STATE_ACTIVE:Tile.STATE_INACTIVE);
+  if(Build.VERSION.SDK_INT>=29)tile.setSubtitle(model.tileSubtitle());
   tile.updateTile();
  }
- String tileSubtitle(){
-  if(switching)return Switcher.MESSAGES.get("pending");
-  if(!tileNote.isEmpty()&&SystemClock.elapsedRealtime()<tileNoteUntil)return tileNote;
-  if(mutating)return "connect".equals(pendingAction)?"Connecting…":"Disconnecting…";
-  if(ancInFlight)return "Updating…";
-  boolean cached=snapshot.optBoolean("cached");
-  if(!cached&&!snapshot.optBoolean("reachable"))return snapshot.has("reachable")?"Unavailable":"Checking…";
-  if(cached&&devices().length()==0)return reading?"Checking…":"Unavailable";
-  JSONObject noise=snapshot.optJSONObject("noise");
-  return connectedCount()+" of 2"+(noise==null?"":noise.optBoolean("enabled")?" · ANC "+noise.optInt("level"):" · ANC off");
- }
 
- // ---- One-tap switch (tests/switch-contract.json): tap moves the headset to this phone; long-press opens the app ----
- void setTileNote(String text,long ms){tileNote=text;tileNoteUntil=SystemClock.elapsedRealtime()+ms;main.postDelayed(this::updateTile,ms+50);}
- JSONObject switchRequest(String id)throws Exception{
-  File f=previewFile();
-  if(f==null||!f.exists())return Core.switchHere(this,"android-tile",id,null);
-  JSONObject s;try(FileInputStream in=new FileInputStream(f)){s=new JSONObject(Core.read(in,65536));}
-  Thread.sleep(s.optLong("delay",1200));String outcome=s.optString("switch","ok");
-  if(outcome.equals("ok"))return new JSONObject().put("ok",true).put("verified",true).put("message",Switcher.MESSAGES.get("ok")).put("state",s.put("cached",false));
-  if(outcome.equals("busy"))return new JSONObject().put("ok",false).put("busy",true).put("error_key","busy").put("error",Switcher.MESSAGES.get("busy"));
-  return Switcher.failure(outcome,"preview");
- }
- void switchHere(){
-  if(switching||busy())return;
-  switching=true;tileNote="";updateTile();final String id=Long.toString(SystemClock.elapsedRealtime(),36);
-  work.submit(()->{
-   JSONObject reply;try{reply=switchRequest(id);}catch(Exception e){reply=Switcher.failure("unreachable",e.getMessage());}
-   final JSONObject result=reply;
-   main.post(()->{
-    switching=false;
-    if(result.optBoolean("ok")){JSONObject state=result.optJSONObject("state");if(overviewShaped(state)){snapshot=state;lastRead=SystemClock.elapsedRealtime();}setTileNote(Switcher.MESSAGES.get("ok"),8000);}
-    else if(result.optBoolean("busy")){setTileNote(Switcher.MESSAGES.get("busy"),30000);openPanel();JSONObject roles=snapshot.optJSONObject("roles");JSONObject phone=roles==null?null:device(roles.optString("phone"));if(phone!=null&&panel!=null){replacing=phone;panel.render();}}
-    else setTileNote(result.optString("error",Switcher.text("unreachable"))+Switcher.MESSAGES.get("retry_hint"),30000);
-    updateTile();
-   });
-  });
- }
-
- // ---- State helpers ----
- boolean live(){return snapshot.optBoolean("reachable")&&!snapshot.optBoolean("cached");}
- boolean busy(){return mutating||ancInFlight||switching;}
- JSONArray devices(){JSONArray list=snapshot.optJSONArray("devices");return list==null?new JSONArray():list;}
- int connectedCount(){int n=0;JSONArray ds=devices();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&d.optBoolean("connected"))n++;}return n;}
- JSONObject device(String address){JSONArray ds=devices();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&address!=null&&address.equals(d.optString("address")))return d;}return null;}
+ // ---- State helpers (drawing) ----
+ JSONObject device(String address){return model.device(address);}
  String role(JSONObject device){
-  JSONObject roles=snapshot.optJSONObject("roles");String address=device.optString("address");
+  JSONObject roles=model.snapshot.optJSONObject("roles");String address=device.optString("address");
   if(roles!=null)for(String r:new String[]{"phone","pc","mac"})if(address.equals(roles.optString(r)))return r;
   return "";
  }
- String name(JSONObject device){String n=device.optString("name");return n.isEmpty()?device.optString("address"):n;}
+ String name(JSONObject device){return TileModel.name(device);}
  String tag(JSONObject device){
-  String r=role(device),here=snapshot.optString("here","phone");
+  String r=role(device),here=model.snapshot.optString("here","phone");
   if(!r.isEmpty()&&r.equals(here))return r.equals("pc")?"This PC":r.equals("mac")?"This Mac":"This phone";
   return r.equals("pc")?"PC":r.equals("mac")?"Mac":r.equals("phone")?"Phone":"Other device";
  }
@@ -119,7 +88,28 @@ public class BoseTileService extends TileService {
  static boolean overviewShaped(JSONObject s){return s!=null&&s.has("devices")&&s.has("reachable");}
 
  // ---- Transport (a build with BuildFlags.PREVIEW may simulate the headset from files/preview.json for offscreen review) ----
+ /** One TileModel request, on a worker thread. */
+ JSONObject call(String path,JSONObject body)throws Exception{
+  if(path.equals("/api/overview"))return readOverview();
+  if(path.equals("/api/switch")){
+   String replace=body==null||body.optString("replace").isEmpty()?null:body.optString("replace");
+   try{return switchRequest(Long.toString(SystemClock.elapsedRealtime(),36),replace);}catch(Exception e){return Switcher.failure("unreachable",e.getMessage());}
+  }
+  JSONObject result=override(body);
+  // A verified connection change without an overview-shaped state is followed by one read, as before.
+  if(!"noise".equals(body.optString("action"))&&result.optBoolean("ok")&&result.optBoolean("verified")&&!overviewShaped(result.optJSONObject("state")))result.put("state",readOverview());
+  return result;
+ }
  File previewFile(){return BuildFlags.PREVIEW?new File(getFilesDir(),"preview.json"):null;}
+ JSONObject switchRequest(String id,String replace)throws Exception{
+  File f=previewFile();
+  if(f==null||!f.exists())return Core.switchHere(this,"android-tile",id,replace);
+  JSONObject s;try(FileInputStream in=new FileInputStream(f)){s=new JSONObject(Core.read(in,65536));}
+  Thread.sleep(s.optLong("delay",1200));String outcome=s.optString("switch","ok");
+  if(outcome.equals("ok"))return new JSONObject().put("ok",true).put("verified",true).put("message",Switcher.MESSAGES.get("ok")).put("state",s.put("cached",false));
+  if(outcome.equals("busy"))return new JSONObject().put("ok",false).put("busy",true).put("error_key","busy").put("error",Switcher.MESSAGES.get("busy")).put("slots",s.optJSONArray("slots")==null?new JSONArray():s.optJSONArray("slots"));
+  return Switcher.failure(outcome,"preview");
+ }
  JSONObject readOverview()throws Exception{
   File f=previewFile();
   if(f!=null&&f.exists())try(FileInputStream in=new FileInputStream(f)){JSONObject s=new JSONObject(Core.read(in,65536));Thread.sleep(s.optLong("readDelay",400));return s.put("cached",false);}
@@ -140,103 +130,23 @@ public class BoseTileService extends TileService {
   return new JSONObject().put("ok",true).put("verified",true).put("message",action.equals("noise")?"Noise cancellation updated":"Connection updated").put("state",s.put("cached",false));
  }
 
- // ---- Requests ----
- void refresh(){
-  if(reading)return;reading=true;final int id=generation;if(panel!=null)panel.render();
-  work.submit(()->{
-   JSONObject state=null;String error=null;
-   try{state=readOverview();}catch(Exception e){error=e.getMessage()==null?"Controller unavailable":e.getMessage();}
-   final JSONObject read=state;final String problem=error;
-   main.post(()->{reading=false;lastRead=SystemClock.elapsedRealtime();
-    if(read!=null&&!busy())snapshot=read;
-    if(id==generation&&panel!=null){if(problem!=null&&notice.isEmpty())setNotice(problem,true);panel.render();}
-    updateTile();});
-  });
- }
- void setNotice(String text,boolean error){notice=text==null?"":text;noticeError=error;}
- void connect(JSONObject device){
-  if(!live()||busy())return;
-  if(connectedCount()>=2){replacing=device;setNotice("",false);panel.render();return;}
-  mutate("connect",device.optString("address"),null);
- }
- void mutate(String action,String address,String replace){
-  if(!live()||busy())return;
-  mutating=true;pendingAction=action;pendingAddress=address;pendingReplace=replace;replacing=null;setNotice("",false);
-  if(panel!=null)panel.render();updateTile();final int id=generation;
-  work.submit(()->{
-   JSONObject state=null;String message,error=null;
-   try{
-    JSONObject data=new JSONObject().put("action",action).put("address",address).put("source","android-tile");if(replace!=null)data.put("replace",replace);
-    JSONObject result=override(data);
-    if(!result.optBoolean("ok")||!result.optBoolean("verified"))throw new IOException(result.optString("error",result.optString("message","Change not verified; refresh before retrying")));
-    message=result.optString("message","Connection updated");state=result.optJSONObject("state");
-    if(!overviewShaped(state))state=readOverview();
-   }catch(Exception e){message=null;error=e.getMessage()==null?"Controller unavailable":e.getMessage();}
-   final JSONObject verified=state;final String ok=message,problem=error;
-   main.post(()->{
-    mutating=false;pendingAction=pendingAddress=pendingReplace=null;
-    if(verified!=null){snapshot=verified;lastRead=SystemClock.elapsedRealtime();setNotice(ok,false);}else setNotice(problem,true);
-    if(id==generation&&panel!=null)panel.render();updateTile();
-    if(verified==null)refresh();
-   });
-  });
- }
- void requestNoise(int level,boolean enabled){
-  if(!live()||mutating)return;
-  shownLevel=level;shownEnabled=enabled;
-  if(ancInFlight){ancQueued=new int[]{level,enabled?1:0};if(panel!=null)panel.render();return;}
-  sendNoise(level,enabled);
- }
- void sendNoise(int level,boolean enabled){
-  ancInFlight=true;setNotice("",false);if(panel!=null)panel.render();updateTile();
-  long wait=Math.max(0,250-(SystemClock.elapsedRealtime()-ancLastStart));final int id=generation;
-  main.postDelayed(()->{
-   ancLastStart=SystemClock.elapsedRealtime();
-   work.submit(()->{
-    JSONObject result=null;String error=null;
-    try{
-     result=override(new JSONObject().put("action","noise").put("level",level).put("enabled",enabled));
-     if(!result.optBoolean("ok")||!result.optBoolean("verified"))throw new IOException(result.optString("error","Noise cancellation not verified"));
-    }catch(Exception e){result=null;error=e.getMessage()==null?"Controller unavailable":e.getMessage();}
-    final JSONObject done=result;final String problem=error;
-    main.post(()->noiseDone(id,done,problem));
-   });
-  },wait);
- }
- void noiseDone(int id,JSONObject result,String problem){
-  ancInFlight=false;
-  if(result==null){ancQueued=null;shownLevel=null;shownEnabled=null;setNotice(problem,true);}
-  else{
-   // Merge only noise/battery (and devices when present): a noise read-back may carry an empty device list.
-   JSONObject state=result.optJSONObject("state");JSONObject noise=result.optJSONObject("noise");
-   try{
-    if(state!=null){if(state.optJSONObject("noise")!=null)noise=state.optJSONObject("noise");if(state.has("battery")&&!state.isNull("battery"))snapshot.put("battery",state.get("battery"));
-     JSONArray ds=state.optJSONArray("devices");if(ds!=null&&ds.length()>0)snapshot.put("devices",ds);}
-    if(noise!=null)snapshot.put("noise",noise);
-   }catch(JSONException ignored){/* snapshot keys are plain strings; put cannot fail here */}
-   int[] next=ancQueued;ancQueued=null;
-   if(next!=null&&(noise==null||noise.optInt("level")!=next[0]||noise.optBoolean("enabled")!=(next[1]==1))){if(id==generation){sendNoise(next[0],next[1]==1);return;}}
-   shownLevel=null;shownEnabled=null;setNotice(result.optString("message","Noise cancellation updated"),false);
-  }
-  if(id==generation&&panel!=null)panel.render();updateTile();
- }
-
  // ---- Panel ----
  void openPanel(){
   if(dialog!=null&&dialog.isShowing())return;
-  generation++;setNotice("",false);replacing=null;shownLevel=null;shownEnabled=null;
-  try{if(!mutating)snapshot=Core.dispatch(this,"/api/cached",null,false);}catch(Exception e){snapshot=new JSONObject();}
+  generation++;model.say("",false);model.uiSend(Machines.o("type","drop-choice"));
+  // With work in progress the model's snapshot is the base its pending layer is drawn over: keep it.
+  if(!model.workRunning()&&model.queued()==null&&!model.live())try{model.snapshot=Core.dispatch(this,"/api/cached",null,false);}catch(Exception e){model.snapshot=new JSONObject();}
   buildDialog();
   // The shade may already be closing; the window token is then gone and the panel simply does not open.
   try{showDialog(dialog);}catch(WindowManager.BadTokenException e){dialog=null;panel=null;generation++;updateTile();return;}
-  sizeWindow();refresh();
+  sizeWindow();model.refresh();
  }
  boolean night(){return (getResources().getConfiguration().uiMode&Configuration.UI_MODE_NIGHT_MASK)==Configuration.UI_MODE_NIGHT_YES;}
  void buildDialog(){
   dialog=new Dialog(this,night()?android.R.style.Theme_DeviceDefault_Dialog_NoActionBar:android.R.style.Theme_DeviceDefault_Light_Dialog_NoActionBar);
   panel=new Panel();dialog.setContentView(panel.root);
   final Dialog own=dialog;
-  dialog.setOnDismissListener(d->{if(dialog==own){dialog=null;panel=null;generation++;replacing=null;}});
+  dialog.setOnDismissListener(d->{if(dialog==own){dialog=null;panel=null;generation++;model.uiSend(Machines.o("type","cancel"));updateTile();}});
   panel.render();
  }
  void sizeWindow(){
@@ -288,7 +198,7 @@ public class BoseTileService extends TileService {
    prompt.setOrientation(LinearLayout.HORIZONTAL);prompt.setGravity(Gravity.CENTER_VERTICAL);prompt.setPadding(dp(12),dp(8),dp(8),dp(8));prompt.setVisibility(View.GONE);
    GradientDrawable pbg=round(0,dp(14),dp(1),color(R.color.qs_accent));pbg.setStroke(dp(1),color(R.color.qs_accent),dp(4),dp(3));prompt.setBackground(pbg);
    promptText=text("",13,false,R.color.qs_ink);prompt.addView(promptText,new LinearLayout.LayoutParams(0,-2,1));
-   Button pc=button("Cancel",false);pc.setTextSize(14);pc.setPadding(dp(16),0,dp(16),0);pc.setOnClickListener(v->{replacing=null;setNotice("",false);render();});
+   Button pc=button("Cancel",false);pc.setTextSize(14);pc.setPadding(dp(16),0,dp(16),0);pc.setOnClickListener(v->model.cancelChoice());
    LinearLayout.LayoutParams pcl=new LinearLayout.LayoutParams(-2,dp(40));pcl.leftMargin=dp(10);prompt.addView(pc,pcl);
    LinearLayout.LayoutParams prl=new LinearLayout.LayoutParams(-1,-2);prl.topMargin=dp(6);card.addView(prompt,prl);
    // Slot cups
@@ -301,11 +211,11 @@ public class BoseTileService extends TileService {
    anc.setContentDescription("Noise cancellation");swRow.addView(anc,new LinearLayout.LayoutParams(dp(60),dp(48)));
    styleSlider();LinearLayout.LayoutParams sbl=new LinearLayout.LayoutParams(-1,dp(40));sbl.setMargins(-dp(12),dp(2),-dp(12),0);ncBox.addView(slider,sbl);
    LinearLayout ends=new LinearLayout(BoseTileService.this);ends.addView(text("Aware",12,false,R.color.qs_ink2),new LinearLayout.LayoutParams(0,-2,1));ends.addView(text("Max",12,false,R.color.qs_ink2));ncBox.addView(ends);
-   anc.listener=on->{if(rendering)return;int level=shownLevel!=null?shownLevel:noiseLevel();requestNoise(level,on);};
+   anc.listener=on->{if(rendering)return;model.setNoise(noiseLevel(),on);};
    slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
-    public void onProgressChanged(SeekBar s,int value,boolean user){if(!user)return;shownLevel=value;showNoise(value,true,true);if(!touching)requestNoise(value,true);}
+    public void onProgressChanged(SeekBar s,int value,boolean user){if(!user)return;showNoise(value,true,true);if(!touching)model.setNoise(value,true);}
     public void onStartTrackingTouch(SeekBar s){touching=true;}
-    public void onStopTrackingTouch(SeekBar s){touching=false;requestNoise(s.getProgress(),true);}
+    public void onStopTrackingTouch(SeekBar s){touching=false;model.setNoise(s.getProgress(),true);}
    });
    // Saved devices
    savedLabel=text("Saved devices",13,true,R.color.qs_ink2);LinearLayout.LayoutParams sl=new LinearLayout.LayoutParams(-2,-2);sl.topMargin=dp(14);sl.bottomMargin=dp(4);card.addView(savedLabel,sl);
@@ -317,96 +227,115 @@ public class BoseTileService extends TileService {
    Button close=button("Close",false);close.setOnClickListener(v->dialog.dismiss());LinearLayout.LayoutParams xl=new LinearLayout.LayoutParams(-2,dp(44));xl.leftMargin=dp(8);foot.addView(close,xl);
    for(Button b:new Button[]{settings,close})b.setPadding(dp(20),0,dp(20),0);
   }
-  int noiseLevel(){JSONObject n=snapshot.optJSONObject("noise");return n==null?7:n.optInt("level",7);}
+  int noiseLevel(){JSONObject n=model.noiseShown();return n==null?7:n.optInt("level",7);}
 
   void render(){
    rendering=true;
-   boolean live=live(),cached=snapshot.optBoolean("cached");int count=connectedCount();
+   JSONObject snapshot=model.snapshot;boolean live=model.live(),cached=snapshot.optBoolean("cached"),reading=model.reading||model.refreshWanted;int count=model.connectedCount();
    // Header status line
    if(live){sub.setText("Live · "+count+" of 2 connected");subLed.set(color(R.color.qs_ok),Led.SOLID,false);}
-   else if(cached&&devices().length()>0){sub.setText((reading?"Checking… · ":"Last known · ")+count+" of 2 connected");subLed.set(color(R.color.qs_ink3),Led.HOLLOW,reading);}
+   else if(cached&&model.devices().length()>0){sub.setText((reading?"Checking… · ":"Last known · ")+count+" of 2 connected");subLed.set(color(R.color.qs_ink3),Led.HOLLOW,reading);}
    else if(reading){sub.setText("Checking headset…");subLed.set(color(R.color.qs_ink3),Led.HOLLOW,true);}
    else{sub.setText("Headset unavailable");subLed.set(color(R.color.qs_warn),Led.HOLLOW,false);}
    Object bat=snapshot.opt("battery");
    batteryBox.setVisibility(bat instanceof Number?View.VISIBLE:View.GONE);if(bat instanceof Number)battery.setText(((Number)bat).intValue()+"%");
-   notice.setVisibility(notice().isEmpty()?View.GONE:View.VISIBLE);notice.setText(notice());notice.setTextColor(color(noticeError?R.color.qs_warn:R.color.qs_ink2));
-   prompt.setVisibility(replacing!=null?View.VISIBLE:View.GONE);if(replacing!=null)promptText.setText("Both slots are in use. Choose which connection "+name(replacing)+" replaces.");
+   notice.setVisibility(notice().isEmpty()?View.GONE:View.VISIBLE);notice.setText(notice());notice.setTextColor(color(model.noticeError?R.color.qs_warn:R.color.qs_ink2));
+   JSONObject replacing=model.replacing();JSONArray offer=model.offer();
+   prompt.setVisibility(replacing!=null||offer!=null?View.VISIBLE:View.GONE);
+   if(replacing!=null)promptText.setText("Both slots are in use. Choose which connection "+name(replacing)+" replaces.");
+   else if(offer!=null)promptText.setText(Switcher.MESSAGES.get("busy"));
    renderCups(live);renderRows(live);
    // Noise
    JSONObject noise=snapshot.optJSONObject("noise");
    ncBox.setVisibility(noise==null?View.GONE:View.VISIBLE);
    if(noise==null){ridges.set(0.5f,false,!rendered);caption.setText("");}
    else{
-    int level=shownLevel!=null?shownLevel:noise.optInt("level");boolean on=shownEnabled!=null?shownEnabled:noise.optBoolean("enabled");
-    anc.setChecked(on);anc.setEnabled(live&&!mutating);slider.setProgress(level);slider.setEnabled(live&&on&&!mutating);
-    float dim=live&&on?1f:.4f;slider.setAlpha(dim);((View)ncBox.getChildAt(2)).setAlpha(dim);anc.setAlpha(live?1f:.5f);
+    JSONObject shown=model.noiseShown();int level=shown.optInt("level");boolean on=shown.optBoolean("enabled");
+    // Never disabled for work in progress: a value set during a change is held and sent when it ends.
+    boolean can=model.canNoise();anc.setChecked(on);anc.setEnabled(can);if(!touching)slider.setProgress(level);slider.setEnabled(can&&on);
+    float dim=can&&on?1f:.4f;slider.setAlpha(dim);((View)ncBox.getChildAt(2)).setAlpha(dim);anc.setAlpha(can?1f:.5f);
     showNoise(level,on,rendered);
    }
    rendering=false;rendered=true;
   }
   boolean rendered=false,touching=false;
-  String notice(){return BoseTileService.this.notice;}
+  String notice(){return model.notice;}
   void showNoise(int level,boolean on,boolean animate){
    ridges.set(on?(10-level)/10f:1f,!on,animate);
    android.text.SpannableStringBuilder s=new android.text.SpannableStringBuilder();
    if(on){s.append("Level "+level);s.setSpan(new android.text.style.ForegroundColorSpan(color(R.color.qs_ink)),0,s.length(),0);s.setSpan(new TypefaceSpanCompat(medium),0,s.length(),0);s.append(" / 10");}
    else{s.append("Off");s.setSpan(new android.text.style.ForegroundColorSpan(color(R.color.qs_ink)),0,s.length(),0);s.setSpan(new TypefaceSpanCompat(medium),0,s.length(),0);s.append(" · all through");}
    caption.setText(s);
-   String state=!on?"Off · outside sound passes through":ancInFlight||ancQueued!=null?"Setting level "+level+"…":"On · level "+level+" of 10";
+   String k=Machines.kind(model.anc),value=on?"Level "+level:"Off";
+   // Held behind a change (hollow), being sent (pending), or the verified value.
+   String state=k.equals("held")?value+" · applies when the "+(model.switching()?"switch":"change")+" ends"
+    :!k.equals("idle")?(on?"Setting level "+level+"…":"Turning off…")
+    :!on?"Off · outside sound passes through":"On · level "+level+" of 10";
    ncSub.setText(state);
   }
 
   void renderCups(boolean live){
    cups.removeAllViews();
-   String[] addr=new String[2];String[] mode=new String[2];int n=0;JSONArray ds=devices();
    // Keep each device in the cup it already occupies so a settle never swaps slots under the finger.
-   List<String> on=new ArrayList<>();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&d.optBoolean("connected"))on.add(d.optString("address"));}
-   for(int i=0;i<2;i++)if(slotOrder[i]!=null&&on.remove(slotOrder[i])){addr[i]=slotOrder[i];mode[i]="on";}
-   for(int i=0;i<2&&!on.isEmpty();i++)if(addr[i]==null){addr[i]=on.remove(0);mode[i]="on";}
-   if(mutating&&"connect".equals(pendingAction)){
-    int slot=-1;if(pendingReplace!=null)for(int i=0;i<2;i++)if(pendingReplace.equals(addr[i]))slot=i;
-    if(slot<0)for(int i=0;i<2;i++)if(addr[i]==null){slot=i;break;}
-    if(slot>=0){addr[slot]=pendingAddress;mode[slot]="connecting";}
-   }
-   if(mutating&&"disconnect".equals(pendingAction))for(int i=0;i<2;i++)if(pendingAddress.equals(addr[i]))mode[i]="disconnecting";
-   slotOrder=addr.clone();
+   List<String> on=new ArrayList<>();JSONArray ds=model.devices();for(int i=0;i<ds.length();i++){JSONObject d=ds.optJSONObject(i);if(d!=null&&d.optBoolean("connected"))on.add(d.optString("address"));}
+   String[] order=new String[2];
+   for(int i=0;i<2;i++)if(slotOrder[i]!=null&&on.remove(slotOrder[i]))order[i]=slotOrder[i];
+   for(int i=0;i<2&&!on.isEmpty();i++)if(order[i]==null)order[i]=on.remove(0);
+   // The change in flight and the queued intent drawn over the verified cups (Machines.overlaySlots).
+   List<JSONObject> slots=model.slots(order);
+   for(int i=0;i<2;i++){JSONObject sl=slots.get(i);if("flight".equals(Machines.str(sl,"pend"))&&"connecting".equals(Machines.str(sl,"st")))order[i]=Machines.str(sl,"address");}
+   slotOrder=order;
    for(int i=0;i<2;i++){
     LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-1,1);if(i==1)lp.leftMargin=dp(10);
-    cups.addView(cup(i+1,addr[i]==null?null:device(addr[i]),mode[i],live),lp);
+    JSONObject sl=slots.get(i);String a=Machines.str(sl,"address");JSONObject d=a.isEmpty()?null:device(a);
+    if(d==null&&!a.isEmpty())d=Machines.o("address",a,"name",a);
+    String rep=Machines.str(sl,"replacing");JSONObject old=rep.isEmpty()?null:device(rep);
+    cups.addView(cup(i+1,d,Machines.str(sl,"st"),"queued".equals(Machines.str(sl,"pend")),sl.optBoolean("here"),rep.isEmpty()?"":old!=null?name(old):rep,live),lp);
    }
   }
-  View cup(int slot,JSONObject d,String mode,boolean live){
+  View cup(int slot,JSONObject d,String mode,boolean queued,boolean here,String replaced,boolean live){
    boolean cached=!live,pending="connecting".equals(mode)||"disconnecting".equals(mode);
    LinearLayout c=new LinearLayout(BoseTileService.this);c.setOrientation(LinearLayout.VERTICAL);c.setPadding(dp(12),dp(12),dp(12),dp(10));
-   c.setBackground(round(color(R.color.qs_surface),dp(22),pending?dp(1.5f):dp(1),color(pending?R.color.qs_accent:R.color.qs_cup_edge)));
+   // Verified: surface fill. In flight: no fill, solid ochre outline. Queued: no fill, dotted ochre outline.
+   GradientDrawable bg=round(pending?Color.TRANSPARENT:color(R.color.qs_surface),dp(22),pending?dp(1.5f):dp(1),color(pending?R.color.qs_accent:R.color.qs_cup_edge));
+   if(queued)bg.setStroke(dp(1.5f),color(R.color.qs_accent),dp(2),dp(3));
+   c.setBackground(bg);
    LinearLayout state=new LinearLayout(BoseTileService.this);state.setGravity(Gravity.CENTER_VERTICAL);c.addView(state);
    Led led=new Led();state.addView(led,new LinearLayout.LayoutParams(dp(13),dp(13)));
-   String label=d==null?"Open":"connecting".equals(mode)?"Connecting…":"disconnecting".equals(mode)?"Disconnecting…":cached?"Last known":"Connected";
-   TextView st=text(pending?label:label+" · Slot "+slot,12,false,R.color.qs_ink2);st.setPadding(dp(5),0,0,0);st.setSingleLine();st.setEllipsize(TextUtils.TruncateAt.END);state.addView(st);
+   String label=d==null?"Open"
+    :queued?("disconnecting".equals(mode)?"Disconnects next":here?"Moves here next":"Connects next")
+    :"connecting".equals(mode)?(here?"Moving here…":"Connecting…"):"disconnecting".equals(mode)?"Disconnecting…":cached?"Last known":"Connected";
+   TextView st=text(pending?label:label+" · Slot "+slot,12,pending,pending?R.color.qs_accent_ink:R.color.qs_ink2);st.setPadding(dp(5),0,0,0);st.setSingleLine();st.setEllipsize(TextUtils.TruncateAt.END);state.addView(st);
    if(d==null)led.set(color(R.color.qs_ink3),Led.HOLLOW,false);
+   else if(queued)led.set(color(R.color.qs_accent),Led.HOLLOW,false);
    else if(pending)led.set(color(R.color.qs_accent),Led.SOLID,true);
    else led.set(color(cached?R.color.qs_ink3:R.color.qs_ok),cached?Led.HOLLOW:Led.SOLID,false);
    TextView name=text(d==null?"Free slot":name(d),16,true,d==null?R.color.qs_ink3:R.color.qs_ink);name.setSingleLine();name.setEllipsize(TextUtils.TruncateAt.END);
+   if(pending)name.setAlpha(queued?.5f:.62f);
    LinearLayout.LayoutParams nl=new LinearLayout.LayoutParams(-1,-2);nl.topMargin=dp(6);c.addView(name,nl);
-   String tagText=d==null?"Connect a saved device":tag(d);boolean here=d!=null&&tagText.startsWith("This ");
-   TextView tag=text(tagText,13,here,here?R.color.qs_accent_ink:R.color.qs_ink2);tag.setSingleLine();tag.setEllipsize(TextUtils.TruncateAt.END);
-   if(here){LinearLayout t=new LinearLayout(BoseTileService.this);t.setGravity(Gravity.CENTER_VERTICAL);View bar=new View(BoseTileService.this);bar.setBackground(round(color(R.color.qs_accent),dp(1),0,0));
+   // A connect into a slot that is being freed names the device it replaces (as the dashboard and popup do).
+   String tagText=d==null?"Connect a saved device":"connecting".equals(mode)&&!replaced.isEmpty()?"Replacing "+replaced:tag(d);boolean mine=d!=null&&tagText.startsWith("This ");
+   TextView tag=text(tagText,13,mine,mine?R.color.qs_accent_ink:R.color.qs_ink2);tag.setSingleLine();tag.setEllipsize(TextUtils.TruncateAt.END);
+   if(pending)tag.setAlpha(queued?.5f:.62f);
+   if(mine){LinearLayout t=new LinearLayout(BoseTileService.this);t.setGravity(Gravity.CENTER_VERTICAL);View bar=new View(BoseTileService.this);bar.setBackground(round(color(R.color.qs_accent),dp(1),0,0));
     LinearLayout.LayoutParams bl=new LinearLayout.LayoutParams(dp(12),dp(2));bl.rightMargin=dp(6);t.addView(bar,bl);t.addView(tag);c.addView(t);}
    else c.addView(tag);
    View spacer=new View(BoseTileService.this);c.addView(spacer,new LinearLayout.LayoutParams(1,0,1));
    LinearLayout.LayoutParams bl=new LinearLayout.LayoutParams(-1,dp(44));bl.topMargin=dp(8);
    if(d==null){View hold=new View(BoseTileService.this);c.addView(hold,bl);return c;}
-   Button b;
-   if(pending){b=button("connecting".equals(mode)?"Connecting…":"Disconnecting…",true);b.setEnabled(false);b.setAlpha(1f);fill(b);}
-   else if(replacing!=null){final String drop=d.optString("address");final String target=replacing.optString("address");b=button("Replace",true);enable(b,live&&!busy());b.setOnClickListener(v->mutate("connect",target,drop));}
-   else{final String a=d.optString("address");b=button("Disconnect",false);enable(b,live&&!busy());b.setOnClickListener(v->mutate("disconnect",a,null));}
+   Button b;final String a=d.optString("address");
+   if(queued){b=button("Queued · cancel",true);dotted(b);b.setOnClickListener(v->model.cancelQueued());}
+   else if(pending){b=button(label,true);b.setEnabled(false);b.setAlpha(1f);wash(b);}
+   else if(model.offer()!=null){b=button("Replace",true);enable(b,true);b.setOnClickListener(v->model.switchHere(a));}
+   else if(model.replacing()!=null){b=button("Replace",true);enable(b,model.canMutate());b.setOnClickListener(v->model.replaceSlot(a));}
+   else{b=button("Disconnect",false);enable(b,model.canMutate());b.setOnClickListener(v->model.disconnect(device(a)));}
    b.setTextSize(14);b.setPadding(dp(8),0,dp(8),0);c.addView(b,bl);return c;
   }
   void renderRows(boolean live){
-   rows.removeAllViews();JSONArray ds=devices();int shown=0;
+   rows.removeAllViews();JSONArray ds=model.devices();int shown=0;
+   Set<String> inCup=new HashSet<>();for(JSONObject sl:model.slots(slotOrder))if("connecting".equals(Machines.str(sl,"st")))inCup.add(Machines.str(sl,"address"));
    for(int i=0;i<ds.length();i++){
-    JSONObject d=ds.optJSONObject(i);if(d==null||d.optBoolean("connected"))continue;
-    if(mutating&&"connect".equals(pendingAction)&&d.optString("address").equals(pendingAddress))continue;
+    JSONObject d=ds.optJSONObject(i);if(d==null||d.optBoolean("connected")||inCup.contains(d.optString("address")))continue;
     rows.addView(hairline(),new LinearLayout.LayoutParams(-1,dp(1)));rows.addView(row(d,live));shown++;
    }
    if(shown==0){TextView none=text(ds.length()==0?"No saved devices yet":"Every saved device is connected",13,false,R.color.qs_ink3);none.setPadding(0,dp(10),0,dp(10));rows.addView(hairline(),new LinearLayout.LayoutParams(-1,dp(1)));rows.addView(none);}
@@ -418,10 +347,14 @@ public class BoseTileService extends TileService {
    LinearLayout.LayoutParams il=new LinearLayout.LayoutParams(dp(22),dp(22));il.rightMargin=dp(14);r.addView(icon,il);
    LinearLayout t=new LinearLayout(BoseTileService.this);t.setOrientation(LinearLayout.VERTICAL);r.addView(t,new LinearLayout.LayoutParams(0,-2,1));
    TextView name=text(name(d),15,true,R.color.qs_ink);name.setSingleLine();name.setEllipsize(TextUtils.TruncateAt.END);t.addView(name);
-   boolean chosen=replacing!=null&&replacing.optString("address").equals(d.optString("address"));
-   t.addView(text(chosen?"Choose a slot above to replace":"Saved · not connected",13,false,chosen?R.color.qs_accent_ink:R.color.qs_ink2));
+   JSONObject replacing=model.replacing(),q=model.queued();String a=d.optString("address");
+   boolean chosen=replacing!=null&&replacing.optString("address").equals(a);
+   // A connect queued with no cup to draw it in (both slots full): it asks which slot to replace when released.
+   boolean waiting=q!=null&&"connect".equals(q.optString("action"))&&a.equals(q.optString("address"));
+   t.addView(text(waiting?"Connects next · asks which slot to replace":chosen?"Choose a slot above to replace":"Saved · not connected",13,false,waiting||chosen?R.color.qs_accent_ink:R.color.qs_ink2));
    Button b;
-   b=button("Connect",true);enable(b,live&&!busy()&&replacing==null);b.setOnClickListener(v->connect(d));
+   if(waiting){b=button("Queued · cancel",true);dotted(b);b.setOnClickListener(v->model.cancelQueued());}
+   else{b=button("Connect",true);enable(b,model.canMutate());b.setOnClickListener(v->model.connect(d));}
    b.setTextSize(14);b.setMinWidth(dp(104));LinearLayout.LayoutParams bl=new LinearLayout.LayoutParams(-2,dp(44));bl.leftMargin=dp(10);r.addView(b,bl);
    return r;
   }
@@ -446,7 +379,10 @@ public class BoseTileService extends TileService {
    return b;
   }
   void enable(Button b,boolean on){b.setEnabled(on);b.setAlpha(on?1f:.45f);}
-  void fill(Button b){b.setBackground(round(color(R.color.qs_accent),dp(22),0,0));b.setTextColor(color(R.color.qs_on_accent));}
+  /** In flight: an ochre wash and outline, lighter than a verified result. */
+  void wash(Button b){b.setBackground(round(color(R.color.qs_accent)&0x26FFFFFF,dp(22),dp(1.5f),color(R.color.qs_accent)));b.setTextColor(color(R.color.qs_accent_ink));}
+  /** Queued: a dotted ochre outline, no fill. */
+  void dotted(Button b){GradientDrawable g=round(Color.TRANSPARENT,dp(22),0,0);g.setStroke(dp(1.5f),color(R.color.qs_accent),dp(2),dp(3));b.setBackground(new RippleDrawable(ColorStateList.valueOf(color(R.color.qs_press)),g,null));b.setTextColor(color(R.color.qs_accent_ink));}
   void styleSlider(){
    slider.setMax(10);slider.setPadding(dp(12),0,dp(12),0);slider.setSplitTrack(false);slider.setContentDescription("Noise cancellation level");
    GradientDrawable bg=round(color(R.color.qs_track),dp(2),0,0),fg=round(color(R.color.qs_fill),dp(2),0,0);
@@ -563,5 +499,5 @@ public class BoseTileService extends TileService {
   }
  }
 
- public void onDestroy(){generation++;if(dialog!=null)dialog.dismiss();work.shutdown();super.onDestroy();}
+ public void onDestroy(){generation++;if(dialog!=null)dialog.dismiss();work.shutdown();reads.shutdown();super.onDestroy();}
 }

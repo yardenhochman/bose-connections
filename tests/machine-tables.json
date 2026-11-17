@@ -1,5 +1,31 @@
 {
-  "about": "Transition tables shared by the dashboard (web/app.js: noiser, intents) and the Omarchy popup (linux/BoseModel.qml: noiseNext, intentNext). tests/web_machines.cjs and tests/bose_model.qml both run every row, so the two front ends keep one behaviour. A row is [from, event, to]. docs/state-machines.md 5 and 6.",
+  "about": "Transition tables shared by the dashboard (web/app.js: interact, noiser, intents) and the Omarchy popup (linux/BoseModel.qml: interactNext, noiseNext, intentNext; android/Machines.java; mac/Machines.h). tests/web_machines.cjs and tests/bose_model.qml both run every row, so the two front ends keep one behaviour. A row is [from, event, to]. docs/state-machines.md 5 and 6.",
+  "interact": {
+    "about": "Dashboard interact and popup interactNext (docs/state-machines.md 2, 6). One value for a slot choice, a Use here offer and the change in flight.",
+    "values": {"slotsB": [{"address": "BB:BB:BB:BB:BB:BB", "label": "Mac"}]},
+    "states": {
+      "idle": {"kind": "idle"},
+      "choosing": {"kind": "choosing", "address": "AA:AA:AA:AA:AA:AA"},
+      "choosingB": {"kind": "choosing", "address": "BB:BB:BB:BB:BB:BB"},
+      "offer": {"kind": "offer", "slots": "slotsB"},
+      "offerNone": {"kind": "offer", "slots": []},
+      "mutating": {"kind": "mutating", "action": "connect", "address": "AA:AA:AA:AA:AA:AA", "replace": null, "label": null, "here": false},
+      "here": {"kind": "mutating", "action": "connect", "address": "AA:AA:AA:AA:AA:AA", "replace": "BB:BB:BB:BB:BB:BB", "label": "Mac", "here": true},
+      "started": {"kind": "mutating", "action": "disconnect", "address": "BB:BB:BB:BB:BB:BB", "replace": null, "label": null, "here": false}
+    },
+    "events": {
+      "pickA": {"type": "pick", "address": "AA:AA:AA:AA:AA:AA"}, "pickB": {"type": "pick", "address": "BB:BB:BB:BB:BB:BB"}, "cancel": {"type": "cancel"},
+      "drop": {"type": "drop-choice"}, "start": {"type": "start", "action": "disconnect", "address": "BB:BB:BB:BB:BB:BB"}, "busy": {"type": "busy", "slots": "slotsB"},
+      "busyBare": {"type": "busy"}, "settled": {"type": "settled"}, "junk": {"type": "nope"}
+    },
+    "rows": [
+      ["idle", "pickA", "choosing"], ["idle", "pickB", "choosingB"], ["idle", "cancel", "idle"], ["idle", "drop", "idle"], ["idle", "start", "started"], ["idle", "busy", "idle"], ["idle", "settled", "idle"], ["idle", "junk", "idle"],
+      ["choosing", "pickA", "idle"], ["choosing", "pickB", "choosingB"], ["choosing", "cancel", "idle"], ["choosing", "drop", "idle"], ["choosing", "start", "started"], ["choosing", "busy", "choosing"], ["choosing", "settled", "choosing"], ["choosing", "junk", "choosing"],
+      ["offer", "pickA", "choosing"], ["offer", "pickB", "choosingB"], ["offer", "cancel", "idle"], ["offer", "drop", "offer"], ["offer", "start", "started"], ["offer", "busy", "offer"], ["offer", "settled", "offer"], ["offer", "junk", "offer"],
+      ["mutating", "pickA", "mutating"], ["mutating", "pickB", "mutating"], ["mutating", "cancel", "mutating"], ["mutating", "drop", "mutating"], ["mutating", "start", "mutating"], ["mutating", "busy", "mutating"], ["mutating", "settled", "idle"], ["mutating", "junk", "mutating"],
+      ["here", "pickA", "here"], ["here", "pickB", "here"], ["here", "cancel", "here"], ["here", "drop", "here"], ["here", "start", "here"], ["here", "busy", "offer"], ["here", "busyBare", "offerNone"], ["here", "settled", "idle"], ["here", "junk", "here"]
+    ]
+  },
   "noiser": {
     "values": {"v3": {"level": 3, "enabled": true}, "v5": {"level": 5, "enabled": true}, "v0": {"level": 5, "enabled": false}},
     "states": {

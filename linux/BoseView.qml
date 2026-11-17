@@ -500,7 +500,11 @@ FocusScope {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: view.theme.sp(1)
         iconName: "refresh"
-        enabled: !view.model.loading && !view.model.pending
+        // Never disabled for work in progress: pressed during a change it is drawn queued and reads once the change ends.
+        enabled: !view.model.loading
+        busy: view.model.loading
+        spinning: view.model.loading
+        dotted: view.model.refreshWanted
         onClicked: { view.model.notice = null; view.model.refresh() }
       }
     }
@@ -628,10 +632,12 @@ FocusScope {
         PillButton {
           theme: view.theme
           compact: true
-          text: view.model.savingRoles ? "Saving…" : "Save"
+          // Pressed during a change it is kept and sent when the change ends (drawn queued until then).
+          text: view.model.savingRoles ? "Saving…" : view.model.rolesWanted ? "Saves after the change" : "Save"
           variant: "accent"
           busy: view.model.savingRoles
-          enabled: !view.model.busy
+          dotted: view.model.rolesWanted !== null
+          enabled: !view.model.savingRoles
           onClicked: view.model.saveRoles(view.editedRoles, function() { view.showSettings = false })
         }
         PillButton {

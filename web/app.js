@@ -118,6 +118,7 @@ function choosingAddr(){return ui.kind==='choosing'?ui.address:null;} // address
 function offerSlots(){return ui.kind==='offer'?ui.slots:null;}     // Use here was busy: {address,label} per slot
 let mutations=0;         // counts started changes: an overview reply requested before the latest one is stale
 let refreshing=false;
+let refreshWanted=false; // Refresh pressed while work runs: read once it ends (pump), so it cannot read a half-made change
 let slotOrder=[null,null];
 let receivedAt=0;
 const anc={m:IDLE,lastStart:-1e9,timer:0,dragging:false}; // m: the noise writer machine (noiser)
@@ -288,7 +289,9 @@ function renderDevices(reachable){
   if(choosingHere)sub.classList.add('pend');
   info.append(node('div','n',d.name),sub);row.append(info);
   const b=node('button','btn');b.type='button';
-  if(choosingHere){b.className='btn connect pressed';b.textContent='Connect';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>cancelChoice(true);}
+  const waiting=queued()?.action==='connect'&&queued().address===d.address; // queued with no cup to draw it in: it asks on release
+  if(waiting){sub.textContent='Connects next · asks which slot to replace';sub.classList.add('pend');b.className='btn connect queued';b.replaceChildren(node('span','ring'),node('span','','Queued · cancel'));b.setAttribute('aria-label',`Cancel the queued connect of ${d.name}`);b.onclick=cancelQueued;}
+  else if(choosingHere){b.className='btn connect pressed';b.textContent='Connect';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>cancelChoice(true);}
   else{b.className='btn connect';b.textContent='Connect';b.dataset.live='true';b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>connect(d.address);}
   row.append(b);list.append(row);
  }
@@ -362,6 +365,7 @@ function pump(){
   if(d==='drop-noise'){anc.m=noiser(anc.m,{type:'drop'});message(NOISE_DROPPED,true);render();return;}
   if(d==='intent'){const i=queued();queueSend({type:'release'});runIntent(i);if(changeRunning()||anc.m.kind==='sending')return;continue;}
   if(d==='noise')pumpNoise();
+  else if(d==='idle'&&refreshWanted){refreshWanted=false;refresh(true);}
   return;
  }
 }
@@ -422,7 +426,7 @@ async function performNow(data,fromQueue){
   if(!r.state)adopt(await api('/api/overview'));
   message(r.message||(data.action==='connect'?`${nameOf(data.address)} connected`:`${nameOf(data.address)} disconnected`));
  }catch(e){message(e.message,true);}
- finally{uiSend({type:'settled'});render();pump();if(opener)focusRow(opener);}
+ finally{mutations++;uiSend({type:'settled'});render();pump();if(opener)focusRow(opener);}
 }
 function connect(address){
  const target=deviceByAddress(address);if(!target||!live()&&!changeRunning())return;
@@ -431,7 +435,8 @@ function connect(address){
  // this connect replaces it, one queued intent at a time.)
  const leaving=[mut()].filter(a=>a?.action==='disconnect').map(a=>a.address);
  const connected=state.devices.filter(d=>d.connected&&!leaving.includes(d.address));
- if(connected.length<2)return perform({action:'connect',address});
+ // Both full while a change runs: queue it; it asks for the slot on release, since the slots may change meanwhile.
+ if(connected.length<2||changeRunning())return perform({action:'connect',address});
  uiSend({type:'pick',address});message('');render();
  const first=document.querySelector('.cup.target');if(first)first.focus();
 }
@@ -467,7 +472,7 @@ async function useHereNow(replace,label,fromQueue){
  message(replace?MSG.replacing.replace('{label}',label):MSG.pending,'pending');render();
  const body={source:switchSource(),request_id:Math.random().toString(36).slice(2,10)};if(replace)body.replace=replace;
  let r;try{r=await switchCall(body);}catch(e){r=null;}
- uiSend(r&&r.busy?{type:'busy',slots:r.slots}:{type:'settled'});
+ mutations++;uiSend(r&&r.busy?{type:'busy',slots:r.slots}:{type:'settled'});
  if(r&&r.ok&&r.verified){
   if(r.state)adopt(r.state);else try{adopt(await api('/api/overview'));}catch(e){}
   const i=replace?slotOrder.indexOf(replace):slotOrder.indexOf(null);if(i>=0&&!slotOrder.includes(here))slotOrder[i]=here;
@@ -482,7 +487,7 @@ $('use-here').onclick=()=>useHere();
 // Input is never disabled for work in progress: a tap during other work queues (act), a noise value is held (pump).
 // Only what cannot be done is disabled: no live headset, its own request in flight, a refresh while work runs.
 function syncControls(){
- const ok=live(),work=workRunning(),noiseOk=!!state?.noise&&(ok||changeRunning());
+ const ok=live(),noiseOk=!!state?.noise&&(ok||changeRunning());
  document.querySelectorAll('[data-live="true"]').forEach(el=>{
   if(el.id==='noise-enabled')el.disabled=!noiseOk;
   else if(el.id==='noise-level'){el.disabled=!noiseOk||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
@@ -491,14 +496,17 @@ function syncControls(){
  // Switch targets work from any state (the controller reads the headset itself first).
  document.querySelectorAll('[data-switch="true"]').forEach(el=>{el.disabled=false;});
  $('use-here').disabled=!!mut()?.here;
- const rb=$('refresh');rb.disabled=refreshing||work;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
+ const rb=$('refresh');rb.disabled=refreshing;rb.classList.toggle('spinning',refreshing);rb.classList.toggle('queued',refreshWanted&&!refreshing);
+ rb.setAttribute('aria-label',refreshing?'Checking':refreshWanted?'Refresh after the change':'Refresh');
 }
 
-async function refresh(){
+// deferred===true: the read a press during work asked for; it keeps that work's result line.
+async function refresh(deferred){
  if(stateMode())return refreshState();
- if(refreshing||mut()||anc.m.kind==='sending')return;
+ if(refreshing)return;
+ if(workRunning()||queued()){refreshWanted=true;syncControls();return;}
  refreshing=true;uiSend({type:'drop-choice'});syncControls();const gen=mutations;
- try{const next=await api('/api/overview');if(gen===mutations)adopt(next);message(unreachable()?'No controller can reach the headset right now. Connect it to a phone, PC or Mac in Bluetooth settings, then refresh.':'',unreachable()?'info':false);}catch(e){message(e.message,true);}
+ try{const next=await api('/api/overview');if(gen===mutations)adopt(next);if(deferred!==true||unreachable())message(unreachable()?'No controller can reach the headset right now. Connect it to a phone, PC or Mac in Bluetooth settings, then refresh.':'',unreachable()?'info':false);}catch(e){message(e.message,true);}
  finally{refreshing=false;render();if(!state)syncControls();}
 }
 
@@ -506,7 +514,7 @@ async function refresh(){
 // ST.snap is the controller's last snapshot; ST.taps holds a tap whose POST has not answered yet (shown at once) or one
 // the controller never took (network). Nothing here infers a connection state of its own.
 // ST.link: the link machine (linker); ST.taps: the tap machine (tapper). Each is written only through its function.
-const ST={link:'boot',snap:null,at:0,offset:0,seq:null,taps:IDLE,here:null};
+const ST={link:'boot',snap:null,at:0,offset:0,seq:null,boot:null,taps:IDLE,here:null}; // boot: the controller run that seq counts in
 function linkSend(e){ST.link=linker(ST.link,e);}
 function tapSend(e){ST.taps=tapper(ST.taps,e);}
 const STEP={reading:'Checking the headphones'}; // first step shown before the controller answers (contract steps.reading)
@@ -516,8 +524,9 @@ function serverNow(){return Date.now()/1000+ST.offset;}
 function since(){return Date.now()/1000-ST.at;}
 function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
 function rid(){return Math.random().toString(36).slice(2,10);}
-async function fetchState(after,wait){
- const q=after==null?'':`?after=${after}&wait=${wait}`;
+// `boot` names the controller run that `after` counts in: a restarted controller (seq from 0 again) answers at once.
+async function fetchState(after,wait,boot){
+ const q=after==null?'':`?after=${after}&wait=${wait}`+(boot?`&boot=${encodeURIComponent(boot)}`:'');
  // The long-poll waits up to `wait` s on the controller; 10 s more means the link is gone (retried with backoff).
  const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),((wait||0)+10)*1000);
  const r=await fetch('/api/state'+q,{cache:'no-store',signal:abort.signal}).finally(()=>clearTimeout(timer));
@@ -535,14 +544,14 @@ function enterState(s){linkSend('snapshot');applySnap(s);follow();setInterval(ti
 async function follow(){
  for(let backoff=1000;;){
   try{
-   const s=await fetchState(ST.seq,25);
+   const s=await fetchState(ST.seq,25,ST.boot);
    if(s===null){linkSend('gone');refresh();return;} // the controller was replaced by an older one
    linkSend('snapshot');backoff=1000;applySnap(s);
   }catch(e){linkSend('error');stateHeader();await sleepMs(backoff);backoff=Math.min(backoff*2,8000);}
  }
 }
 function applySnap(s){
- ST.snap=s;ST.seq=s.seq;ST.at=Date.now()/1000;ST.offset=(s.now||ST.at)-ST.at;
+ ST.snap=s;ST.seq=s.seq;ST.boot=s.boot||null;ST.at=Date.now()/1000;ST.offset=(s.now||ST.at)-ST.at;
  if(!ST.here)ST.here=s.here||s.headset?.controllers?.[0]?.id||'pc';
  if(s.operation)tapSend({type:'operation'});
  const prev=state;state=overviewFrom(s);
@@ -566,7 +575,6 @@ function serverOp(){
 function tapOp(){return ST.taps.kind==='posting'?ST.taps.tap:null;}
 function shownOp(){const f=ST.taps.kind==='refused'?ST.taps.fail:null;return tapOp()||serverOp()||(f&&serverNow()-f.at<DONE_LINGER?f:null);}
 function opRunning(){const o=tapOp()||serverOp();return !!o&&!o.result;}
-function busy(){return !!mut()||(stateMode()&&opRunning());}
 function agoText(sec){if(sec==null)return '';if(sec<3)return 'just now';if(sec<60)return `${Math.round(sec)} s ago`;if(sec<3600)return `${Math.round(sec/60)} min ago`;return 'at '+clock(Date.now()/1000-sec);}
 function secs(v){return (Math.round(v*10)/10).toFixed(1)+' s';}
 function the(role){return role===ST.here?'this '+(role==='phone'?'phone':labels[role]):role==='phone'?'the phone':'the '+(labels[role]||'device');}
@@ -768,8 +776,11 @@ async function startSwitchNow(target,replace,fromQueue){
 }
 async function cancelSwitch(){await postJSON('/api/switch/cancel',{source:switchSource()});}
 async function refreshState(){
- // A fresh headset read: the controller folds it into the state the long-poll delivers.
- if(refreshing||busy())return;refreshing=true;syncControls();
+ // A fresh headset read: the controller folds it into the state the long-poll delivers. A press while work runs reads
+ // once it ends (pump).
+ if(refreshing)return;
+ if(workRunning()||queued()){refreshWanted=true;syncControls();return;}
+ refreshing=true;syncControls();
  try{await api('/api/overview');}catch(e){message(e.message,true);}finally{refreshing=false;syncControls();}
 }
 function tick(){
