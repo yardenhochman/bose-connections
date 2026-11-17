@@ -189,7 +189,7 @@ FocusScope {
         text: !view.noise ? "Level unknown"
             : !view.ancOn ? "<b>Off</b> · all through"
             : "<b>Level " + Math.round(view.liveLevel) + "</b> / 10"
-        color: view.theme.ink
+        color: view.model.ancBusy ? view.theme.accentInk : view.theme.ink
         font.family: view.theme.family
         font.pixelSize: view.theme.fCaption
       }
@@ -205,8 +205,10 @@ FocusScope {
       width: parent.width
       variant: "accent"
       readonly property bool mine: !!view.model.pending && !!view.model.pending.here
-      text: !mine ? "Use here" : view.model.notice ? view.model.notice.text : view.model.messages.pending
+      text: mine ? (view.model.notice ? view.model.notice.text : view.model.messages.pending)
+          : view.model.queuedHere ? "Use here queued · tap to cancel" : "Use here"
       busy: mine
+      dotted: view.model.queuedHere && !mine
       enabled: view.model.canUseHere
       onClicked: view.model.switchHere()
     }
@@ -307,10 +309,14 @@ FocusScope {
             here: view.model.isHere(modelData.device)
             cached: view.cached
             replacedName: modelData.replaced || ""
+            queued: !!modelData.queued
+            hereMove: !!modelData.here
+            animate: view.animate
             actionText: modelData.state !== "connected" ? ""
                       : view.model.replacing ? "Replace" : "Disconnect"
             actionEnabled: view.model.canMutate
             onAction: view.model.replacing ? view.model.replaceSlot(modelData.device) : view.model.disconnectDevice(modelData.device)
+            onCancelQueued: view.model.cancelQueued()
           }
         }
       }
@@ -365,14 +371,27 @@ FocusScope {
             font.pixelSize: view.theme.fName
             font.weight: Font.Medium
           }
-          Text {
-            text: !view.noise ? "Unknown"
-                : view.ancOn ? "On · level " + Math.round(view.liveLevel) + " of 10" + (view.model.ancBusy ? " · applying…" : "")
-                : "Off · outside sound passes through" + (view.model.ancBusy ? " · applying…" : "")
-            textFormat: Text.PlainText
-            color: view.model.ancBusy ? view.theme.accentInk : view.theme.ink2
-            font.family: view.theme.family
-            font.pixelSize: view.theme.fSmall
+          Row {
+            spacing: view.theme.sp(5)
+            // Held behind a change or switch: a hollow ring and what it waits for.
+            Rectangle {
+              visible: view.model.ancHeld
+              anchors.verticalCenter: parent.verticalCenter
+              width: view.theme.sp(7); height: width; radius: width / 2
+              color: "transparent"
+              border.width: 1.5; border.color: view.theme.accent
+            }
+            Text {
+              text: !view.noise ? "Unknown"
+                  : view.model.ancHeld ? (view.ancOn ? "Level " + Math.round(view.liveLevel) : "Off")
+                                         + (view.model.pending && !view.model.pending.here ? " · applies when the change ends" : " · applies when the switch ends")
+                  : view.ancOn ? "On · level " + Math.round(view.liveLevel) + " of 10" + (view.model.ancBusy ? " · applying…" : "")
+                  : "Off · outside sound passes through" + (view.model.ancBusy ? " · applying…" : "")
+              textFormat: Text.PlainText
+              color: view.model.ancBusy ? view.theme.accentInk : view.theme.ink2
+              font.family: view.theme.family
+              font.pixelSize: view.theme.fSmall
+            }
           }
         }
         // Switch: on = noise cancellation on.

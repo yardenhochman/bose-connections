@@ -1,7 +1,10 @@
 import QtQuick
+import QtQuick.Shapes
 
 // Rounded action button. "ghost" = hairline ink outline; "accent" = outlined
 // ochre that fills while pressed or while its action is pending.
+// spinning: a request in flight, drawn lighter than a result (ochre wash, a
+// turning arc, no fill). dotted: a queued intent (dotted outline, hollow ring).
 Item {
   id: b
 
@@ -11,10 +14,13 @@ Item {
   property bool busy: false
   property bool compact: false
   property string iconName: ""
+  property bool spinning: false
+  property bool dotted: false
+  property bool animate: true
   signal clicked()
 
   readonly property bool accent: variant === "accent"
-  readonly property bool filled: accent && (area.pressed || busy)
+  readonly property bool filled: accent && (area.pressed || busy) && !spinning && !dotted
   readonly property bool hot: area.containsMouse && enabled
 
   activeFocusOnTab: enabled && visible
@@ -29,15 +35,55 @@ Item {
   Rectangle {
     anchors.fill: parent
     radius: height / 2
-    color: b.filled ? b.theme.accent : (b.hot ? (b.accent ? b.theme.alpha(b.theme.accent, 0.12) : b.theme.hover) : "transparent")
-    border.width: b.activeFocus ? 2 : 1
+    color: b.filled ? b.theme.accent : (b.spinning || b.hot ? (b.accent ? b.theme.alpha(b.theme.accent, 0.12) : b.theme.hover) : "transparent")
+    border.width: b.dotted ? 0 : b.activeFocus ? 2 : 1
     border.color: b.activeFocus ? b.theme.ink : (b.accent ? b.theme.accent : b.theme.lineStrong)
     Behavior on color { ColorAnimation { duration: 120; easing.type: Easing.OutCubic } }
+  }
+  Shape {
+    visible: b.dotted
+    anchors.fill: parent
+    preferredRendererType: Shape.CurveRenderer
+    ShapePath {
+      strokeColor: b.activeFocus ? b.theme.ink : b.theme.accent
+      strokeWidth: b.activeFocus ? 2 : 1.2
+      strokeStyle: ShapePath.DashLine
+      dashPattern: [1.2, 2]
+      fillColor: "transparent"
+      PathRectangle { x: 0.5; y: 0.5; width: b.width - 1; height: b.height - 1; radius: (b.height - 1) / 2 }
+    }
   }
 
   Row {
     anchors.centerIn: parent
     spacing: b.theme.sp(6)
+    // In flight: a turning three-quarter arc. Queued: a hollow ring.
+    Item {
+      visible: b.spinning || b.dotted
+      width: b.theme.sp(11); height: width
+      anchors.verticalCenter: parent.verticalCenter
+      Shape {
+        id: arc
+        visible: b.spinning
+        anchors.fill: parent
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+          strokeColor: label.color
+          strokeWidth: Math.max(1.5, b.theme.sp(1.8))
+          fillColor: "transparent"
+          capStyle: ShapePath.RoundCap
+          PathAngleArc { centerX: arc.width / 2; centerY: arc.height / 2; radiusX: arc.width / 2 - 1; radiusY: radiusX; startAngle: 0; sweepAngle: 270 }
+        }
+        RotationAnimator on rotation { running: b.spinning && b.animate; from: 0; to: 360; duration: 900; loops: Animation.Infinite }
+      }
+      Rectangle {
+        visible: b.dotted
+        anchors.centerIn: parent
+        width: b.theme.sp(8); height: width; radius: width / 2
+        color: "transparent"
+        border.width: Math.max(1, b.theme.sp(1.4)); border.color: label.color
+      }
+    }
     BoseIcon {
       id: icon
       visible: b.iconName !== ""
@@ -62,7 +108,7 @@ Item {
     id: area
     anchors.fill: parent
     hoverEnabled: true
-    enabled: b.enabled && !b.busy
+    enabled: b.enabled && !b.busy && !b.spinning
     cursorShape: Qt.PointingHandCursor
     onClicked: b.clicked()
   }
