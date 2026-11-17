@@ -5,7 +5,7 @@ import "../linux"
 //   QT_QPA_PLATFORM=offscreen qml6 tests/render_popup.qml -- <output folder>
 // Writes popup-<light|dark>-<scene>.png and exits. Scenes: inflight (a Disconnect in flight, a Disconnect queued, a noise
 // value held), connect (a Connect queued into the slot the Disconnect frees), here (a Use here queued behind a noise
-// write).
+// write), refresh and save (Refresh and the settings Save pressed during a Disconnect: kept, drawn queued).
 Item {
   id: root
   width: 360
@@ -58,7 +58,8 @@ Item {
       if (method === "POST") { root.held.push(done); return }
       done(null, root.overview(connected))
     }
-    model.pending = null; model.queue = {kind: "idle"}; model.anc = {kind: "idle"}; model.notice = null; model.slotOrder = [null, null]
+    model.ui = {kind: "idle"}; model.queue = {kind: "idle"}; model.anc = {kind: "idle"}; model.notice = null; model.slotOrder = [null, null]
+    model.refreshWanted = false; model.rolesWanted = null; view.showSettings = false
     model.refresh()
   }
   property var steps: []
@@ -76,6 +77,11 @@ Item {
       scenes.push(function() { grab("connect", nextStep) })
       scenes.push(after(function() { fresh([devs.phone]); model.setNoise(3, true); model.switchHere() }))
       scenes.push(function() { grab("here", nextStep) })
+      // Refresh and settings Save pressed during a change: drawn queued, sent when the change ends.
+      scenes.push(after(function() { fresh([devs.pc, devs.phone]); model.disconnectDevice(model.deviceFor(devs.phone)); model.refresh() }))
+      scenes.push(function() { grab("refresh", nextStep) })
+      scenes.push(after(function() { view.showSettings = true; model.saveRoles({pc: devs.pc, phone: devs.phone, mac: devs.mac}, null) }))
+      scenes.push(function() { grab("save", nextStep) })
     })
     run(scenes)
   }

@@ -76,6 +76,7 @@ Item {
   // The shared transition tables (tests/machine-tables.json): the popup's machines must equal the dashboard's.
   function resolve(t, o) {
     if (typeof o === "string" && t.values && o in t.values) return t.values[o]
+    if (Array.isArray(o)) return o.map(function(x) { return resolve(t, x) })
     if (o && typeof o === "object") { var r = {}; for (var k in o) r[k] = resolve(t, o[k]); return r }
     return o
   }
@@ -87,7 +88,7 @@ Item {
     xhr.send()
     var tables = JSON.parse(xhr.responseText)
     const mm = modelComponent.createObject(harness) as BoseModel
-    var fns = {noiser: mm.noiseNext, intents: mm.intentNext}
+    var fns = {interact: mm.interactNext, noiser: mm.noiseNext, intents: mm.intentNext}
     for (var name in fns) {
       var t = tables[name]
       t.rows.forEach(function(r) {
@@ -203,10 +204,49 @@ Item {
     check(im.queuedIntent && im.queuedIntent.address === devs.pc && slotStates().indexOf("Desktop PC:disconnecting:queued") >= 0, "instant: a stale read keeps the queued intent drawn: " + slotStates())
     answer(); answer()
     check(slotStates() === "-:empty,-:empty" && maxOpen === 1, "instant: both disconnects ran in order: " + slotStates())
+    var gets = []
+    im.transport = function(method, path, body, done) {
+      if (method === "POST") { open++; held.push({path: path, body: body, done: function(err, json) { open--; done(err, json) }}); return }
+      gets.push(path); done(null, cur)
+    }
+    // One interaction value (machine 2): a Use here offer and a slot choice can no longer be open at once.
+    cur = overview([devs.phone, devs.mac]); im.refresh()
+    im.switchHere()
+    answer(function() { return {ok: false, busy: true, error_key: "busy", error: contract.messages.busy, slots: [{address: devs.phone, label: "Phone"}, {address: devs.mac, label: "Mac"}]} })
+    check(im.ui.kind === "offer" && im.busySlots.length === 2, "interaction: busy Use here offers Replace per slot")
+    im.connectDevice(im.deviceFor(devs.tv))
+    check(im.ui.kind === "choosing" && im.replacing && im.replacing.address === devs.tv && im.busySlots === null, "interaction: picking a device closes the Use here offer: " + JSON.stringify(im.ui))
+    im.cancelReplace()
+    check(im.ui.kind === "idle" && !im.replacing && !im.busySlots && !im.pending, "interaction: cancel closes the slot choice")
+    // Connect with both slots full while a change runs: queued, the slot is asked for when it is released.
+    im.switchHere()
+    im.connectDevice(im.deviceFor(devs.tv))
+    check(im.queuedIntent && im.queuedIntent.address === devs.tv && im.ui.kind === "mutating", "interaction: a connect into full slots during a change is queued, not dropped: " + JSON.stringify(im.queue))
+    answer(function() { return {ok: true, verified: true, message: contract.messages.ok, state: cur} })
+    check(im.ui.kind === "choosing" && im.replacing && im.replacing.address === devs.tv && held.length === 0, "interaction: released into full slots it asks which to replace: " + JSON.stringify(im.ui))
+    im.cancelReplace()
+    // Refresh during work (formerly disabled): shown at once, read once the work ends, so it cannot undo the change.
+    im.disconnectDevice(im.deviceFor(devs.mac))
+    gets = []
+    im.refresh(); im.refresh()
+    check(im.refreshWanted && gets.length === 0 && im.refreshing, "refresh during a change: wanted and shown, not sent: " + JSON.stringify(gets))
+    answer()
+    check(gets.length === 1 && gets[0] === "/api/overview" && !im.refreshWanted, "refresh during a change: one read after it ends: " + JSON.stringify(gets))
+    // Save in settings during work (formerly disabled): kept and sent when the change ends, never alongside it.
+    im.disconnectDevice(im.deviceFor(devs.phone))
+    var saved = false
+    im.saveRoles({pc: devs.pc, phone: devs.phone, mac: devs.mac}, function() { saved = true })
+    check(held.length === 1 && held[0].path === "/api/override" && im.rolesWanted && im.saving && !im.savingRoles, "save during a change: shown as saving, not sent yet")
+    answer()
+    check(held.length === 1 && held[0].path === "/api/roles" && !im.rolesWanted, "save during a change: sent once the change ends")
+    held.shift().done(null, {ok: true})
+    check(saved && im.notice && im.notice.text === "Controller settings saved" && maxOpen === 1, "save during a change: saved, one request at a time (max open " + maxOpen + ")")
     im.destroy()
   }
 
-  Component.onCompleted: Qt.callLater(run)
+  Component.onCompleted: Qt.callLater(function() {
+    try { run() } catch (e) { console.log("FAIL omarchy contract: " + e + "\n" + e.stack); Qt.exit(1) }  // an exception must not hang the run
+  })
   function run() {
     var xhr = new XMLHttpRequest()
     xhr.open("GET", Qt.resolvedUrl("switch-contract.json"), false)

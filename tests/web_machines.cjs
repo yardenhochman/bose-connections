@@ -9,7 +9,7 @@ const M={};vm.runInNewContext(block+';Object.assign(M,{IDLE,interact,tapper,fold
 const {IDLE,interact,tapper,foldAccepted,linker,noiser,noiseShown,intents,intentKey,schedule,overlaySlots}=M;
 const tables=JSON.parse(fs.readFileSync(path.join(__dirname,'machine-tables.json'),'utf8'));
 // A shared table names values by key (tests/machine-tables.json); resolve them into objects.
-function resolve(t,o){if(typeof o==='string'&&o in t.values)return t.values[o];if(o&&typeof o==='object'){const r={};for(const [k,v] of Object.entries(o))r[k]=resolve(t,v);return r;}return o;}
+function resolve(t,o){if(typeof o==='string'&&t.values&&o in t.values)return t.values[o];if(Array.isArray(o))return o.map(x=>resolve(t,x));if(o&&typeof o==='object'){const r={};for(const [k,v] of Object.entries(o))r[k]=resolve(t,v);return r;}return o;}
 function runTable(name,fn){const t=tables[name];for(const [from,ev,to] of t.rows)eq(fn(resolve(t,t.states[from]),resolve(t,t.events[ev])),resolve(t,t.states[to]),`${name} ${from} --${ev}->`);}
 let n=0;const eq=(a,b,t)=>{assert.deepStrictEqual(JSON.parse(JSON.stringify(a)),JSON.parse(JSON.stringify(b)),t);n++;};
 
@@ -29,6 +29,7 @@ const T={
  here:{pickA:S.here,pickB:S.here,cancel:S.here,drop:S.here,start:S.here,busy:{kind:'offer',slots:[{address:B,label:'Mac'}]},settled:IDLE,junk:S.here}};
 for(const [from,row] of Object.entries(T))for(const [ev,to] of Object.entries(row))eq(interact(S[from],E[ev]),to,`interact ${from} --${ev}->`);
 eq(interact(S.here,{type:'busy'}),{kind:'offer',slots:[]},'busy without slots offers none');
+runTable('interact',interact); // the shared table (also run against BoseModel.interactNext, Machines.java and Machines.h)
 // The contradiction the old flags allowed (a Use here offer and a slot choice at once) is unrepresentable:
 eq(interact(S.offer,E.pickA).kind,'choosing','picking a device closes the Use here offer');
 

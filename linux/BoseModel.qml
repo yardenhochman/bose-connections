@@ -22,10 +22,18 @@ QtObject {
   property bool helperDown: false
   property bool loading: false
   property bool savingRoles: false
-  property var pending: null       // {action, address, replace, name, replaceName}
-  property int changes: 0          // started connection changes: an overview or cache read sent before the latest one is stale
-  property var replacing: null     // saved device waiting for a slot choice
-  property var busySlots: null     // Use here: [{address, label}] offered after a busy reply
+  // Interaction (interactNext, the dashboard's interact): idle | choosing{address} (both slots full: pick one to replace)
+  // | offer{slots} (Use here was busy: Replace per slot) | mutating{action, address, replace, label, here} (the change
+  // in flight). Written only by uiSend; pending, replacing and busySlots are its readers.
+  property var ui: ({kind: "idle"})
+  readonly property var pending: ui.kind === "mutating" ? ui : null
+  readonly property var replacing: ui.kind === "choosing" ? (deviceFor(ui.address) || {address: ui.address, name: ui.address}) : null
+  readonly property var busySlots: ui.kind === "offer" ? ui.slots : null
+  property int changes: 0          // connection changes started or ended: an overview or cache read sent before the latest is stale
+  property bool refreshWanted: false   // Refresh pressed while work runs: read once it ends
+  property var rolesWanted: null       // {roles, done}: Save pressed while work runs, sent once it ends
+  readonly property bool refreshing: loading || refreshWanted
+  readonly property bool saving: savingRoles || rolesWanted !== null
   property var notice: null        // {text, tone: "ok" | "error" | "pending"}
   property var slotOrder: [null, null]
   property var anc: ({kind: "idle"})   // noise writer (noiseNext): idle | waiting | held | sending; written only by noiseSend
@@ -72,9 +80,9 @@ QtObject {
     var over = overlaySlots(base, p, q)
     return over.map(function(s) {
       var intent = s.pend === "queued" ? q : p
-      var dev = s.address ? (deviceFor(s.address) || {address: s.address, name: intent ? intent.name : s.address}) : null
+      var dev = s.address ? (deviceFor(s.address) || {address: s.address, name: intent && intent.name ? intent.name : s.address}) : null
       return {device: dev, state: s.st === "free" ? "empty" : s.st, queued: s.pend === "queued", here: s.here,
-              replaced: s.replacing ? (nameOf(deviceFor(s.replacing)) || (intent && intent.replaceName) || "") : ""}
+              replaced: s.replacing ? (nameOf(deviceFor(s.replacing)) || (intent && (intent.replaceName || intent.label)) || "") : ""}
     })
   }
   readonly property var savedDevices: {
@@ -191,8 +199,8 @@ QtObject {
     snapshot = state
     loaded = true
     helperDown = false
-    if (replacing && (!live || connectedCount < 2)) replacing = null
-    if (busySlots && connectedCount < 2) busySlots = null
+    if (ui.kind === "choosing" && (!live || connectedCount < 2)) uiSend({type: "drop-choice"})
+    if (ui.kind === "offer" && connectedCount < 2) uiSend({type: "cancel"})
     snapshotApplied()
   }
   // Noise read-backs can carry an empty device list when the controller has no
@@ -220,8 +228,12 @@ QtObject {
       if (thenRefresh) m.refresh()
     }, 30000)
   }
+  // Refresh while work runs is not sent then (it would read a half-made change): it shows at once and runs when the
+  // work ends (drain).
   function refresh() {
-    if (loading || pending) return
+    if (loading) return
+    if (workRunning || queuedIntent) { refreshWanted = true; return }
+    refreshWanted = false
     loading = true
     var gen = changes
     request("GET", "/api/overview", null, function(err, json) {
@@ -237,13 +249,27 @@ QtObject {
   }
   function opened() {
     notice = null
-    replacing = null
+    uiSend({type: "drop-choice"})
     loadCached(true)
   }
 
   // -------------------------------------------------------------- machines
-  // Pure transitions, the same as web/app.js (noiser, intents, schedule, overlaySlots); tests/bose_model.qml runs the
-  // shared tables of tests/machine-tables.json against these. An event a state does not take returns the same state.
+  // Pure transitions, the same as web/app.js (interact, noiser, intents, schedule, overlaySlots); tests/bose_model.qml
+  // runs the shared tables of tests/machine-tables.json against these. An event a state does not take returns the same
+  // state.
+  function interactNext(s, e) {
+    switch (e.type) {
+    case "pick": if (s.kind === "mutating") return s
+      return s.kind === "choosing" && s.address === e.address ? {kind: "idle"} : {kind: "choosing", address: e.address}
+    case "cancel": return s.kind === "choosing" || s.kind === "offer" ? {kind: "idle"} : s
+    case "drop-choice": return s.kind === "choosing" ? {kind: "idle"} : s   // a refresh or a tap ends a slot choice, not an offer
+    case "start": if (s.kind === "mutating") return s
+      return {kind: "mutating", action: e.action, address: e.address, replace: e.replace || null, label: e.label || null, here: !!e.here}
+    case "busy": return s.kind === "mutating" && s.here ? {kind: "offer", slots: Array.isArray(e.slots) ? e.slots : []} : s
+    case "settled": return s.kind === "mutating" ? {kind: "idle"} : s
+    }
+    return s
+  }
   function noiseNext(s, e) {
     switch (e.type) {
     case "input": return s.kind === "sending" ? {kind: "sending", sent: s.sent, queued: e.value}
@@ -296,6 +322,7 @@ QtObject {
     }
     return out
   }
+  function uiSend(e) { ui = interactNext(ui, e) }
   function noiseSend(e) { anc = noiseNext(anc, e) }
   function queueSend(e) { queue = intentNext(queue, e) }
 
@@ -314,7 +341,11 @@ QtObject {
         if (workRunning) return
         continue
       }
-      if (d === "noise") pumpNoise()
+      if (d === "noise") { pumpNoise(); return }
+      if (d !== "idle") return
+      // Nothing else to run: the deferred Save, then the deferred Refresh.
+      if (rolesWanted) { var r = rolesWanted; rolesWanted = null; saveRoles(r.roles, r.done); return }
+      if (refreshWanted) refresh()
       return
     }
   }
@@ -322,7 +353,7 @@ QtObject {
   // ------------------------------------------------------------- mutations
   // Every connection input goes through act: at once when nothing else runs, else the one queued intent.
   function act(intent) {
-    if (workRunning) { queueSend({type: "hold", intent: intent}); return }
+    if (workRunning) { uiSend({type: "drop-choice"}); queueSend({type: "hold", intent: intent}); return }
     if (queuedIntent) queueSend({type: "cancel"})
     runIntent(intent, false)
   }
@@ -339,7 +370,7 @@ QtObject {
     }
     if (d.connected) { notice = {tone: "ok", text: nameOf(d) + " is already connected"}; return }
     var rep = i.replace && deviceFor(i.replace) && deviceFor(i.replace).connected ? deviceFor(i.replace) : null
-    if (connectedCount >= 2 && !rep) { replacing = d; return }   // the slots filled meanwhile: ask, never guess
+    if (connectedCount >= 2 && !rep) { uiSend({type: "pick", address: d.address}); return }   // the slots filled meanwhile: ask, never guess
     if (rep) mutate({action: "connect", address: d.address, replace: rep.address},
                     {action: "connect", address: d.address, name: nameOf(d), replace: rep.address, replaceName: nameOf(rep)})
     else mutate({action: "connect", address: d.address}, {action: "connect", address: d.address, name: nameOf(d)})
@@ -347,22 +378,23 @@ QtObject {
   function connectDevice(d) {
     if (!canMutate || !d) return
     notice = null
-    // A slot that a disconnect in flight frees counts as open: the connect queues behind it.
+    // A slot that a disconnect in flight frees counts as open: the connect queues behind it. With both slots full and
+    // a change running, the connect queues too and asks for the slot when it is released (the slots may change).
     var leaving = pending && pending.action === "disconnect" ? 1 : 0
-    if (connectedCount - leaving >= 2) { replacing = d; return }
+    if (connectedCount - leaving >= 2 && !changeRunning) { uiSend({type: "pick", address: d.address}); return }
     act({action: "connect", address: d.address, name: nameOf(d)})
   }
   function replaceSlot(slotDevice) {
     var d = replacing
-    replacing = null
+    uiSend({type: "cancel"})
     if (!canMutate || !d || !slotDevice) return
     act({action: "connect", address: d.address, name: nameOf(d), replace: slotDevice.address, replaceName: nameOf(slotDevice)})
   }
-  function cancelReplace() { replacing = null; busySlots = null }
+  function cancelReplace() { uiSend({type: "cancel"}) }
   function disconnectDevice(d) {
     if (!canMutate || !d) return
     notice = null
-    replacing = null
+    uiSend({type: "drop-choice"})
     act({action: "disconnect", address: d.address, name: nameOf(d)})
   }
   function successText(p) {
@@ -385,20 +417,20 @@ QtObject {
     if (!replace && queuedHere) { cancelQueued(); return }   // the same tap again cancels the queued Use here
     var label = ""
     for (var i = 0; replace && busySlots && i < busySlots.length; i++) if (busySlots[i].address === replace) label = busySlots[i].label
-    busySlots = null
-    replacing = null
+    uiSend({type: "cancel"})
     act({action: "here", address: hereAddress, name: nameOf(deviceFor(hereAddress)) || "This PC", replace: replace || "", replaceName: label, here: true})
   }
   function switchHereNow(replace, label) {
     var here = hereAddress
     if (!here) return
     changes++
-    pending = {action: "connect", address: here, name: nameOf(deviceFor(here)) || "This PC", replace: replace || "", replaceName: label, here: true}
+    uiSend({type: "start", action: "connect", address: here, replace: replace || null, label: label || null, here: true})
     notice = {tone: "pending", text: replace ? messages.replacing.replace("{label}", label || "device") : messages.pending}
     var body = {source: "omarchy", request_id: Math.random().toString(36).slice(2, 10)}
     if (replace) body.replace = replace
     request("POST", "/api/switch", body, function(err, json) {
-      m.pending = null
+      m.changes++
+      m.uiSend(json && json.busy ? {type: "busy", slots: json.slots || []} : {type: "settled"})
       if (json && json.ok && json.verified) {
         var order = m.slotOrder.slice()
         var at = replace ? order.indexOf(replace) : order.indexOf(null)
@@ -406,7 +438,6 @@ QtObject {
         if (json.state) m.applySnapshot(json.state)
         m.notice = {tone: "ok", text: m.messages.ok}
       } else if (json && json.busy) {
-        m.busySlots = json.slots || []
         m.notice = null
       } else {
         m.notice = {tone: "error", text: m.errorText(err, json && json.error_key ? json : null) + m.messages.retry_hint}
@@ -416,8 +447,8 @@ QtObject {
   }
   function mutate(body, p) {
     changes++
-    pending = p
-    function done(n) { m.pending = null; m.notice = n; m.drain() }
+    uiSend({type: "start", action: body.action, address: body.address, replace: body.replace || null})
+    function done(n) { m.changes++; m.uiSend({type: "settled"}); m.notice = n; m.drain() }
     request("POST", "/api/override", body, function(err, json) {
       if (err || !json || json.ok === false) { done({tone: "error", text: m.errorText(err, json)}); return }
       if (!json.verified) {
@@ -481,8 +512,9 @@ QtObject {
   }
 
   // ------------------------------------------------------------- settings
+  // Save while other work runs is kept and sent when it ends (drain): never a settings write alongside a change.
   function saveRoles(roles, done) {
-    if (savingRoles || pending || ancBusy) return
+    if (savingRoles || workRunning || queuedIntent || anc.kind !== "idle") { rolesWanted = {roles: roles, done: done}; notice = null; return }
     savingRoles = true
     notice = null
     request("POST", "/api/roles", {roles: roles}, function(err) {
