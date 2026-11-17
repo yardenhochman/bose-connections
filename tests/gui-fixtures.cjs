@@ -26,6 +26,8 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  let cur=null,overviewCalls=0,overrideHandler=null,switchHandler=null,switchReplied=0;const posts=[],switchPosts=[];
  // GET /api/state: null = an older controller (404), so the page keeps its overview polling; else a scripted long-poll.
  let states=null;const stateGets=[],cancels=[];
+ // One mutation at a time toward the controller: the most /api/override + /api/switch requests ever open at once.
+ let open=0,maxOpen=0;const enter=()=>{open++;maxOpen=Math.max(maxOpen,open);},leave=()=>{open--;};
  // Every page gets the same fixture API; nothing reaches a live controller.
  const wire=async page=>{
   // Without BOSE_URL the page itself comes from this checkout's web/, so no running helper is needed.
@@ -33,7 +35,7 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await page.route('**/fonts/*.woff2',r=>{const f=path.join(fonts,path.basename(new URL(r.request().url()).pathname));return fs.existsSync(f)?r.fulfill({body:fs.readFileSync(f),contentType:'font/woff2'}):r.fulfill({status:404,body:''});});
   await page.route('**/api/cached',r=>r.fulfill({json:{devices:[]}}));
   await page.route('**/api/overview',r=>{overviewCalls++;return r.fulfill({json:cur});});
-  await page.route('**/api/override',async r=>{const body=r.request().postDataJSON();posts.push({body,at:Date.now()});const res=await overrideHandler(body);return r.fulfill({json:res});});
+  await page.route('**/api/override',async r=>{const body=r.request().postDataJSON();posts.push({body,at:Date.now()});enter();try{const res=await overrideHandler(body);return r.fulfill({json:res});}finally{leave();}});
   await page.route(u=>new URL(u).pathname==='/api/state',async r=>{
    if(!states)return r.fulfill({status:404,body:'not found'});
    const q=new URL(r.request().url()).searchParams;const after=q.has('after')?Number(q.get('after')):null;stateGets.push({after,wait:q.get('wait')});
@@ -41,7 +43,7 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
    try{await r.fulfill({json:{...states.snap,now:Date.now()/1000}});}catch(e){}
   });
   await page.route('**/api/switch/cancel',async r=>{cancels.push(r.request().postDataJSON());if(states?.onCancel)states.onCancel();return r.fulfill({json:{ok:true}});});
-  await page.route('**/api/switch',async r=>{const body=r.request().postDataJSON();switchPosts.push({body,at:Date.now()});const res=await switchHandler(body);switchReplied=Date.now();return r.fulfill({json:res});});
+  await page.route('**/api/switch',async r=>{const body=r.request().postDataJSON();switchPosts.push({body,at:Date.now()});enter();try{const res=await switchHandler(body);switchReplied=Date.now();return r.fulfill({json:res});}finally{leave();}});
  };
  await wire(page);
  const ready=(p=page)=>p.evaluate(()=>document.fonts.ready.then(()=>new Promise(r=>setTimeout(r,400))));
@@ -150,7 +152,9 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  await page.getByRole('button',{name:'Connect MacBook Pro'}).click();
  await page.locator('.cup.pending .pill.pending',{hasText:'Connecting…'}).waitFor({timeout:200});
  check(await page.locator('.device',{hasText:'MacBook Pro'}).count()===0,'A device pending in a cup must leave the saved list');
- check(await page.locator('[data-live="true"]:enabled').count()===0,'Other mutations must be disabled while one runs');
+ // Was: every other control disabled while one change runs. Now they stay enabled and queue (state-machines.md 6).
+ check(await page.getByRole('button',{name:'Disconnect Desktop PC'}).isEnabled()&&await page.locator('#noise-level').isEnabled(),'Other controls stay enabled while a change runs');
+ check(await page.locator('.cup.pending .spin').count()===1&&await page.locator('.cup.queued').count()===0,'In flight: one spinning pending cup, nothing queued');
  await shot(page,'phone-pending.png');
  await page.getByText('MacBook Pro connected').waitFor();
  check((await page.locator('.cup').nth(1).textContent()).includes('MacBook Pro'),'MacBook Pro should take slot 2');
@@ -190,6 +194,65 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  check(JSON.stringify(posts[0].body)===JSON.stringify({action:'connect',address:DEV.phone.address,replace:DEV.mac.address}),'Incorrect replace payload '+JSON.stringify(posts[0]?.body));
  check(overviewCalls===calls+1,'Response without state should fall back to exactly one overview call');
  check((await page.locator('.cup').nth(1).textContent()).includes('Android phone'),'Replacement should land in the replaced slot');
+
+ // ---- Instant input: taps during a change queue one intent, noise is held, one request at a time (state-machines.md 5-6) ----
+ {fs.mkdirSync(path.join(artifacts,'pending'),{recursive:true});
+  const pc=DEV.pc.address,ph=DEV.phone.address,mac=DEV.mac.address;
+  const apply=b=>{const on=cur.devices.filter(d=>d.connected).map(d=>d.address);
+   if(b.action==='noise')cur=overview(on,{level:b.level,enabled:b.enabled});
+   else if(b.action==='disconnect')cur=overview(on.filter(a=>a!==b.address),cur.noise);
+   else cur=overview([...on.filter(a=>a!==b.replace),b.address],cur.noise);
+   return {ok:true,verified:true,message:b.action==='noise'?'Noise cancellation updated':`${Object.values(DEV).find(d=>d.address===b.address).name} ${b.action}ed`,state:cur};};
+  const queuedCups=()=>page.locator('.cup.queued').allInnerTexts();
+  cur=overview([pc,ph],{level:8,enabled:true});await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect Android phone'}).waitFor();
+  posts.length=0;maxOpen=0;let fail=null;
+  overrideHandler=async b=>{await sleep(b.action==='noise'?300:2500);if(fail&&fail(b))return {ok:false,verified:false,message:'The headset didn’t confirm the disconnect.'};return apply(b);};
+  // Latest wins: Disconnect phone runs; Disconnect PC queues; the slider is held; Connect Mac then replaces the queued intent.
+  await page.getByRole('button',{name:'Disconnect Android phone'}).click();
+  await page.locator('.cup.pending',{hasText:'Disconnecting…'}).waitFor({timeout:200});
+  await page.getByRole('button',{name:'Disconnect Desktop PC'}).click();
+  await page.locator('.cup.queued',{hasText:'Disconnects next'}).waitFor({timeout:200});
+  await page.locator('#noise-level').evaluate(el=>{el.value='4';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));});
+  await page.waitForFunction(()=>document.querySelector('#noise-current').textContent==='Level 4 · applies when the change ends',null,{timeout:200});
+  check(await page.locator('#noise-current .led.queued').count()===1,'A held noise value shows the hollow queued light');
+  check(posts.length===1,'Queued input sends nothing while the change runs: '+JSON.stringify(posts.map(p=>p.body)));
+  // Pending never looks verified: no surface fill (verified cups have one), and queued differs from in flight by its outline.
+  {const look=await page.evaluate(()=>{const g=e=>e&&{bg:getComputedStyle(e).backgroundColor,border:getComputedStyle(e).borderTopStyle,spin:!!e.querySelector('.spin')};return {p:g(document.querySelector('.cup.pending')),q:g(document.querySelector('.cup.queued')),v:g(document.querySelector('#settings-dialog'))};});
+   check(look.p&&look.q&&look.p.bg==='rgba(0, 0, 0, 0)'&&look.q.bg==='rgba(0, 0, 0, 0)'&&look.p.border==='solid'&&look.q.border==='dotted'&&look.p.spin&&!look.q.spin,'Pending and queued looks: '+JSON.stringify(look));}
+  await ready();await shot(page,'pending/phone-light-queued.png');await scheme('dark');await shot(page,'pending/phone-dark-queued.png');await scheme('light');
+  await page.getByRole('button',{name:'Connect MacBook Pro'}).click();
+  await page.locator('.cup.queued',{hasText:'MacBook Pro'}).waitFor({timeout:200});
+  check(JSON.stringify(await queuedCups()).includes('Connects next')&&(await queuedCups()).length===1,'Latest wins: only the Connect is queued: '+JSON.stringify(await queuedCups()));
+  check(await page.getByRole('button',{name:'Disconnect Desktop PC'}).isVisible(),'The replaced intent reverts: Desktop PC is plain connected again: '+JSON.stringify(await page.locator('.cup').allInnerTexts()));
+  check(await page.locator('.device',{hasText:'MacBook Pro'}).count()===0,'A queued connect shows in its cup, not in the saved list');
+  await shot(page,'pending/phone-light-queued-connect.png');
+  await page.waitForFunction(()=>document.querySelector('#noise-current').textContent==='On · level 4 of 10',null,{timeout:12000});
+  check(JSON.stringify(posts.map(p=>p.body))===JSON.stringify([{action:'disconnect',address:ph},{action:'connect',address:mac},{action:'noise',level:4,enabled:true}]),'Queued work runs in order, intent before the held noise: '+JSON.stringify(posts.map(p=>p.body)));
+  check(maxOpen===1,'One mutation at a time toward the controller, max open '+maxOpen);
+  check((await page.locator('.cup').allInnerTexts()).join('|').includes('MacBook Pro')&&await page.locator('.cup.queued,.cup.pending').count()===0,'Settled: Desktop PC and MacBook Pro, nothing pending');
+  // Cancel: the same control again drops the queued intent; nothing is sent for it.
+  posts.length=0;
+  await page.getByRole('button',{name:'Disconnect MacBook Pro'}).click();await page.locator('.cup.pending',{hasText:'Disconnecting…'}).waitFor({timeout:200});
+  await page.getByRole('button',{name:'Disconnect Desktop PC'}).click();
+  await page.getByRole('button',{name:'Cancel the queued disconnect of Desktop PC'}).click();
+  check(await page.locator('.cup.queued').count()===0&&await page.getByRole('button',{name:'Disconnect Desktop PC'}).isVisible(),'Cancel drops the queued intent at once');
+  await page.getByText('MacBook Pro disconnected').waitFor({timeout:8000});await sleep(300);
+  check(posts.length===1,'A cancelled intent is never sent: '+JSON.stringify(posts.map(p=>p.body)));
+  // A queued intent that fails reverts to the verified state and says so.
+  posts.length=0;fail=b=>b.action==='disconnect';
+  await page.getByRole('button',{name:'Connect Android phone'}).click();await page.locator('.cup.pending',{hasText:'Connecting…'}).waitFor({timeout:200});
+  await page.getByRole('button',{name:'Disconnect Desktop PC'}).click();await page.locator('.cup.queued',{hasText:'Disconnects next'}).waitFor({timeout:200});
+  await page.getByText('The headset didn’t confirm the disconnect.').waitFor({timeout:12000});
+  check(await page.getByRole('button',{name:'Disconnect Desktop PC'}).isEnabled()&&await page.locator('.cup.queued,.cup.pending').count()===0,'Failed queued disconnect reverts to Connected');
+  check(JSON.stringify(posts.map(p=>p.body.action))==='["connect","disconnect"]','Failure case posts: '+JSON.stringify(posts.map(p=>p.body)));
+  // A noise value held behind a change whose end leaves the headset unreachable reverts and says so.
+  fail=null;overrideHandler=async b=>{await sleep(600);cur={...overview([pc,ph],cur.noise),reachable:false,cached:true};return {ok:false,verified:false,message:'The headset didn’t confirm the disconnect.',state:cur};};
+  posts.length=0;await page.getByRole('button',{name:'Disconnect Android phone'}).click();
+  await page.locator('#noise-enabled').click();await page.waitForFunction(()=>document.querySelector('#noise-current').textContent.startsWith('Off · applies when'),null,{timeout:300});
+  await page.getByText('Noise change not sent: the headphones aren’t reachable now').waitFor({timeout:4000});
+  check(posts.length===1&&await page.locator('#noise-enabled').isChecked(),'Dropped noise: never sent, the switch shows the verified On again');
+  cur=overview([pc,ph],{level:4,enabled:true});await page.locator('#refresh').click();await page.getByRole('button',{name:'Disconnect Android phone'}).waitFor();await page.getByText('Live · just now').waitFor();
+ }
 
  // Settings dialog
  await page.getByRole('button',{name:'Settings',exact:true}).click();
@@ -304,6 +367,21 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
  overrideHandler=async()=>({ok:false,error_key:'keep_one',error:M.errors.keep_one,detail:'scripted'});
  await sw.getByRole('button',{name:'Connect MacBook Pro'}).click();await sw.getByRole('button',{name:'Replace Android phone'}).click();
  await sw.getByText(M.errors.keep_one,{exact:true}).waitFor();
+ // Use here during a noise write: queued (not disabled), the same tap again cancels, then it goes when the write ends
+ cur=overview([DEV.phone.address]);await sw.goto(base);await sw.getByText('Live · just now').waitFor();await ready(sw);
+ posts.length=0;switchPosts.length=0;overrideHandler=async b=>{await sleep(900);cur=overview([DEV.phone.address],{level:b.level,enabled:b.enabled});return {ok:true,verified:true,message:'Noise cancellation updated',state:cur};};
+ switchHandler=async()=>{await sleep(300);cur=overview([DEV.phone.address,DEV.pc.address],cur.noise);return {ok:true,verified:true,message:M.ok,state:cur};};
+ await sw.locator('#noise-level').evaluate(el=>{el.value='2';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));});
+ await sw.getByText('Setting level 2…').waitFor({timeout:200});
+ await sw.locator('#use-here').click();
+ check((await sw.locator('#use-here').textContent())==='Use here queued · tap to cancel'&&await sw.locator('#use-here.queued').isEnabled(),'Use here during a noise write is queued, not disabled');
+ check(await sw.locator('.cup.queued',{hasText:'Moves here next'}).count()===1,'The queued Use here is drawn in the free slot');
+ await settle();await shot(sw,'pending/phone-light-queued-here.png');
+ await sw.locator('#use-here').click();check((await sw.locator('#use-here').textContent())==='Use here'&&await sw.locator('.cup.queued').count()===0,'The same tap again cancels it');
+ await sw.locator('#use-here').click();
+ await sw.getByText(M.ok,{exact:true}).waitFor({timeout:5000});
+ check(switchPosts.length===1&&switchPosts[0].at>=posts[0].at+850,'The queued Use here is sent once, after the noise write answered');
+ check(await sw.locator('.cup',{hasText:'Desktop PC'}).count()===1,'Use here landed');
  // Android WebView: the bridge's switchHere is used when present, with the same reply shape
  await sw.addInitScript(()=>{window.__switched=[];window.Android={request:(id,p,d)=>fetch(p,d?{method:'POST',headers:{'Content-Type':'application/json'},body:d}:{}).then(r=>r.text()).then(t=>window.finishRequest(id,t)),
   switchHere:(id,body)=>{window.__switched.push(JSON.parse(body));setTimeout(()=>window.finishRequest(id,JSON.stringify({ok:false,error_key:'timeout',error:'Took too long to switch'})),300);},settings:()=>{}};});
@@ -373,9 +451,41 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await sleep(700);
   const mb=switchPosts[0]?.body;check(switchPosts.length===1&&mb.target==='mac'&&mb.source==='web'&&/^[a-z0-9]{1,32}$/.test(mb.request_id)&&!('replace' in mb),'Move to Mac payload '+JSON.stringify(mb));
   check((await opText()).includes('Moving to the Mac'),'Operation title for the Mac: '+await opText());
-  check(await st.locator('[data-switch="true"]:enabled').count()===0&&await st.locator('[data-live="true"]:enabled').count()===0,'One operation at a time: other actions disabled');
+  // Was: every other action disabled while a switch runs. Now they stay enabled: a tap queues behind the switch, a noise
+  // value is held until it ends, and nothing reaches the controller meanwhile (state-machines.md 5-6).
+  posts.length=0;overrideHandler=async b=>{await sleep(50);return {ok:true,verified:true,message:'Noise cancellation updated',state:{noise:{level:b.level,enabled:b.enabled}}};};
+  check(await st.getByRole('button',{name:'Disconnect Android phone'}).isEnabled()&&await st.locator('#noise-level').isEnabled(),'Controls stay enabled during a switch');
+  await st.getByRole('button',{name:'Disconnect Android phone'}).click();
+  await st.locator('.cup .chip.queued',{hasText:'Disconnects next'}).waitFor({timeout:200});
+  await st.locator('#noise-level').evaluate(el=>{el.value='3';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));});
+  await st.waitForFunction(()=>document.querySelector('#noise-current').textContent==='Level 3 · applies when the switch ends',null,{timeout:200});
+  check(await st.locator('#op .step.active').count()===1,'The running switch card stays as it was');
+  await st.mouse.move(1,1);await ready(st);await shot(st,'pending/state-phone-light-queued.png');
+  await st.emulateMedia({colorScheme:'dark'});await ready(st);await shot(st,'pending/state-phone-dark-queued.png');await st.emulateMedia({colorScheme:'light'});
+  await st.getByRole('button',{name:'Cancel the queued disconnect of Android phone'}).click();
+  check(await st.locator('.cup .chip.queued').count()===0,'Cancel drops the queued disconnect');
+  await st.getByRole('button',{name:'Move the headphones to the Mac'}).click();await sleep(100);
+  check(switchPosts.length===1&&await st.locator('.btn.queued').count()===0,'Tapping the running move again is ignored');
+  check(posts.length===0,'Nothing reaches the controller while the switch runs: '+JSON.stringify(posts.map(p=>p.body)));
 
   // Mac → PC: releasing, connecting, done; each pushed by the long-poll, never inferred by the page
+  const ended=Date.now();states.set(scenes.macphone());await st.locator('#op').waitFor({state:'hidden'});
+  await st.waitForFunction(()=>document.querySelector('#noise-current').textContent==='On · level 3 of 10',null,{timeout:2000});
+  check(posts.length===1&&JSON.stringify(posts[0].body)===JSON.stringify({action:'noise',level:3,enabled:true})&&posts[0].at>=ended,'The held noise value is sent once the switch ends: '+JSON.stringify(posts.map(p=>p.body)));
+  // A switch tap during a noise write queues behind it and goes when the write ends.
+  overrideHandler=async b=>{await sleep(700);return {ok:true,verified:true,message:'Noise cancellation updated',state:{noise:{level:b.level,enabled:b.enabled}}};};
+  switchPosts.length=0;switchHandler=async()=>({accepted:true,seq:states.snap.seq,operation:op('mac','reading',[step('reading',lbl('reading'),'active',{since:now()})],{started_at:now()})});
+  await sleep(300); // past the 250 ms throttle gap, so the write starts at once
+  await st.locator('#noise-level').evaluate(el=>{el.value='5';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));});
+  await st.getByText('Setting level 5…').waitFor({timeout:200});check(posts.length===2,'The write is on the wire');
+  await st.getByRole('button',{name:'Move the headphones to this PC',exact:true}).click();
+  await st.locator('.device .btn.queued',{hasText:'Queued · cancel'}).waitFor({timeout:200});
+  check((await st.locator('#use-here').textContent())==='Use here queued · tap to cancel','Use here shows the queued intent too');
+  await shot(st,'pending/state-phone-light-queued-switch.png');
+  check(switchPosts.length===0,'The switch waits for the noise write');
+  await st.locator('#op .step.active').waitFor({timeout:3000});
+  check(switchPosts.length===1&&switchPosts[0].body.target==='pc','The queued switch is sent after the write: '+JSON.stringify(switchPosts.map(p=>p.body)));
+  check(switchPosts[0].at>=posts[posts.length-1].at+600,'One request at a time: the switch starts after the noise write answered');
   states.set(scenes.macphone());await st.locator('#op').waitFor({state:'hidden'});
   switchPosts.length=0;switchHandler=async()=>({accepted:true,seq:states.snap.seq,operation:scenes.releasing().operation});
   await st.getByRole('button',{name:/^Use here/}).click();await sleep(200);
@@ -445,7 +555,8 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   states=null;
  }
 
+ check(maxOpen<=1,'One mutation at a time toward the controller, max open '+maxOpen);
  check(!errors.length,errors.join('\n'));
- console.log(`GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window); Use here through ${contract.scenarios.length} contract scenarios + popover source, row contract text, Android bridge; /api/state long-poll: chips, steps, timings, result, auto-clear, retry, choose/cancel, Move-to targets, unreachable reasons, 404 fallback, popover.`);
+ console.log(`GUI checked: offline/live/cached, light+dark, phone+desktop; pending connect/disconnect; render-from-state; overview fallback; failure revert; ANC slider release + coalescing; ANC switch off; replace via cups; settings dialog; no JS errors or mobile overflow; here-controller footer; Mac popover mode (single column, height report, open window); Use here through ${contract.scenarios.length} contract scenarios + popover source, row contract text, Android bridge; /api/state long-poll: chips, steps, timings, result, auto-clear, retry, choose/cancel, Move-to targets, unreachable reasons, 404 fallback, popover; instant input: queued Connect/Disconnect/Use here/Move-to (latest wins, cancel, failure revert), noise held behind a change or switch (sent after, dropped when unreachable), one mutation at a time.`);
  await browser.close();
 })().catch(e=>{console.error(e);process.exit(1);});

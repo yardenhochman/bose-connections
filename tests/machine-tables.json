@@ -1,0 +1,77 @@
+{
+  "about": "Transition tables shared by the dashboard (web/app.js: noiser, intents) and the Omarchy popup (linux/BoseModel.qml: noiseNext, intentNext). tests/web_machines.cjs and tests/bose_model.qml both run every row, so the two front ends keep one behaviour. A row is [from, event, to]. docs/state-machines.md 5 and 6.",
+  "noiser": {
+    "values": {"v3": {"level": 3, "enabled": true}, "v5": {"level": 5, "enabled": true}, "v0": {"level": 5, "enabled": false}},
+    "states": {
+      "idle": {"kind": "idle"},
+      "waiting": {"kind": "waiting", "queued": "v3"},
+      "held": {"kind": "held", "queued": "v3"},
+      "sending": {"kind": "sending", "sent": "v3", "queued": null},
+      "sendingQ": {"kind": "sending", "sent": "v3", "queued": "v5"},
+      "waitingV0": {"kind": "waiting", "queued": "v0"},
+      "heldV0": {"kind": "held", "queued": "v0"},
+      "sendingV0": {"kind": "sending", "sent": "v3", "queued": "v0"},
+      "waitingV5": {"kind": "waiting", "queued": "v5"}
+    },
+    "events": {
+      "input": {"type": "input", "value": "v0"}, "hold": {"type": "hold"}, "resume": {"type": "resume"}, "drop": {"type": "drop"},
+      "send": {"type": "send"}, "ok": {"type": "ok"}, "fail": {"type": "fail"}, "junk": {"type": "x"}
+    },
+    "rows": [
+      ["idle", "input", "waitingV0"], ["idle", "hold", "idle"], ["idle", "resume", "idle"], ["idle", "drop", "idle"],
+      ["idle", "send", "idle"], ["idle", "ok", "idle"], ["idle", "fail", "idle"], ["idle", "junk", "idle"],
+      ["waiting", "input", "waitingV0"], ["waiting", "hold", "held"], ["waiting", "resume", "waiting"], ["waiting", "drop", "waiting"],
+      ["waiting", "send", "sending"], ["waiting", "ok", "waiting"], ["waiting", "fail", "idle"], ["waiting", "junk", "waiting"],
+      ["held", "input", "heldV0"], ["held", "hold", "held"], ["held", "resume", "waiting"], ["held", "drop", "idle"],
+      ["held", "send", "held"], ["held", "ok", "held"], ["held", "fail", "idle"], ["held", "junk", "held"],
+      ["sending", "input", "sendingV0"], ["sending", "hold", "sending"], ["sending", "resume", "sending"], ["sending", "drop", "sending"],
+      ["sending", "send", "sending"], ["sending", "ok", "idle"], ["sending", "fail", "idle"], ["sending", "junk", "sending"],
+      ["sendingQ", "input", "sendingV0"], ["sendingQ", "hold", "sendingQ"], ["sendingQ", "resume", "sendingQ"], ["sendingQ", "drop", "sendingQ"],
+      ["sendingQ", "send", "sendingQ"], ["sendingQ", "ok", "waitingV5"], ["sendingQ", "fail", "idle"], ["sendingQ", "junk", "sendingQ"]
+    ]
+  },
+  "intents": {
+    "values": {
+      "discA": {"action": "disconnect", "address": "AA"},
+      "connB": {"action": "connect", "address": "BB"},
+      "connBrA": {"action": "connect", "address": "BB", "replace": "AA"},
+      "here": {"action": "here", "address": "PC"},
+      "toMac": {"action": "switch", "target": "mac"}
+    },
+    "states": {
+      "idle": {"kind": "idle"},
+      "qDisc": {"kind": "queued", "intent": "discA"},
+      "qConn": {"kind": "queued", "intent": "connB"},
+      "qConnR": {"kind": "queued", "intent": "connBrA"},
+      "qHere": {"kind": "queued", "intent": "here"},
+      "qMac": {"kind": "queued", "intent": "toMac"}
+    },
+    "events": {
+      "holdDisc": {"type": "hold", "intent": "discA"}, "holdConn": {"type": "hold", "intent": "connB"},
+      "holdConnR": {"type": "hold", "intent": "connBrA"}, "holdHere": {"type": "hold", "intent": "here"},
+      "holdMac": {"type": "hold", "intent": "toMac"},
+      "cancel": {"type": "cancel"}, "release": {"type": "release"}, "junk": {"type": "x"}
+    },
+    "rows": [
+      ["idle", "holdDisc", "qDisc"], ["idle", "holdConn", "qConn"], ["idle", "holdHere", "qHere"], ["idle", "holdMac", "qMac"],
+      ["idle", "cancel", "idle"], ["idle", "release", "idle"], ["idle", "junk", "idle"],
+      ["qDisc", "holdDisc", "idle"], ["qDisc", "holdConn", "qConn"], ["qDisc", "holdHere", "qHere"], ["qDisc", "holdMac", "qMac"],
+      ["qDisc", "cancel", "idle"], ["qDisc", "release", "idle"], ["qDisc", "junk", "qDisc"],
+      ["qConn", "holdConn", "idle"], ["qConn", "holdConnR", "qConnR"], ["qConn", "holdDisc", "qDisc"],
+      ["qConnR", "holdConn", "qConn"], ["qConnR", "holdConnR", "idle"],
+      ["qHere", "holdHere", "idle"], ["qHere", "holdMac", "qMac"], ["qHere", "release", "idle"],
+      ["qMac", "holdMac", "idle"], ["qMac", "holdHere", "qHere"], ["qMac", "cancel", "idle"], ["qMac", "junk", "qMac"]
+    ]
+  },
+  "schedule": {
+    "about": "[change, noise kind, intent kind, live, decision]",
+    "rows": [
+      [true, "idle", "idle", true, "wait"], [true, "waiting", "idle", true, "hold-noise"], [true, "held", "queued", true, "wait"],
+      [true, "sending", "queued", true, "wait"], [true, "waiting", "queued", false, "hold-noise"],
+      [false, "sending", "queued", true, "wait"], [false, "sending", "idle", true, "wait"],
+      [false, "waiting", "queued", true, "intent"], [false, "held", "queued", true, "intent"], [false, "idle", "queued", false, "intent"],
+      [false, "held", "idle", true, "resume-noise"], [false, "held", "idle", false, "drop-noise"],
+      [false, "waiting", "idle", true, "noise"], [false, "waiting", "idle", false, "noise"], [false, "idle", "idle", true, "idle"]
+    ]
+  }
+}
