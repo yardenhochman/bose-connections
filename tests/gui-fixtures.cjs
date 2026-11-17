@@ -263,6 +263,7 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   check(await page.locator('#refresh').isEnabled(),'Refresh stays enabled while a change runs');
   await page.locator('#refresh').click();await page.locator('#refresh').click();
   check(await page.locator('#refresh.queued').count()===1&&overviewCalls===reads,'Refresh during a change: drawn queued, nothing read yet ('+(overviewCalls-reads)+' reads)');
+  await shot(page,'pending/phone-light-refresh-queued.png');
   await page.getByText('Android phone disconnected').waitFor({timeout:6000});await sleep(400);
   check(overviewCalls===reads+1&&await page.locator('#refresh.queued').count()===0,'Refresh during a change: exactly one read once it ends, got '+(overviewCalls-reads));
   check(await page.locator('.cup',{hasText:'Android phone'}).count()===0,'The deferred read keeps the verified result');
@@ -275,6 +276,7 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await page.getByRole('button',{name:'Connect Living room TV'}).click();
   await page.locator('.btn.connect.queued').waitFor({timeout:300}).catch(()=>{});
   check(await page.locator('.device',{hasText:'Living room TV'}).locator('.queued').count()===1&&posts.length===1,'Connect into full slots during a change is queued: '+JSON.stringify(posts.map(p=>p.body)));
+  await shot(page,'pending/phone-light-row-queued.png');await scheme('dark');await shot(page,'pending/phone-dark-row-queued.png');await scheme('light');
   await page.getByRole('button',{name:'Replace MacBook Pro'}).waitFor({timeout:6000});
   check(posts.length===1&&await page.getByRole('button',{name:/^Replace /}).count()===2,'Released into full slots it asks which to replace, sending nothing');
   await page.getByRole('button',{name:'Cancel',exact:true}).click();

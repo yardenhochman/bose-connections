@@ -289,10 +289,11 @@ public class BoseTileService extends TileService {
     LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-1,1);if(i==1)lp.leftMargin=dp(10);
     JSONObject sl=slots.get(i);String a=Machines.str(sl,"address");JSONObject d=a.isEmpty()?null:device(a);
     if(d==null&&!a.isEmpty())d=Machines.o("address",a,"name",a);
-    cups.addView(cup(i+1,d,Machines.str(sl,"st"),"queued".equals(Machines.str(sl,"pend")),sl.optBoolean("here"),live),lp);
+    String rep=Machines.str(sl,"replacing");JSONObject old=rep.isEmpty()?null:device(rep);
+    cups.addView(cup(i+1,d,Machines.str(sl,"st"),"queued".equals(Machines.str(sl,"pend")),sl.optBoolean("here"),rep.isEmpty()?"":old!=null?name(old):rep,live),lp);
    }
   }
-  View cup(int slot,JSONObject d,String mode,boolean queued,boolean here,boolean live){
+  View cup(int slot,JSONObject d,String mode,boolean queued,boolean here,String replaced,boolean live){
    boolean cached=!live,pending="connecting".equals(mode)||"disconnecting".equals(mode);
    LinearLayout c=new LinearLayout(BoseTileService.this);c.setOrientation(LinearLayout.VERTICAL);c.setPadding(dp(12),dp(12),dp(12),dp(10));
    // Verified: surface fill. In flight: no fill, solid ochre outline. Queued: no fill, dotted ochre outline.
@@ -312,7 +313,8 @@ public class BoseTileService extends TileService {
    TextView name=text(d==null?"Free slot":name(d),16,true,d==null?R.color.qs_ink3:R.color.qs_ink);name.setSingleLine();name.setEllipsize(TextUtils.TruncateAt.END);
    if(pending)name.setAlpha(queued?.5f:.62f);
    LinearLayout.LayoutParams nl=new LinearLayout.LayoutParams(-1,-2);nl.topMargin=dp(6);c.addView(name,nl);
-   String tagText=d==null?"Connect a saved device":tag(d);boolean mine=d!=null&&tagText.startsWith("This ");
+   // A connect into a slot that is being freed names the device it replaces (as the dashboard and popup do).
+   String tagText=d==null?"Connect a saved device":"connecting".equals(mode)&&!replaced.isEmpty()?"Replacing "+replaced:tag(d);boolean mine=d!=null&&tagText.startsWith("This ");
    TextView tag=text(tagText,13,mine,mine?R.color.qs_accent_ink:R.color.qs_ink2);tag.setSingleLine();tag.setEllipsize(TextUtils.TruncateAt.END);
    if(pending)tag.setAlpha(queued?.5f:.62f);
    if(mine){LinearLayout t=new LinearLayout(BoseTileService.this);t.setGravity(Gravity.CENTER_VERTICAL);View bar=new View(BoseTileService.this);bar.setBackground(round(color(R.color.qs_accent),dp(1),0,0));

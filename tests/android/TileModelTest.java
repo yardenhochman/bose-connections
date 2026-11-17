@@ -78,9 +78,9 @@ public class TileModelTest {
    m.setNoise(3,true);
    check("noise write in flight",f.writes.size()==1,f.sent.toString());
    int before=f.changed;m.tileTap();
-   check("a tile tap during a noise write queues with feedback",m.queuedHere()&&f.writes.size()==1&&m.tileSubtitle().equals("Moves here next · tap to cancel")&&f.changed>before,m.tileSubtitle());
+   check("a tile tap during a noise write queues with feedback",m.queuedHere()&&f.writes.size()==1&&m.tileSubtitle().equals("Queued here")&&f.changed>before,m.tileSubtitle());
    m.tileTap();
-   check("a second tile tap cancels it",!m.queuedHere()&&!m.tileSubtitle().startsWith("Moves here next"),m.tileSubtitle());
+   check("a second tile tap cancels it",!m.queuedHere()&&!m.tileSubtitle().equals("Queued here"),m.tileSubtitle());
    m.tileTap();f.advance(300);answer(f);
    check("the queued tap is sent after the write",f.writes.size()==1&&f.writes.peek().path.equals("/api/switch")&&m.tileSubtitle().equals(Switcher.MESSAGES.get("pending")),f.sent+" "+m.tileSubtitle());
    m.tileTap();

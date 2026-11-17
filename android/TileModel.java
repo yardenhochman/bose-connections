@@ -79,7 +79,7 @@ final class TileModel {
   JSONObject p=pending();
   if(p!=null&&p.optBoolean("here"))return Machines.str(p,"label").isEmpty()?Switcher.MESSAGES.get("pending"):Switcher.MESSAGES.get("replacing").replace("{label}",Machines.str(p,"label"));
   if(!tileNote.isEmpty()&&host.now()<tileNoteUntil)return tileNote;
-  if(queuedHere())return "Moves here next · tap to cancel";
+  if(queuedHere())return "Queued here"; // a second tap cancels it; longer text is cut off on the tile
   if(p!=null)return "disconnect".equals(p.optString("action"))?"Disconnecting…":"Connecting…";
   if(Machines.is(anc,"held"))return "ANC change waits for the switch";
   if(!Machines.is(anc,"idle"))return "Updating…";
