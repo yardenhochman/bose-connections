@@ -230,6 +230,20 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(http.call('/api/state?wait=abc')[0],400)
             _,quick=http.call('/api/state?after=0&wait=25');self.assertEqual(quick['seq'],seq)  # seq > after: at once
         finally:http.close();w.pc.status_pool.shutdown(wait=True)
+    def test_a_restarted_controller_answers_an_old_after_at_once(self):
+        # docs/state-machines.md 4: seq restarts from 0, so a page's old `after` would wait out the whole long-poll.
+        # The snapshot carries a boot id; a poll that names another boot is answered at once.
+        w=World([PHONE],watch=False);http=Http(w.pc)
+        try:
+            _,first=http.call('/api/state');boot=first.get('boot')
+            self.assertIsInstance(boot,str);self.assertRegex(boot,r'^[0-9a-f]{8,32}$')
+            start=time.perf_counter();_,same=http.call(f'/api/state?after={first["seq"]}&wait=0.4&boot={boot}')
+            self.assertGreaterEqual(time.perf_counter()-start,.38);self.assertEqual(same['boot'],boot)  # same boot: waits as before
+            start=time.perf_counter();_,other=http.call(f'/api/state?after={first["seq"]+500}&wait=25&boot=0123abcd')
+            self.assertLess(time.perf_counter()-start,2);self.assertEqual(other['boot'],boot)
+            self.assertEqual(http.call('/api/state?after=1&wait=1&boot=bad%20id')[0],400)
+        finally:http.close();w.pc.status_pool.shutdown(wait=True)
+        self.assertNotEqual(Hub(dict(id='pc',roles={},peers=[])).boot,Hub(dict(id='pc',roles={},peers=[])).boot)
     def test_mesh_serves_state_to_authenticated_peers_only(self):
         w=World([PHONE],watch=False)
         class Fake:  # a Handler driven without sockets: mesh checks need a tailnet source address
@@ -314,6 +328,25 @@ class WatcherTests(unittest.TestCase):
             while not until() and time.perf_counter()<end:time.sleep(.01)
         finally:watcher.stop()
         return watcher,argvs
+    def test_stop_between_the_loop_check_and_popen_leaves_no_child(self):
+        # docs/state-machines.md 10: a stop() that landed after the loop check but before popen left the new child
+        # running until its next output line. `which` runs in that window, so it stands in for the racing stop().
+        started=[];holder={}
+        class Blocking:
+            def __init__(self):self.terminated=threading.Event();self.stdout=self
+            def __iter__(self):return self
+            def __next__(self):
+                self.terminated.wait(5);raise StopIteration
+            def terminate(self):self.terminated.set()
+            def wait(self,timeout=None):return 0
+        def popen(argv,**kw):
+            p=Blocking();started.append(p);return p
+        def which(name):
+            holder['w'].stop();return name
+        w=statemachine.LineWatcher([['x']],lambda line:None,popen=popen,which=which,backoff=.01);holder['w']=w
+        w.start();w.thread.join(1)
+        self.assertFalse(w.thread.is_alive(),'the watcher loop must end after stop()')
+        self.assertTrue(all(p.terminated.is_set() for p in started),'a child started after stop() must be terminated at once')
     def test_bluez_watcher_parses_gdbus_and_dbus_monitor_and_restarts(self):
         hub=Hub(dict(id='pc',roles=dict(ROLES),peers=[]));values=[]
         hub.listeners.append(lambda kind,value:values.append(value))

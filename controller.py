@@ -926,8 +926,10 @@ class Handler(BaseHTTPRequestHandler):
                 after=int(query['after'][0]) if 'after' in query else None
                 wait=float(query.get('wait',['0'])[0])
                 if wait!=wait:raise ValueError('wait')
-            except ValueError:return self.send(400,{'error':'Invalid after or wait'})
-            return self.send(200,self.server.controller.hub.state(after,wait))
+                boot=query['boot'][0] if 'boot' in query else None  # the boot id the caller's `after` belongs to
+                if boot is not None and not re.fullmatch(r'[0-9a-f]{1,32}',boot):raise ValueError('boot')
+            except ValueError:return self.send(400,{'error':'Invalid after, wait or boot'})
+            return self.send(200,self.server.controller.hub.state(after,wait,boot))
         if self.server.mesh:return self.send(404,{'error':'Not found'})
         files={'/':('index.html','text/html; charset=utf-8'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css'),'/favicon.svg':('favicon.svg','image/svg+xml'),'/fonts/jost-latin.woff2':('fonts/jost-latin.woff2','font/woff2'),'/fonts/jost-latin-ext.woff2':('fonts/jost-latin-ext.woff2','font/woff2')}
         if path not in files:return self.send(404,{'error':'Not found'})

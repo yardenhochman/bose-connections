@@ -506,7 +506,7 @@ async function refresh(){
 // ST.snap is the controller's last snapshot; ST.taps holds a tap whose POST has not answered yet (shown at once) or one
 // the controller never took (network). Nothing here infers a connection state of its own.
 // ST.link: the link machine (linker); ST.taps: the tap machine (tapper). Each is written only through its function.
-const ST={link:'boot',snap:null,at:0,offset:0,seq:null,taps:IDLE,here:null};
+const ST={link:'boot',snap:null,at:0,offset:0,seq:null,boot:null,taps:IDLE,here:null}; // boot: the controller run that seq counts in
 function linkSend(e){ST.link=linker(ST.link,e);}
 function tapSend(e){ST.taps=tapper(ST.taps,e);}
 const STEP={reading:'Checking the headphones'}; // first step shown before the controller answers (contract steps.reading)
@@ -516,8 +516,9 @@ function serverNow(){return Date.now()/1000+ST.offset;}
 function since(){return Date.now()/1000-ST.at;}
 function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
 function rid(){return Math.random().toString(36).slice(2,10);}
-async function fetchState(after,wait){
- const q=after==null?'':`?after=${after}&wait=${wait}`;
+// `boot` names the controller run that `after` counts in: a restarted controller (seq from 0 again) answers at once.
+async function fetchState(after,wait,boot){
+ const q=after==null?'':`?after=${after}&wait=${wait}`+(boot?`&boot=${encodeURIComponent(boot)}`:'');
  // The long-poll waits up to `wait` s on the controller; 10 s more means the link is gone (retried with backoff).
  const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),((wait||0)+10)*1000);
  const r=await fetch('/api/state'+q,{cache:'no-store',signal:abort.signal}).finally(()=>clearTimeout(timer));
@@ -535,14 +536,14 @@ function enterState(s){linkSend('snapshot');applySnap(s);follow();setInterval(ti
 async function follow(){
  for(let backoff=1000;;){
   try{
-   const s=await fetchState(ST.seq,25);
+   const s=await fetchState(ST.seq,25,ST.boot);
    if(s===null){linkSend('gone');refresh();return;} // the controller was replaced by an older one
    linkSend('snapshot');backoff=1000;applySnap(s);
   }catch(e){linkSend('error');stateHeader();await sleepMs(backoff);backoff=Math.min(backoff*2,8000);}
  }
 }
 function applySnap(s){
- ST.snap=s;ST.seq=s.seq;ST.at=Date.now()/1000;ST.offset=(s.now||ST.at)-ST.at;
+ ST.snap=s;ST.seq=s.seq;ST.boot=s.boot||null;ST.at=Date.now()/1000;ST.offset=(s.now||ST.at)-ST.at;
  if(!ST.here)ST.here=s.here||s.headset?.controllers?.[0]?.id||'pc';
  if(s.operation)tapSend({type:'operation'});
  const prev=state;state=overviewFrom(s);

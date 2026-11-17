@@ -39,7 +39,11 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   await page.route(u=>new URL(u).pathname==='/api/state',async r=>{
    if(!states)return r.fulfill({status:404,body:'not found'});
    const q=new URL(r.request().url()).searchParams;const after=q.has('after')?Number(q.get('after')):null;stateGets.push({after,wait:q.get('wait')});
-   if(after!=null&&states.snap.seq<=after)await states.next(Math.min(Number(q.get('wait'))||0,25)*1000);
+   // As the controller: a poll that names another boot id (a restarted controller counts seq from 0 again) is answered at once.
+   const boot=q.get('boot');stateGets[stateGets.length-1].boot=boot;
+   if(after!=null&&states.snap.seq<=after&&(boot==null||boot===states.snap.boot))await states.next(Math.min(Number(q.get('wait'))||0,25)*1000);
+   if(!states)return r.fulfill({status:404,body:'not found'}).catch(()=>{}); // the state section ended while this poll waited
+   if(states.dropped){states.dropped=false;return r.abort('connectionreset').catch(()=>{});} // the controller went away mid-poll
    try{await r.fulfill({json:{...states.snap,now:Date.now()/1000}});}catch(e){}
   });
   await page.route('**/api/switch/cancel',async r=>{cancels.push(r.request().postDataJSON());if(states?.onCancel)states.onCancel();return r.fulfill({json:{ok:true}});});
@@ -405,7 +409,9 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   const waiters=[];
   states={snap:null,onCancel:null,
    next:ms=>new Promise(res=>{const t=setTimeout(res,ms);waiters.push(()=>{clearTimeout(t);res();});}),
-   set(snap){snap.seq=(this.snap?.seq||0)+1;this.snap=snap;waiters.splice(0).forEach(f=>f());}};
+   set(snap){snap.seq=(this.snap?.seq||0)+1;snap.boot=snap.boot||this.snap?.boot||'0a1b2c3d';this.snap=snap;waiters.splice(0).forEach(f=>f());},
+   // A controller restart: the open long-poll dies, and the new process counts seq from 1 under a new boot id.
+   restart(snap){this.dropped=true;snap.seq=1;snap.boot='9f8e7d6c';const woke=waiters.splice(0);this.snap=snap;woke.forEach(f=>f());}};
   const step=(name,label,state,extra={})=>({name,label,state,...extra});
   const op=(target,phase,list,extra={})=>({id:'k3f9a2',source:'web',target,action:'switch',phase,started_at:now()-3,deadline:150,steps:list,result:null,...extra});
   const tv={address:DEV.tv.address,role:null,label:DEV.tv.name,name:DEV.tv.name,state:'disconnected'};
@@ -528,6 +534,17 @@ function overview(connected,noise={level:7,enabled:true},extra={}){
   check((await st.locator('#headset-status').textContent()).startsWith('Not reachable · last read 2 min ago'),'Unreachable header: '+await st.locator('#headset-status').textContent());
   check(await st.locator('#use-here').isEnabled(),'Use here stays available: the controller reads the headset itself');
   check(!await st.evaluate(()=>document.documentElement.scrollWidth>innerWidth),'State mode horizontal overflow');
+
+  // Controller restart (docs/state-machines.md 4): the new process starts at seq 1 under a new boot id. The page's next
+  // poll names its old boot, so it is answered at once instead of waiting out 25 s with an `after` from the old run.
+  {for(let i=0;i<40;i++)states.set(scenes.idle()); // seq well above what the restarted controller will count
+   await st.locator('.cup .chip',{hasText:'Connected'}).first().waitFor();await sleep(300);
+   check(stateGets.at(-1).boot===states.snap.boot,'The long-poll names the boot id of its after: '+JSON.stringify(stateGets.at(-1)));
+   const t0=Date.now();states.restart(scenes.macphone());
+   await st.locator('.cup',{hasText:'MacBook Pro'}).waitFor({timeout:8000}).catch(()=>{});
+   const took=Date.now()-t0;check(took<6000,`After a controller restart the page must catch up at once, took ${took} ms`);
+   states.set(scenes.idle());await st.locator('.cup',{hasText:'Desktop PC'}).waitFor({timeout:4000});
+   check(stateGets.at(-1).after===states.snap.seq&&stateGets.at(-1).boot==='9f8e7d6c','after and boot follow the new run: '+JSON.stringify(stateGets.at(-1)));}
 
   // Screenshots: every scene, light + dark, phone + desktop. Times are frozen-ish: the shots are taken right after set().
   for(const [w,h,kind] of [[390,844,'phone'],[1280,900,'desktop']]){

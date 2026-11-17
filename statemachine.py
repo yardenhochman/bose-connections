@@ -139,6 +139,7 @@ class Hub:
     link (BlueZ watcher / local_status), peers' `link:false`, the PipeWire sink, and the current operation."""
     def __init__(self,config):
         self.config=config;self.cond=threading.Condition(threading.RLock());self.seq=0;self.digest=None
+        self.boot=secrets.token_hex(8)  # this process's id: seq restarts from 0 with it (docs/state-machines.md 4)
         self.read=None          # dict(devices, battery, noise, product, via, t)
         self.reachable=False;self.controllers=[];self.controllers_t=None
         self.own_link=None;self.link_t=None;self.link_watched=False
@@ -233,7 +234,7 @@ class Hub:
             headset=dict(reachable=read_reachable,via=read.get('via') if read_reachable else None,read_age=age,battery=read.get('battery'),
                          noise=read.get('noise'),product=read.get('product') or 'Bose 700',controllers=controllers)
             op=self.operation
-            return dict(seq=self.seq,now=round(time.time(),2),headset=headset,slots=slots,devices=others,
+            return dict(seq=self.seq,boot=self.boot,now=round(time.time(),2),headset=headset,slots=slots,devices=others,
                         audio=dict(self.audio) if self.audio is not None else None,operation=op.to_json() if op else None)
     @staticmethod
     def material(snap):
@@ -249,12 +250,13 @@ class Hub:
             digest=self.material(self.snapshot())
             if digest!=self.digest:
                 self.digest=digest;self.seq+=1;self.cond.notify_all()
-    def state(self,after=None,wait=0.0):
-        """GET /api/state: at once when seq > after (or no after), else wait up to `wait` s for the next change."""
+    def state(self,after=None,wait=0.0,boot=None):
+        """GET /api/state: at once when seq > after (or no after), else wait up to `wait` s for the next change.
+        A `boot` other than this process's means the caller's `after` counts another run's seq: answered at once."""
         wait=max(0.0,min(POLL_MAX,float(wait or 0)))
         with self.cond:
             self.last_poll=_mono();self.touch()
-            if after is not None:
+            if after is not None and (boot is None or boot==self.boot):
                 end=_real_monotonic()+wait
                 while self.seq<=after:
                     left=end-_real_monotonic()
@@ -276,6 +278,7 @@ class LineWatcher:
     def __init__(self,commands,on_line,on_start=None,popen=subprocess.Popen,which=shutil.which,backoff=2.0,name='watcher'):
         self.commands=commands;self.on_line=on_line;self.on_start=on_start;self.popen=popen;self.which=which
         self.backoff=backoff;self.name=name;self.stopping=threading.Event();self.proc=None;self.starts=0;self.thread=None
+        self.spawn=threading.Lock()  # stop() and the start of a child never interleave: a stop either sees the child or prevents it
     def start(self):
         self.thread=threading.Thread(target=self.run,name=self.name,daemon=True);self.thread.start();return self
     def command(self):return next((c for c in self.commands if self.which(c[0])),None)
@@ -283,8 +286,11 @@ class LineWatcher:
         while not self.stopping.is_set():
             argv=self.command()
             if not argv:self.stopping.wait(30);continue
-            try:self.proc=self.popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,bufsize=1)
-            except OSError:self.stopping.wait(self.backoff);continue
+            with self.spawn:
+                if self.stopping.is_set():break
+                try:self.proc=self.popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,bufsize=1)
+                except OSError:self.proc=None
+            if self.proc is None:self.stopping.wait(self.backoff);continue
             self.starts+=1
             try:
                 if self.on_start:self.on_start()
@@ -300,8 +306,9 @@ class LineWatcher:
             self.stopping.wait(self.backoff)
     def stop(self):
         self.stopping.set()
-        if self.proc:
-            try:self.proc.terminate()
+        with self.spawn:proc=self.proc
+        if proc:
+            try:proc.terminate()
             except Exception:pass
 
 class BluezWatcher(LineWatcher):
