@@ -46,11 +46,15 @@ function linker(s,e){
  }
  return s;
 }
-// 5. Noise writer: idle | waiting{queued} (throttle gap or a connection change first) | sending{sent,queued}. The newest
-// input is always the one sent next; a failure drops everything back to the verified headset value.
+// 5. Noise writer: idle | waiting{queued} (throttle gap) | held{queued} (a connection change or switch runs: sent when it
+// ends) | sending{sent,queued}. The newest input is always the one sent next; a failure, or a held value whose change
+// ended with the headset out of reach (drop), falls back to the verified headset value.
 function noiser(s,e){
  switch(e.type){
-  case 'input':return s.kind==='sending'?{...s,queued:e.value}:{kind:'waiting',queued:e.value};
+  case 'input':return s.kind==='sending'?{...s,queued:e.value}:s.kind==='held'?{kind:'held',queued:e.value}:{kind:'waiting',queued:e.value};
+  case 'hold':return s.kind==='waiting'?{kind:'held',queued:s.queued}:s;
+  case 'resume':return s.kind==='held'?{kind:'waiting',queued:s.queued}:s;
+  case 'drop':return s.kind==='held'?IDLE:s;
   case 'send':return s.kind==='waiting'?{kind:'sending',sent:s.queued,queued:null}:s;
   case 'ok':return s.kind!=='sending'?s:s.queued?{kind:'waiting',queued:s.queued}:IDLE;
   case 'fail':return IDLE;
@@ -58,6 +62,45 @@ function noiser(s,e){
  return s;
 }
 function noiseShown(s){return s.kind==='idle'?null:s.queued||s.sent;}
+// 6. Intent queue: idle | queued{intent}. One connection intent ({action:'connect'|'disconnect'|'here'|'switch', address,
+// replace, target}) held while other work runs. The latest wins; the same intent again cancels it; release hands it on.
+function intentKey(i){return i?[i.action,i.address||'',i.replace||'',i.target||''].join('|'):'';}
+function intents(s,e){
+ switch(e.type){
+  case 'hold':return s.kind==='queued'&&intentKey(s.intent)===intentKey(e.intent)?IDLE:{kind:'queued',intent:e.intent};
+  case 'cancel':case 'release':return IDLE;
+ }
+ return s;
+}
+// What runs next. One request toward the controller at a time: a connection change or switch (change), else a noise
+// write (sending). When both wait, the queued intent goes first; a noise value waiting behind it is held.
+// w: {change, noise: noiser state, intent: intents state, live}. Returns wait | hold-noise | intent | resume-noise |
+// drop-noise | noise | idle.
+function schedule(w){
+ if(w.change)return w.noise.kind==='waiting'?'hold-noise':'wait';
+ if(w.noise.kind==='sending')return 'wait';
+ if(w.intent.kind==='queued')return 'intent';
+ if(w.noise.kind==='held')return w.live?'resume-noise':'drop-noise';
+ if(w.noise.kind==='waiting')return 'noise';
+ return 'idle';
+}
+// The intended result drawn over the verified slots: the change in flight (pend 'flight') and the queued intent (pend
+// 'queued'). slots: [{address|null, st}] with st connected | free | a controller state. Pure: verified data is never
+// changed here, so a late reply can only update the layer underneath.
+function overlaySlots(slots,flight,queued){
+ const out=slots.map(s=>({...s,address:s.address||null,was:s.address||null,pend:null,replacing:null,here:false}));
+ for(const [a,how] of [[flight,'flight'],[queued,'queued']]){
+  if(!a||!a.address)continue;
+  if(a.action==='disconnect'){const s=out.find(s=>s.address===a.address&&s.st==='connected'&&!s.pend);if(s){s.st='disconnecting';s.pend=how;}continue;}
+  if(a.action!=='connect'&&a.action!=='here')continue;
+  if(out.some(s=>s.address===a.address&&(s.st==='connected'||s.st==='connecting')))continue; // already holds a slot
+  let i=a.replace?out.findIndex(s=>s.address===a.replace&&s.st!=='free'):out.findIndex(s=>s.st==='free'&&!s.pend);
+  if(i<0&&!a.replace)i=out.findIndex(s=>s.st==='disconnecting'); // the slot a pending disconnect frees
+  if(i<0)continue;
+  const old=out[i];out[i]={...old,address:a.address,st:'connecting',pend:how,here:!!a.here,replacing:a.replace||(old.st==='disconnecting'?old.address:null)};
+ }
+ return out;
+}
 // ---- machines:end ----
 const $=id=>document.getElementById(id);
 const labels={pc:'PC',phone:'Phone',mac:'Mac'};
@@ -78,14 +121,24 @@ let refreshing=false;
 let slotOrder=[null,null];
 let receivedAt=0;
 const anc={m:IDLE,lastStart:-1e9,timer:0,dragging:false}; // m: the noise writer machine (noiser)
+let iq=IDLE;             // the intent queue (intents): written only by queueSend
+function queueSend(e){iq=intents(iq,e);}
+function queued(){return iq.kind==='queued'?iq.intent:null;}
 
 
 // ---- Transport: Android bridge or fetch ----
+// Every request has a deadline, so a hung one can never hold the queue: a connection change may wait out a switch on the
+// controller (150 s), a noise write or a read answers in seconds.
+const TIMED_OUT='Controller timed out. Refresh before trying again.';
+function deadlineFor(path,data){return path==='/api/override'&&data?.action!=='noise'?160000:path==='/api/override'?20000:30000;}
 let seq=0;const bridgeCalls=new Map();
 window.finishRequest=(id,json)=>{const p=bridgeCalls.get(id);if(p){bridgeCalls.delete(id);p.resolve(JSON.parse(json));}};
-function api(path,data){
- if(window.Android){return new Promise((resolve,reject)=>{const id=String(++seq);const timer=setTimeout(()=>{bridgeCalls.delete(id);reject(new Error('Controller timed out. Refresh before trying again.'));},160000);bridgeCalls.set(id,{resolve:r=>{clearTimeout(timer);if(r.error)reject(new Error(r.error));else resolve(r);}});Android.request(id,path,data?JSON.stringify(data):'');});}
- return fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined}).then(async r=>{const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Request failed');return d;});
+function api(path,data,ms=deadlineFor(path,data)){
+ if(window.Android){return new Promise((resolve,reject)=>{const id=String(++seq);const timer=setTimeout(()=>{bridgeCalls.delete(id);reject(new Error(TIMED_OUT));},ms);bridgeCalls.set(id,{resolve:r=>{clearTimeout(timer);if(r.error)reject(new Error(r.error));else resolve(r);}});Android.request(id,path,data?JSON.stringify(data):'');});}
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),ms);
+ return fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined,signal:abort.signal})
+  .then(async r=>{const d=await r.json();if(!r.ok||d.error)throw new Error(d.error||'Request failed');return d;})
+  .catch(e=>{throw e.name==='AbortError'?new Error(TIMED_OUT):e;}).finally(()=>clearTimeout(timer));
 }
 
 // ---- Small helpers ----
@@ -112,12 +165,22 @@ function settledSlots(){
  for(const a of connected)if(!next.includes(a)){const i=next.indexOf(null);if(i>=0)next[i]=a;}
  slotOrder=next;return next.slice();
 }
-function slotView(){
- const op=mut();
- const slots=settledSlots().map(a=>a?{address:a,mode:'connected'}:{address:null,mode:'open'});
- if(op?.action==='disconnect'){const s=slots.find(s=>s.address===op.address);if(s)s.mode='disconnecting';}
- if(op?.action==='connect'){const i=op.replace?slots.findIndex(s=>s.address===op.replace):slots.findIndex(s=>!s.address);if(i>=0)slots[i]={address:op.address,mode:'connecting',replacing:op.replace||null};}
- return slots;
+function slotView(){return overlaySlots(settledSlots().map(a=>({address:a,st:a?'connected':'free'})),mut(),queued());}
+// Words for a slot drawn as an intended result: in flight (sent, waiting for the headset) or queued (not sent yet).
+function pendWords(s){
+ if(s.pend==='queued')return s.st==='disconnecting'?'Disconnects next':s.here?'Moves here next':'Connects next';
+ return s.st==='disconnecting'?'Disconnecting…':s.st==='releasing'?'Releasing…':s.here?'Moving here…':'Connecting…';
+}
+// The pending part of a cup: a spinning pill while in flight, a dotted Cancel while queued (the same tap again cancels).
+function pendControl(cup,s,name){
+ if(s.pend==='queued'){
+  cup.classList.add('queued');
+  const b=node('button','pill queued');b.type='button';b.append(node('span','ring'),node('span','','Queued · cancel'));
+  b.setAttribute('aria-label',`Cancel the queued ${s.st==='disconnecting'?'disconnect of':'connection of'} ${name}`);
+  b.onclick=cancelQueued;cup.append(b);return;
+ }
+ cup.classList.add('pending');if(s.st!=='connecting')cup.classList.add('leaving');
+ cup.append(pendingPill(pendWords(s)));
 }
 
 // ---- Render ----
@@ -156,7 +219,7 @@ function renderCups(reachable){
  const slots=slotView();
  slots.forEach((s,i)=>{
   const d=s.address?deviceByAddress(s.address):null;
-  const target=choosing&&s.mode==='connected'&&d;
+  const target=choosing&&s.st==='connected'&&!s.pend&&d;
   const cup=node(target?'button':'div','cup');
   const head=node('div','state');const led=node('span','led');const label=node('span');head.append(led,label,node('span','slot',`Slot ${i+1}`));cup.append(head);
   if(!d){
@@ -170,12 +233,9 @@ function renderCups(reachable){
   if(s.replacing)cup.append(node('div','tag',`Replacing ${nameOf(s.replacing)}`));
   else if(role&&role===state.here){const tag=node('div','tag here');tag.append(node('i'),document.createTextNode('This '+(role==='phone'?'phone':labels[role])));cup.append(tag);}
   else cup.append(node('div','tag',role?labels[role]:''));
-  if(s.mode==='connecting'){
-   cup.classList.add('pending');led.className='led pending';label.textContent='Connecting…';
-   cup.append(pendingPill('Connecting…'));
-  }else if(s.mode==='disconnecting'){
-   cup.classList.add('pending','leaving');led.className='led pending';label.textContent='Disconnecting…';
-   cup.append(pendingPill('Disconnecting…'));
+  if(s.pend){
+   led.className=s.pend==='queued'?'led queued':'led pending';label.textContent=pendWords(s);
+   pendControl(cup,s,d.name);
   }else if(target){
    cup.classList.add('target');label.textContent=state.cached?'Last known':'Connected';
    cup.setAttribute('aria-label',`Replace ${d.name}`);cup.type='button';cup.dataset.live='true';
@@ -190,7 +250,7 @@ function renderCups(reachable){
  });
 }
 
-function pendingPill(text){const p=node('div','pill pending',text);p.setAttribute('aria-busy','true');return p;}
+function pendingPill(text){const p=node('div','pill pending');p.append(node('span','spin'),node('span','',text));p.setAttribute('aria-busy','true');return p;}
 function renderChoice(){
  const choosing=choosingAddr(),busySlots=offerSlots();
  const target=choosing&&deviceByAddress(choosing),box=$('choose'),opts=$('choose-options');
@@ -204,10 +264,12 @@ function renderChoice(){
 function renderHere(){
  const op=mut();
  const here=hereAddress(),b=$('use-here');$('here').hidden=!here;if(!here)return;
- const mine=!!op?.here;b.classList.toggle('pressed',mine);b.setAttribute('aria-busy',String(mine));
- b.textContent=mine?(op.replace?MSG.replacing.replace('{label}',op.label):MSG.pending):'Use here';
- b.setAttribute('aria-label',mine?b.textContent:'Use here: move the headphones to this '+(state.here==='phone'?'phone':labels[state.here]||'device'));
+ const mine=!!op?.here,waiting=queued()?.action==='here';
+ b.classList.toggle('pressed',mine);b.classList.toggle('queued',waiting&&!mine);b.setAttribute('aria-busy',String(mine));
+ b.textContent=mine?(op.replace?MSG.replacing.replace('{label}',op.label):MSG.pending):waiting?QUEUED_HERE:'Use here';
+ b.setAttribute('aria-label',mine?b.textContent:waiting?'Cancel the queued Use here':'Use here: move the headphones to this '+(state.here==='phone'?'phone':labels[state.here]||'device'));
 }
+const QUEUED_HERE='Use here queued · tap to cancel';
 
 function renderDevices(reachable){
  const op=mut(),choosing=choosingAddr();
@@ -215,7 +277,8 @@ function renderDevices(reachable){
  const devices=state.devices||[];
  if(!devices.length){const empty=node('div','empty');empty.append(node('strong','',reachable?'No saved devices found':'Headset unavailable'),node('span','',reachable?'Pair your devices in the headset’s Bluetooth settings.':'Turn on the headset and keep it near one of your controllers.'));list.append(empty);return;}
  // a device being connected already shows in its cup as pending, so it leaves the list until the change settles or reverts
- const saved=devices.filter(d=>!d.connected&&!(op?.action==='connect'&&op.address===d.address));
+ const inCup=new Set(slotView().filter(s=>s.pend&&s.st==='connecting').map(s=>s.address));
+ const saved=devices.filter(d=>!d.connected&&!(op?.action==='connect'&&op.address===d.address)&&!inCup.has(d.address));
  if(!saved.length){const empty=node('div','empty');empty.append(node('strong','','Every saved device holds a slot'),node('span','','Disconnect one above to free a slot.'));list.append(empty);return;}
  for(const d of saved){
   const row=node('div','device');row.dataset.address=d.address;row.append(icon(deviceIcon(d)));
@@ -274,19 +337,38 @@ function renderNoise(){
  $('noise-enabled').checked=!!n.enabled;
  setFill();
  const sub=$('noise-current');sub.replaceChildren();sub.classList.toggle('pend',!!busy);
- if(busy){sub.append(node('span','led pending'),document.createTextNode(n.enabled?`Setting level ${lvl}…`:'Turning off…'));}
+ if(anc.m.kind==='held')sub.append(node('span','led queued'),document.createTextNode(`${n.enabled?'Level '+lvl:'Off'} · ${heldWords()}`));
+ else if(busy){sub.append(node('span','led pending'),document.createTextNode(n.enabled?`Setting level ${lvl}…`:'Turning off…'));}
  else sub.textContent=n.enabled?`On · level ${lvl} of 10`:'Off · all through';
  ridges.set(n);
 }
+// A held noise value says what it waits for: a switch (Use here, Move to) or a Connect / Disconnect.
+function heldWords(){const m=mut();return m&&!m.here?'applies when the change ends':'applies when the switch ends';}
+const NOISE_DROPPED='Noise change not sent: the headphones aren’t reachable now';
 function setFill(){const el=$('noise-level');el.style.setProperty('--pct',(Number(el.value)*10)+'%');}
 function requestNoise(level,enabled){
- if(!live()||busy())return;
- anc.m=noiser(anc.m,{type:'input',value:{level,enabled}});message('');renderNoise();syncControls();pumpNoise();
+ if(!state?.noise)return;
+ if(!live()&&!changeRunning()){message(NOISE_DROPPED,true);renderNoise();return;}
+ anc.m=noiser(anc.m,{type:'input',value:{level,enabled}});message('');pump();renderNoise();syncControls();
+}
+// A connection change or switch is running: this page's own request, or (shared state) an operation started anywhere.
+function changeRunning(){return !!mut()||(stateMode()&&opRunning());}
+// The one scheduler: called whenever work ends or input arrives (machines: schedule, intents, noiser).
+function pump(){
+ for(let n=0;n<4;n++){
+  const d=schedule({change:changeRunning(),noise:anc.m,intent:iq,live:live()});
+  if(d==='hold-noise'){anc.m=noiser(anc.m,{type:'hold'});clearTimeout(anc.timer);renderNoise();return;}
+  if(d==='resume-noise'){anc.m=noiser(anc.m,{type:'resume'});continue;}
+  if(d==='drop-noise'){anc.m=noiser(anc.m,{type:'drop'});message(NOISE_DROPPED,true);render();return;}
+  if(d==='intent'){const i=queued();queueSend({type:'release'});runIntent(i);if(changeRunning()||anc.m.kind==='sending')return;continue;}
+  if(d==='noise')pumpNoise();
+  return;
+ }
 }
 function pumpNoise(){
- if(anc.m.kind!=='waiting'||mut())return;
+ if(anc.m.kind!=='waiting'||changeRunning())return;
  const wait=anc.lastStart+250-performance.now();
- if(wait>0){clearTimeout(anc.timer);anc.timer=setTimeout(pumpNoise,wait);return;}
+ if(wait>0){clearTimeout(anc.timer);anc.timer=setTimeout(pump,wait);return;}
  const v=anc.m.queued;anc.m=noiser(anc.m,{type:'send'});anc.lastStart=performance.now();renderNoise();syncControls();
  let ok=false;
  api('/api/override',{action:'noise',level:v.level,enabled:v.enabled}).then(async r=>{
@@ -295,7 +377,7 @@ function pumpNoise(){
   if(!r.state)adopt(await api('/api/overview'));
   ok=true;if(!anc.m.queued)message(r.message||'Noise cancellation updated');
  }).catch(e=>{clearTimeout(anc.timer);message(e.message,true);})
- .finally(()=>{anc.m=noiser(anc.m,{type:ok?'ok':'fail'});render();pumpNoise();});
+ .finally(()=>{anc.m=noiser(anc.m,{type:ok?'ok':'fail'});render();pump();});
 }
 
 // ---- Connections ----
@@ -305,9 +387,33 @@ function adoptNoise(next){
  if(Array.isArray(next.devices)&&next.devices.length||stateMode())return adopt(next);
  const merged={...state};if('noise' in next)merged.noise=next.noise;if(next.battery!=null)merged.battery=next.battery;state=merged;
 }
-async function perform(data){
- if(busy()||!live()||anc.m.kind!=='idle')return;
- const opener=choosingAddr();mutations++;uiSend({type:'start',...data});message('');render();
+// Every connection input goes through act: it runs at once when nothing else does, else it becomes the one queued intent
+// (latest wins; the same intent again cancels it), drawn as queued until the running work ends.
+function workRunning(){return changeRunning()||anc.m.kind==='sending';}
+function act(intent){
+ if(workRunning()){uiSend({type:'drop-choice'});queueSend({type:'hold',intent});render();return;}
+ if(queued())queueSend({type:'cancel'});
+ runIntent(intent,false);
+}
+function cancelQueued(){queueSend({type:'cancel'});render();}
+// fromQueue: released when the running work ended, so it is checked against the verified state first and keeps the
+// result line of the work before it.
+function runIntent(i,fromQueue=true){
+ if(i.action==='switch')return startSwitchNow(i.target,i.replace,fromQueue);
+ if(i.action==='here')return stateMode()?startSwitchNow(ST.here,i.replace,fromQueue):useHereNow(i.replace,i.label,fromQueue);
+ const d=deviceByAddress(i.address);
+ if(!d||!live()){if(fromQueue)message(`${i.action==='connect'?'Connect':'Disconnect'} not sent: the headphones aren’t reachable now`,true);return render();}
+ if(i.action==='disconnect'){if(!d.connected){message(`${d.name} is already disconnected.`,'info');return render();}return performNow(i,fromQueue);}
+ if(d.connected){message(`${d.name} is already connected.`,'info');return render();}
+ const full=state.devices.filter(x=>x.connected).length>=2,replace=i.replace&&deviceByAddress(i.replace)?.connected?i.replace:null;
+ if(full&&!replace){uiSend({type:'pick',address:i.address});message('');return render();} // the slots filled meanwhile: ask, never guess
+ performNow({action:'connect',address:i.address,...(replace?{replace}:{})},fromQueue);
+}
+function perform(data){if(live()||changeRunning())act(data);}
+async function performNow(data,fromQueue){
+ const body={action:data.action,address:data.address,...(data.replace?{replace:data.replace}:{})};
+ const opener=choosingAddr();mutations++;uiSend({type:'start',...body});if(!fromQueue)message('');render();
+ data=body;
  try{
   const r=await api('/api/override',data);
   if(r.state)adopt(r.state);
@@ -316,12 +422,15 @@ async function perform(data){
   if(!r.state)adopt(await api('/api/overview'));
   message(r.message||(data.action==='connect'?`${nameOf(data.address)} connected`:`${nameOf(data.address)} disconnected`));
  }catch(e){message(e.message,true);}
- finally{uiSend({type:'settled'});render();pumpNoise();if(opener)focusRow(opener);}
+ finally{uiSend({type:'settled'});render();pump();if(opener)focusRow(opener);}
 }
 function connect(address){
- const target=deviceByAddress(address);if(!target||!live()||busy())return;
+ const target=deviceByAddress(address);if(!target||!live()&&!changeRunning())return;
  if(target.connected)return message(`${target.name} is already connected.`);
- const connected=state.devices.filter(d=>d.connected);
+ // A slot that a Disconnect in flight frees counts as open: the connect queues behind it. (A queued Disconnect does not:
+ // this connect replaces it, one queued intent at a time.)
+ const leaving=[mut()].filter(a=>a?.action==='disconnect').map(a=>a.address);
+ const connected=state.devices.filter(d=>d.connected&&!leaving.includes(d.address));
  if(connected.length<2)return perform({action:'connect',address});
  uiSend({type:'pick',address});message('');render();
  const first=document.querySelector('.cup.target');if(first)first.focus();
@@ -345,10 +454,15 @@ function switchCall(body){
  return fetch('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:abort.signal}).then(r=>r.json())
   .catch(e=>({ok:false,error_key:e.name==='AbortError'?'timeout':'unreachable'})).finally(()=>clearTimeout(timer));
 }
-async function useHere(replace){
+function useHere(replace){
  if(stateMode())return startSwitch(ST.here,replace);
- const here=hereAddress();if(!here||mut()||anc.m.kind!=='idle')return;
+ const here=hereAddress();if(!here||mut()?.here)return; // its own request in flight cannot be taken back
+ if(!replace&&queued()?.action==='here')return cancelQueued(); // the same tap again cancels the queued Use here
  const label=replace?(offerSlots()?.find(s=>s.address===replace)?.label||'device'):null;
+ act({action:'here',address:here,replace:replace||null,label,here:true});
+}
+async function useHereNow(replace,label,fromQueue){
+ const here=hereAddress();if(!here)return;
  mutations++;uiSend({type:'start',action:'connect',address:here,replace,label,here:true});
  message(replace?MSG.replacing.replace('{label}',label):MSG.pending,'pending');render();
  const body={source:switchSource(),request_id:Math.random().toString(36).slice(2,10)};if(replace)body.replace=replace;
@@ -360,23 +474,24 @@ async function useHere(replace){
   message(MSG.ok);
  }else if(r&&r.busy)message('');
  else message((MSG.errors[r?.error_key]||r?.error||MSG.errors.unreachable)+MSG.retry_hint,true);
- render();pumpNoise();
+ render();pump();
  if(offerSlots())document.querySelector('#choose-options .btn')?.focus();
 }
 $('use-here').onclick=()=>useHere();
 
-// One mutation at a time; the busy item stays legible, the rest just disables.
+// Input is never disabled for work in progress: a tap during other work queues (act), a noise value is held (pump).
+// Only what cannot be done is disabled: no live headset, its own request in flight, a refresh while work runs.
 function syncControls(){
- const ok=live();const ancBusy=anc.m.kind!=='idle';const b=busy();
+ const ok=live(),work=workRunning(),noiseOk=!!state?.noise&&(ok||changeRunning());
  document.querySelectorAll('[data-live="true"]').forEach(el=>{
-  if(el.id==='noise-enabled')el.disabled=!ok||b||!state?.noise;
-  else if(el.id==='noise-level'){el.disabled=!ok||b||!state?.noise||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
-  else el.disabled=!ok||b||ancBusy;
+  if(el.id==='noise-enabled')el.disabled=!noiseOk;
+  else if(el.id==='noise-level'){el.disabled=!noiseOk||!shownNoise()?.enabled;$('noise-slider').classList.toggle('off',el.disabled);}
+  else el.disabled=!ok&&!changeRunning();
  });
- // Switch targets work from any state (the controller reads the headset itself first); one operation at a time.
- document.querySelectorAll('[data-switch="true"]').forEach(el=>{el.disabled=b||ancBusy;});
- $('use-here').disabled=b||ancBusy;
- const rb=$('refresh');rb.disabled=refreshing||b||ancBusy;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
+ // Switch targets work from any state (the controller reads the headset itself first).
+ document.querySelectorAll('[data-switch="true"]').forEach(el=>{el.disabled=false;});
+ $('use-here').disabled=!!mut()?.here;
+ const rb=$('refresh');rb.disabled=refreshing||work;rb.classList.toggle('spinning',refreshing);rb.setAttribute('aria-label',refreshing?'Checking':'Refresh');
 }
 
 async function refresh(){
@@ -403,14 +518,18 @@ function sleepMs(ms){return new Promise(r=>setTimeout(r,ms));}
 function rid(){return Math.random().toString(36).slice(2,10);}
 async function fetchState(after,wait){
  const q=after==null?'':`?after=${after}&wait=${wait}`;
- const r=await fetch('/api/state'+q,{cache:'no-store'});
+ // The long-poll waits up to `wait` s on the controller; 10 s more means the link is gone (retried with backoff).
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),((wait||0)+10)*1000);
+ const r=await fetch('/api/state'+q,{cache:'no-store',signal:abort.signal}).finally(()=>clearTimeout(timer));
  if(r.status===404)return null;
  if(!r.ok)throw new Error('state '+r.status);
  return r.json();
 }
-async function postJSON(path,body){
- try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return await r.json();}
- catch(e){return null;}
+// The switch POST answers at once (an operation is accepted or refused); 15 s means the controller is not answering.
+async function postJSON(path,body,ms=15000){
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),ms);
+ try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:abort.signal});return await r.json();}
+ catch(e){return null;}finally{clearTimeout(timer);}
 }
 function enterState(s){linkSend('snapshot');applySnap(s);follow();setInterval(tick,1000);}
 async function follow(){
@@ -428,7 +547,7 @@ function applySnap(s){
  if(s.operation)tapSend({type:'operation'});
  const prev=state;state=overviewFrom(s);
  if(prev&&noiseShown(anc.m))state.noise=prev.noise; // an ANC write in flight keeps its own pending value
- render();
+ render();pump(); // an operation that just ended releases the queued intent or held noise value
 }
 // The legacy overview shape, so ANC, settings and per-row Connect keep their existing code.
 function overviewFrom(s){
@@ -473,8 +592,9 @@ function stateHeader(){
 function renderOp(){
  const box=$('op'),o=shownOp(),here=hereAddress();
  $('here').hidden=!here||!!o;
- const b=$('use-here');b.classList.remove('pressed');b.removeAttribute('aria-busy');b.textContent='Use here';
- b.setAttribute('aria-label','Use here: move the headphones to '+the(ST.here));
+ const b=$('use-here'),q=queued(),waiting=q?.action==='switch'&&q.target===ST.here;
+ b.classList.remove('pressed');b.classList.toggle('queued',waiting);b.removeAttribute('aria-busy');b.textContent=waiting?QUEUED_HERE:'Use here';
+ b.setAttribute('aria-label',waiting?'Cancel the queued Use here':'Use here: move the headphones to '+the(ST.here));
  box.replaceChildren();box.hidden=!o;if(!o)return;
  const res=o.result,choosing=o.phase==='choose'&&!res;
  box.className='op '+(res?(res.ok?'ok':'failed'):choosing?'choosing':'run');
@@ -528,20 +648,19 @@ function chip(stateName,age){
  return c;
 }
 function renderStateCups(){
- const op=mut(),choosing=choosingAddr();
+ const choosing=choosingAddr();
  const cups=$('cups');cups.replaceChildren();cups.classList.add('st');
- const slots=(ST.snap.slots||[]).slice(0,2);while(slots.length<2)slots.push({state:'free'});
+ const raw=(ST.snap.slots||[]).slice(0,2);while(raw.length<2)raw.push({state:'free'});
+ // This page's Connect / Disconnect in flight (POST /api/override) and its queued intent, drawn over the controller's slots.
+ const slots=overlaySlots(raw.map(x=>({...x,st:x.state})),mut(),queued());
  slots.forEach((x,i)=>{
-  let st=x.state;
-  // a Disconnect / Connect from this page (POST /api/override) in flight, until the controller's state catches up
-  if(op?.action==='disconnect'&&op.address===x.address&&st==='connected')st='disconnecting';
-  let addr=x.address;
-  if(op?.action==='connect'&&st==='free'&&!slots.slice(0,i).some(y=>y.state==='free')&&!op.replace){st='connecting';addr=op.address;}
-  if(op?.action==='connect'&&op.replace===x.address){st='connecting';addr=op.address;}
-  const d=addr?{address:addr,name:addr===x.address?(x.name||x.label):nameOf(addr),role:addr===x.address?x.role:roleOf(addr)}:null;
-  const target=choosing&&st==='connected'&&d;
+  const st=x.st,addr=x.address;
+  // the controller's own connecting / releasing marks are in flight too
+  const pend=x.pend||(st==='connecting'||st==='releasing'?'flight':null);
+  const d=addr?{address:addr,name:addr===x.was?(x.name||x.label):nameOf(addr),role:addr===x.was?x.role:roleOf(addr)}:null;
+  const target=choosing&&st==='connected'&&!pend&&d;
   const cup=node(target?'button':'div','cup');
-  const head=node('div','state');head.append(chip(st,x.age),node('span','slot',`Slot ${i+1}`));
+  const head=node('div','state');head.append(pend?pendChip({...x,pend}):chip(st,x.age),node('span','slot',`Slot ${i+1}`));
   if(st==='unknown'&&x.age!=null){const a=node('span','slot-age',agoText(x.age+since()));a.dataset.age=String(x.age);a.dataset.prefix='';head.append(a);}
   cup.append(head);
   if(!d){
@@ -551,12 +670,11 @@ function renderStateCups(){
    cups.append(cup);return;
   }
   const dev=node('div','dev');dev.append(icon(deviceIcon(d)));cup.append(dev,node('div','name',d.name||'Device'));
-  if(d.role&&d.role===ST.here){const tag=node('div','tag here');tag.append(node('i'),document.createTextNode('This '+(d.role==='phone'?'phone':labels[d.role])));cup.append(tag);}
+  if(x.replacing)cup.append(node('div','tag',`Replacing ${nameOf(x.replacing)}`));
+  else if(d.role&&d.role===ST.here){const tag=node('div','tag here');tag.append(node('i'),document.createTextNode('This '+(d.role==='phone'?'phone':labels[d.role])));cup.append(tag);}
   else cup.append(node('div','tag',d.role?labels[d.role]||'':''));
-  if(st==='connecting'||st==='releasing'||st==='disconnecting'){
-   cup.classList.add('pending');if(st!=='connecting')cup.classList.add('leaving');
-   cup.append(pendingPill(CHIP[st][0]));
-  }else if(target){
+  if(pend)pendControl(cup,{...x,pend},d.name);
+  else if(target){
    cup.classList.add('target');cup.setAttribute('aria-label',`Replace ${d.name}`);cup.type='button';cup.dataset.live='true';
    cup.onclick=()=>perform({action:'connect',address:choosing,replace:d.address});cup.append(node('span','pill','Replace'));
   }else if(st==='connected'){
@@ -566,11 +684,18 @@ function renderStateCups(){
   cups.append(cup);
  });
 }
+// The chip of a slot drawn as an intended result: a pulsing light in flight, a hollow ring while queued.
+function pendChip(x){
+ const c=node('span','chip '+(x.pend==='queued'?'queued':'pending'));
+ c.append(node('span','led '+(x.pend==='queued'?'queued':'pending')),node('span','',pendWords(x)));return c;
+}
 function renderStateDevices(){
  const op=mut(),choosing=choosingAddr();
  const list=$('devices');list.replaceChildren();
  const slots=ST.snap.slots||[],inSlot=new Set(slots.filter(x=>x.address).map(x=>x.address));
- const rows=(ST.snap.devices||[]).filter(d=>d.address&&!inSlot.has(d.address)&&!(op?.action==='connect'&&op.address===d.address));
+ const raw=slots.slice(0,2).map(x=>({...x,st:x.state})),inCup=new Set(overlaySlots(raw,op,queued()).filter(x=>x.pend&&x.st==='connecting').map(x=>x.address));
+ const rows=(ST.snap.devices||[]).filter(d=>d.address&&!inSlot.has(d.address)&&!(op?.action==='connect'&&op.address===d.address)&&!inCup.has(d.address));
+ const q=queued();
  if(!rows.length){
   const empty=node('div','empty');
   if(!inSlot.size)empty.append(node('strong','',ST.snap.headset?.reachable?'No saved devices found':'Headset unavailable'),node('span','',ST.snap.headset?.reachable?'Pair your devices in the headset’s Bluetooth settings.':'Turn on the headset and keep it near one of your controllers.'));
@@ -581,7 +706,9 @@ function renderStateDevices(){
   const row=node('div','device');row.dataset.address=d.address;row.append(icon(deviceIcon(d)));
   const info=node('div','device-info'),role=roleIds.includes(d.role)?d.role:null,choosingHere=choosing===d.address;
   const sub=node('div','s');
+  const waiting=!!role&&(q?.action==='switch'&&q.target===role||q?.action==='here'&&role===ST.here);
   if(choosingHere){sub.textContent='Choose a slot above to replace';sub.classList.add('pend');}
+  else if(waiting){sub.append(node('span','led queued'),node('span','','Queued · goes next'));sub.classList.add('pend','queued');}
   else if(d.state==='connecting'){sub.textContent='Connecting…';sub.classList.add('pend');}
   else if(d.state==='unknown'){sub.textContent='Unknown · '+agoText((d.age??0)+since());if(d.age!=null){sub.dataset.age=String(d.age);sub.dataset.prefix='Unknown · ';}}
   else sub.textContent=`Saved · not connected${role?' · '+labels[role]:''}`;
@@ -591,6 +718,7 @@ function renderStateDevices(){
    // A role device is a switch target: the controller releases a slot if needed (keeping the phone) and connects it.
    b.textContent=role===ST.here?'Use here':'Move to '+(role==='phone'?'phone':labels[role]);b.dataset.switch='true';
    b.setAttribute('aria-label',`Move the headphones to ${the(role)}`);b.onclick=()=>startSwitch(role);
+   if(waiting){b.className='btn connect queued';b.replaceChildren(node('span','ring'),node('span','','Queued · cancel'));b.setAttribute('aria-label',`Cancel the queued move to ${the(role)}`);}
   }else if(choosingHere){b.className='btn connect pressed';b.textContent='Connect';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>cancelChoice(true);}
   else{b.textContent='Connect';b.dataset.live='true';b.setAttribute('aria-label',`Connect ${d.name}`);b.onclick=()=>connect(d.address);}
   row.append(b);list.append(row);
@@ -617,9 +745,18 @@ function renderStateControllers(){
   box.append(ul);
  }
 }
-async function startSwitch(target,replace){
- if(!target||(opRunning()&&!replace)||anc.m.kind!=='idle'||mut())return;
- uiSend({type:'drop-choice'});message('');
+// A tap on a switch target. A choice inside a running choose phase answers that phase; anything else is an intent.
+function startSwitch(target,replace){
+ if(!target)return;
+ const o=tapOp()||serverOp();
+ if(replace&&o&&!o.result&&o.phase==='choose'&&!mut()&&anc.m.kind!=='sending')return startSwitchNow(target,replace,false);
+ const q=queued();
+ if(!replace&&q&&(q.action==='switch'&&q.target===target||q.action==='here'&&target===ST.here))return cancelQueued(); // same tap again
+ if(!replace&&o&&!o.result&&o.target===target)return; // that move is the one running
+ act({action:'switch',target,replace:replace||null});
+}
+async function startSwitchNow(target,replace,fromQueue){
+ uiSend({type:'drop-choice'});if(!fromQueue)message('');
  tapSend({type:'tap',tap:{target,phase:'reading',started_at:serverNow(),source:switchSource(),steps:[{name:'reading',label:STEP.reading,state:'active',since:serverNow()}],result:null}});
  render();
  const body={source:switchSource(),request_id:rid(),target};if(replace)body.replace=replace;
@@ -627,7 +764,7 @@ async function startSwitch(target,replace){
  if(r&&r.operation){tapSend({type:'answered'});ST.snap=foldAccepted(ST.snap,ST.seq,r);}
  else if(!r||r.accepted!==true){const text=r?.error||MSG.errors.unreachable;tapSend({type:'refused',fail:{target,started_at:serverNow(),at:serverNow(),steps:[],result:{ok:false,text,seconds:0}}});}
  else tapSend({type:'answered'});
- render();
+ render();pump();
 }
 async function cancelSwitch(){await postJSON('/api/switch/cancel',{source:switchSource()});}
 async function refreshState(){

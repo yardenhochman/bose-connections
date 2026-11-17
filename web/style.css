@@ -83,8 +83,17 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 .cup.open .name{color:var(--ink-2);font-weight:400}
 .cup.open .dev{color:var(--ink-3)}
 .cup.unknown .name{color:var(--ink-2);font-weight:400}
-.cup.pending{border:1.5px solid var(--accent)}
-.cup.pending .state{color:var(--accent-ink);font-weight:500}
+/* Pending = an intended result, never mistaken for a verified one. Verified: filled surface, green light, solid text.
+   In flight (sent, waiting for the headset): no fill, solid ochre outline, faded device, a spinning ring.
+   Queued (not sent yet): no fill, dotted ochre outline, fainter device, a hollow ring, and a Cancel. */
+.cup.pending{background:transparent;border:1.5px solid var(--accent)}
+.cup.pending .state,.cup.queued .state{color:var(--accent-ink);font-weight:500}
+.cup.pending .name,.cup.pending .dev{opacity:.62}
+.cup.queued{background:transparent;border:1.5px dotted var(--accent)}
+.cup.queued .name,.cup.queued .dev,.cup.queued .tag{opacity:.5}
+.spin{width:14px;height:14px;flex:none;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .9s linear infinite}
+.ring{width:9px;height:9px;flex:none;border-radius:50%;box-shadow:inset 0 0 0 1.5px currentColor}
+.led.queued{background:transparent;box-shadow:inset 0 0 0 1.5px var(--accent);animation:breathe 1.6s ease-in-out infinite}
 .cup.target{border:1.5px dashed var(--accent);cursor:pointer;color:inherit;font:inherit}
 .cup.target:hover{background:var(--accent-wash)}
 .cup.target:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
@@ -95,11 +104,16 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 .btn.ghost:hover:not(:disabled){background:var(--hair)}
 .btn.connect{border:1.5px solid var(--accent);color:var(--accent-ink);min-width:104px}
 .btn.connect:hover:not(:disabled){background:var(--accent-wash)}
-.btn.connect:active:not(:disabled),.btn.connect.pressed,.pill.pending{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn.connect:active:not(:disabled),.btn.connect.pressed{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
 .btn.solid{background:var(--fill);color:var(--ground)}
 .btn.solid:hover:not(:disabled){opacity:.9}
 .btn:disabled:not(.pressed){opacity:.42}
-.pill{height:44px;border-radius:22px;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:500;border:1.5px solid var(--accent);color:var(--accent-ink)}
+.pill{height:44px;border-radius:22px;display:flex;align-items:center;justify-content:center;gap:8px;font-size:15px;font-weight:500;border:1.5px solid var(--accent);color:var(--accent-ink);white-space:nowrap}
+.pill.pending{background:var(--accent-wash)}
+.pill.queued{border-style:dotted;background:transparent;width:100%}
+.pill.queued:hover{background:var(--accent-wash)}
+.btn.connect.queued{border-style:dotted;gap:8px}
+.usehere .btn.queued{border-style:dotted}
 /* Replace prompt, above the cups */
 .choose{display:flex;align-items:center;gap:12px;margin:2px 16px 12px;padding:6px 6px 6px 18px;border:1.5px dashed var(--accent);border-radius:28px;background:var(--accent-wash);position:relative;z-index:2}
 .choose p{flex:1;font-size:14px;line-height:1.35;color:var(--accent-ink);font-weight:500}
@@ -121,6 +135,8 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.4;stro
 .chip .led.idle{box-shadow:inset 0 0 0 1.5px var(--ink-3)}
 .chip .led.pending{box-shadow:0 0 0 2px var(--accent-wash)}
 .chip.pending{color:var(--accent-ink);background:var(--accent-wash);border-color:transparent}
+.chip.queued{color:var(--accent-ink);background:transparent;border:1px dotted var(--accent)}
+.chip .led.queued{box-shadow:inset 0 0 0 1.5px var(--accent)}
 .chip.idle{color:var(--ink-2);font-weight:400}
 .chip .age{font-weight:400;margin-left:-4px;overflow:hidden;text-overflow:ellipsis}
 .cup.open .chip,.cup.unknown .chip{background:transparent}
@@ -179,6 +195,8 @@ section{padding:0 20px;position:relative;z-index:1}
 .nc-t{font-size:17px;font-weight:500;display:block}
 .nc-s{font-size:13px;color:var(--ink-2);display:flex;align-items:center;gap:6px}
 .nc-s.pend{color:var(--accent-ink)}
+.nc-s .led,.device-info .s .led{width:7px;height:7px}
+.device-info .s.queued{display:flex;align-items:center;gap:6px}
 .sw{appearance:none;-webkit-appearance:none;width:52px;height:32px;border-radius:16px;background:var(--track);position:relative;flex:none;cursor:pointer;transition:background-color .18s var(--ease)}
 .sw::after{content:"";position:absolute;top:4px;left:4px;width:24px;height:24px;border-radius:50%;background:var(--thumb);box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .18s var(--ease)}
 .sw:checked{background:var(--fill)}

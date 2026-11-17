@@ -9,9 +9,14 @@ connection to replace when both Bluetooth slots are occupied.
 - **Use here**: one tap moves the headset to the device in hand and reports a true
   status. When both slots are busy it offers Replace per slot instead of guessing.
 - Pending states appear instantly and settle only after the headset confirms;
-  a failed or unconfirmed change reverts to the verified state.
+  a failed or unconfirmed change reverts to the verified state. In-flight and
+  queued changes are drawn differently from verified ones.
+- No control waits for other work: a tap during a change or a switch is queued
+  (the latest wins; tap it again to cancel) and runs when that work ends. The
+  headset still gets one change at a time.
 - Noise cancellation levels 0–10 and Off, with verified headset state. The slider
-  applies on release, and a switch turns noise cancellation on or off.
+  applies on release, and a switch turns noise cancellation on or off. During a
+  switch the chosen level shows at once and applies when the switch ends.
 - Android Quick Settings tile and a native dialog with connections and ANC controls.
 - Omarchy top-bar popup that uses the active Omarchy theme's colours.
 - macOS menu-bar icon that opens a compact popover; right-click for the native menu.
@@ -280,7 +285,9 @@ it holds several QML files and a `fonts/` directory. Click the headphones icon t
 open the popup. **Use here** moves the headset to this PC and plays PC audio on it.
 Two slot cups show the connected devices, each with Disconnect;
 saved devices have Connect. When both slots are full, choose which device to
-replace in place. The ANC switch and slider apply on release, and **Open dashboard**
+replace in place. A tap during another change is queued and drawn with a dotted
+outline until it runs. The ANC switch and slider apply on release (held until a
+running change ends), and **Open dashboard**
 opens a compact app window through `omarchy-launch-webapp`. Colours follow the
 active Omarchy theme. The same backend protections apply to popup and
 dashboard actions. Other Linux desktops can use the web dashboard; a generic
@@ -363,13 +370,16 @@ Linux sink step and relayed through an Android-shaped phone, with a fake clock a
 counts, the final slots, the default sink and the single `bose.switch` log line.
 `tests/test_omarchy_contract.py` runs `tests/bose_model.qml` offscreen
 (`QT_QPA_PLATFORM=offscreen QML_XHR_ALLOW_FILE_READ=1 qml6 tests/bose_model.qml`). It drives
-the Omarchy popup model through the same scenarios and is skipped when `qml6` is missing. The
+the Omarchy popup model through the same scenarios, the shared machine tables and the queued-input cases, and is
+skipped when `qml6` is missing. `QT_QPA_PLATFORM=offscreen qml6 tests/render_popup.qml -- <folder>` renders the
+popup's in-flight and queued looks, light and dark, to PNG files. The
 protocol/controller tests cover packet fragmentation, rejected commands, slot/anchor
 protection, mutation verification, ambiguous-command handling and private cache
 persistence, ANC handling and avoiding competing background connections. CI runs them on Python 3.12 and 3.13.
 
 `tests/web_machines.cjs` (run by `tests/test_web_machines.py`, skipped without node) checks the transition tables of the
-dashboard's machines block in `web/app.js` ([docs/state-machines.md](docs/state-machines.md)).
+dashboard's machines block in `web/app.js` ([docs/state-machines.md](docs/state-machines.md)). The noise writer, intent
+queue and scheduler tables live in `tests/machine-tables.json`, and both this check and the popup harness run them.
 `tests/test_android_contract.py` compiles `android/Switcher.java` with a test-only
 `org.json` stand-in and runs every scenario of `tests/switch-contract.json` against a fake
 overview and override (skipped without a JDK); `tests/test_mac_contract.py` statically checks that
@@ -383,7 +393,9 @@ verifies mobile/desktop layouts, settings and the replacement dialog. It also ru
 through every contract scenario: pending text before the reply, final texts, Replace offers,
 the replace payload, the Mac popover source and the Android `switchHere` bridge. A scripted `GET /api/state`
 long-poll then drives the shared-state page: chips, step timings, result, auto-clear, Try again, the choose phase
-and cancel, Move-to targets, unreachable reasons and the popover (its captures go to `artifacts/state/`); every
+and cancel, Move-to targets, unreachable reasons and the popover (its captures go to `artifacts/state/`). The instant-input
+checks queue taps during a change, a switch and a noise write, hold the slider, cancel, revert a failed queued change,
+and fail if more than one `/api/override` or `/api/switch` request is ever open (captures in `artifacts/pending/`); every
 other run answers `/api/state` with 404, which also covers the fallback to overview polling. It creates
 ignored screenshots under `artifacts/` (`BOSE_ARTIFACTS` overrides the folder); it sends no
 connection mutations. Set

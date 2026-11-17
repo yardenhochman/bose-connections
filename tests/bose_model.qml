@@ -73,6 +73,139 @@ Item {
     model.destroy()
   }
 
+  // The shared transition tables (tests/machine-tables.json): the popup's machines must equal the dashboard's.
+  function resolve(t, o) {
+    if (typeof o === "string" && t.values && o in t.values) return t.values[o]
+    if (o && typeof o === "object") { var r = {}; for (var k in o) r[k] = resolve(t, o[k]); return r }
+    return o
+  }
+  function same(a, b) { return JSON.stringify(a) === JSON.stringify(b) }
+  function canon(o) { return JSON.parse(JSON.stringify(o, function(k, v) { return v && typeof v === "object" && !Array.isArray(v) ? Object.keys(v).sort().reduce(function(r, x) { r[x] = v[x]; return r }, {}) : v })) }
+  function runTables() {
+    var xhr = new XMLHttpRequest()
+    xhr.open("GET", Qt.resolvedUrl("machine-tables.json"), false)
+    xhr.send()
+    var tables = JSON.parse(xhr.responseText)
+    const mm = modelComponent.createObject(harness) as BoseModel
+    var fns = {noiser: mm.noiseNext, intents: mm.intentNext}
+    for (var name in fns) {
+      var t = tables[name]
+      t.rows.forEach(function(r) {
+        var got = fns[name](resolve(t, t.states[r[0]]), resolve(t, t.events[r[1]]))
+        check(same(canon(got), canon(resolve(t, t.states[r[2]]))), "table " + name + " " + r[0] + " --" + r[1] + "-> " + JSON.stringify(got))
+      })
+    }
+    tables.schedule.rows.forEach(function(r) {
+      var got = mm.schedule({change: r[0], noise: {kind: r[1]}, intent: {kind: r[2]}, live: r[3]})
+      check(got === r[4], "table schedule " + JSON.stringify(r) + " got " + got)
+    })
+    mm.destroy()
+  }
+
+  // Instant input (docs/state-machines.md 5-6): queue, latest wins, cancel, noise held behind a switch, failure revert,
+  // stale read, one request at a time toward the controller.
+  function runInstant() {
+    var held = [], open = 0, maxOpen = 0, cur = overview([devs.pc, devs.phone])
+    function apply(b) {
+      var on = cur.devices.filter(function(d) { return d.connected }).map(function(d) { return d.address })
+      if (b.action === "disconnect") on = on.filter(function(a) { return a !== b.address })
+      else if (b.action === "connect") on = on.filter(function(a) { return a !== b.replace }).concat([b.address])
+      var noise = b.action === "noise" ? {level: b.level, enabled: b.enabled} : cur.noise
+      cur = overview(on); cur.noise = noise
+      return {ok: true, verified: true, state: cur}
+    }
+    const im = modelComponent.createObject(harness, {transport: function(method, path, body, done) {
+      if (method === "POST") { open++; maxOpen = Math.max(maxOpen, open); held.push({path: path, body: body, done: function(err, json) { open--; done(err, json) }}); return }
+      done(null, cur)
+    }}) as BoseModel
+    // The 250 ms gap between noise writes is real time; the harness is synchronous, so it starts each answer past it.
+    function answer(fn) { var h = held.shift(); im.ancLastStart = 0; h.done(null, fn ? fn(h.body) : apply(h.body)) }
+    function slotStates() { return im.slots.map(function(s) { return (s.device ? im.nameOf(s.device) : "-") + ":" + s.state + (s.queued ? ":queued" : "") }).join(",") }
+    im.refresh()
+    var phone = im.deviceFor(devs.phone), pc = im.deviceFor(devs.pc), mac = im.deviceFor(devs.mac)
+    // Latest wins.
+    im.disconnectDevice(phone)
+    check(held.length === 1 && im.pending && im.pending.address === devs.phone, "instant: disconnect phone in flight")
+    check(im.canMutate && im.canNoise, "instant: controls stay enabled during a change")
+    im.disconnectDevice(pc)
+    check(held.length === 1 && im.queuedIntent && im.queuedIntent.address === devs.pc, "instant: a second tap is queued, not sent")
+    check(slotStates() === "Desktop PC:disconnecting:queued,Android phone:disconnecting", "instant: queued drawn apart from in flight: " + slotStates())
+    im.setNoise(4, true)
+    check(im.anc.kind === "held" && im.noiseShown.level === 4 && held.length === 1, "instant: noise during a change is held, shown, not sent")
+    im.connectDevice(mac)
+    check(im.queuedIntent && im.queuedIntent.action === "connect" && im.queuedIntent.address === devs.mac, "instant: latest wins (connect replaces the queued disconnect)")
+    check(slotStates() === "Desktop PC:connected,MacBook Pro:connecting:queued", "instant: the queued connect takes the slot the disconnect frees: " + slotStates())
+    check(im.savedDevices.every(function(d) { return d.address !== devs.mac }), "instant: a queued connect leaves the saved list")
+    answer()
+    check(held.length === 1 && held[0].body.action === "connect" && held[0].body.address === devs.mac && !im.queuedIntent, "instant: the queued intent goes when the change ends")
+    check(im.anc.kind === "held", "instant: noise still held behind the released connect")
+    answer()
+    check(held.length === 1 && held[0].body.action === "noise" && held[0].body.level === 4, "instant: then the held noise value is sent")
+    answer()
+    check(im.anc.kind === "idle" && im.snapshot.noise.level === 4 && maxOpen === 1, "instant: settled, one request at a time (max open " + maxOpen + ")")
+    // Cancel: the same tap again.
+    im.disconnectDevice(mac)
+    im.disconnectDevice(pc); im.disconnectDevice(pc)
+    check(!im.queuedIntent && slotStates().indexOf("queued") < 0, "instant: the same tap again cancels the queued intent")
+    im.disconnectDevice(pc); im.cancelQueued()
+    check(!im.queuedIntent, "instant: cancelQueued")
+    answer()
+    check(held.length === 0, "instant: nothing sent for a cancelled intent")
+    // A queued intent that fails reverts and says so.
+    im.connectDevice(phone)
+    im.disconnectDevice(pc)
+    answer()
+    answer(function() { return {ok: false, error_key: "keep_one", error: contract.messages.errors.keep_one} })
+    check(im.notice && im.notice.tone === "error" && im.notice.text === contract.messages.errors.keep_one && slotStates() === "Desktop PC:connected,Android phone:connected", "instant: failed queued disconnect reverts: " + slotStates() + " " + JSON.stringify(im.notice))
+    // Noise queued behind a switch (setNoise while !canNoise used to drop it).
+    im.switchHere()
+    check(im.pending && im.pending.here && !im.canUseHere, "instant: Use here in flight")
+    im.setNoise(2, false)
+    check(im.anc.kind === "held" && held.length === 1 && held[0].path === "/api/switch", "instant: noise during a switch is held")
+    im.setNoise(3, true)
+    check(im.anc.queued.level === 3 && im.anc.queued.enabled, "instant: newest held value wins")
+    answer(function() { return {ok: true, verified: true, message: contract.messages.ok, state: cur} })
+    check(held.length === 1 && held[0].body.action === "noise" && held[0].body.level === 3, "instant: sent when the switch ends")
+    answer()
+    // Held noise whose change ends with the headset out of reach: dropped, and the notice says so.
+    im.disconnectDevice(phone)
+    im.setNoise(1, true)
+    var off = overview([devs.pc]); off.reachable = false; off.cached = true
+    answer(function() { return {ok: true, verified: false, state: off} })
+    check(im.anc.kind === "idle" && im.notice && im.notice.text === im.droppedNoiseText && held.length === 0, "instant: held noise dropped when the headset is out of reach: " + JSON.stringify(im.notice))
+    // Not live and nothing running: setNoise says so instead of dropping silently.
+    im.setNoise(5, true)
+    check(im.notice && im.notice.text === im.droppedNoiseText && held.length === 0, "instant: setNoise while unreachable says so")
+    // Use here during a noise write: queued, cancel by tapping again, then sent after the write.
+    cur = overview([devs.phone]); im.refresh()
+    im.setNoise(8, true)
+    check(held.length === 1 && held[0].body.action === "noise", "instant: noise write in flight")
+    im.switchHere()
+    check(im.queuedHere && held.length === 1 && im.canUseHere, "instant: Use here during a noise write is queued")
+    check(slotStates() === "Android phone:connected,Desktop PC:connecting:queued", "instant: queued Use here drawn in the free slot: " + slotStates())
+    im.switchHere()
+    check(!im.queuedHere, "instant: Use here again cancels it")
+    im.switchHere()
+    answer()
+    check(held.length === 1 && held[0].path === "/api/switch", "instant: queued Use here sent after the write")
+    answer(function() { return {ok: true, verified: true, message: contract.messages.ok, state: overview([devs.phone, devs.pc])} })
+    // Stale read after an optimistic change: an overview sent before a queued intent lands after it; the intent stays.
+    var late = null
+    im.transport = function(method, path, body, done) {
+      if (method === "POST") { open++; held.push({path: path, body: body, done: function(err, json) { open--; done(err, json) }}); return }
+      if (path === "/api/overview" && !late) { late = done; return }
+      done(null, cur)
+    }
+    cur = overview([devs.pc, devs.phone]); im.refresh()
+    im.disconnectDevice(im.deviceFor(devs.phone))
+    im.disconnectDevice(im.deviceFor(devs.pc))
+    late(null, overview([devs.pc, devs.phone]))
+    check(im.queuedIntent && im.queuedIntent.address === devs.pc && slotStates().indexOf("Desktop PC:disconnecting:queued") >= 0, "instant: a stale read keeps the queued intent drawn: " + slotStates())
+    answer(); answer()
+    check(slotStates() === "-:empty,-:empty" && maxOpen === 1, "instant: both disconnects ran in order: " + slotStates())
+    im.destroy()
+  }
+
   Component.onCompleted: Qt.callLater(run)
   function run() {
     var xhr = new XMLHttpRequest()
@@ -109,6 +242,8 @@ Item {
           "late refresh: the older overview does not bring back the old slots")
     late.destroy()
     contract.scenarios.forEach(runScenario)
+    runTables()
+    runInstant()
     console.log((failures ? "FAIL" : "PASS") + " omarchy contract: " + contract.scenarios.length + " scenarios, " + checks + " checks, " + failures + " failures")
     Qt.exit(failures ? 1 : 0)
   }
